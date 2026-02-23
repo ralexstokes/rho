@@ -12,7 +12,7 @@ use rho_core::{
     },
     providers::{Provider, ProviderError, ProviderRequest},
     stream::ProviderEvent,
-    tool::{ToolCall, ToolResult},
+    tool::{ToolCall, ToolDefinition, ToolResult},
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -109,8 +109,11 @@ impl AgentRuntime {
         F: FnMut(ServerEvent),
     {
         let session_id = session.id.clone();
+        let builtin_tools = builtin_tool_definitions();
+
         for iteration in 0..=self.max_tool_iterations {
-            let request = ProviderRequest::new(model.to_string(), session.messages.clone());
+            let request = ProviderRequest::new(model.to_string(), session.messages.clone())
+                .with_tools(builtin_tools.clone());
             let mut stream = provider.stream(request);
 
             let mut assistant_message = None;
@@ -213,6 +216,67 @@ fn push_tool_result_event<F>(
         result: result.clone(),
     }));
     tool_results.push(result);
+}
+
+fn builtin_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "read".to_string(),
+            description: "Read a UTF-8 text file from disk.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to read.",
+                    },
+                },
+                "required": ["path"],
+            }),
+        },
+        ToolDefinition {
+            name: "write".to_string(),
+            description: "Write UTF-8 content to a file, creating parent directories as needed."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Destination file path.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "UTF-8 file contents to write.",
+                    },
+                },
+                "required": ["path", "content"],
+            }),
+        },
+        ToolDefinition {
+            name: "bash".to_string(),
+            description:
+                "Execute a bash command and return JSON with exit_code, stdout, and stderr."
+                    .to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute.",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Optional working directory.",
+                    },
+                },
+                "required": ["command"],
+            }),
+        },
+    ]
 }
 
 fn execute_builtin_tool(call: &ToolCall) -> ToolResult {
@@ -438,6 +502,12 @@ mod tests {
                 ]
             );
             assert_eq!(provider.requests().len(), 1);
+            let tool_names: Vec<String> = provider.requests()[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect();
+            assert_eq!(tool_names, ["read", "write", "bash"]);
         });
     }
 

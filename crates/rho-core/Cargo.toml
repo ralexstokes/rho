@@ -7,9 +7,8 @@ license.workspace = true
 [dependencies]
 futures-core.workspace = true
 futures-util.workspace = true
+rig.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 async-stream = "0.3.6"
-eventsource-stream = "0.2.3"
-reqwest = { version = "0.12.23", default-features = false, features = ["json", "stream", "rustls-tls"] }
