@@ -1,27 +1,23 @@
 use std::{
-    io::{Stdout, stdout},
     time::Duration,
 };
 
 use crate::{
     autocomplete::{AutocompleteItem, AutocompleteProvider, CombinedAutocompleteProvider},
     editor::EditorState,
+    keys::{Key, is_key_release, is_key_repeat, matches_key},
     overlay::{OverlayAnchor, OverlayMargin, OverlayOptions, OverlayStack, SizeValue},
     select_list::SelectList,
+    terminal::ProcessTerminal,
     theme::UiTheme,
     widgets::{
         TextBlock, loader_frame, render_markdown, section_block, spacer_lines, truncate_to_width,
     },
 };
-use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
-    Frame, Terminal,
-    backend::CrosstermBackend,
+    Frame,
     layout::{Constraint, Direction, Layout},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
@@ -73,7 +69,7 @@ impl TuiClient {
         let session_id = wait_for_session_ack(&mut inbound_rx).await?;
         let mut app = AppState::new(self.url.clone(), session_id);
 
-        let mut terminal = TerminalGuard::new()?;
+        let mut terminal = ProcessTerminal::start().map_err(TuiClientError::Io)?;
         let mut events = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_millis(33));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -572,11 +568,14 @@ fn handle_key_event(
     app: &mut AppState,
     outbound_tx: &mpsc::UnboundedSender<ClientEvent>,
 ) -> Result<(), TuiClientError> {
-    if key.kind != KeyEventKind::Press {
+    if is_key_release(&key) {
+        return Ok(());
+    }
+    if is_key_repeat(&key) && matches_key(&key, Key::TAB) {
         return Ok(());
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+    if matches_key(&key, Key::ctrl('c').as_str()) {
         app.should_quit = true;
         return Ok(());
     }
@@ -782,39 +781,6 @@ async fn recv_server_envelope(reader: &mut WsReader) -> Result<ServerEnvelope, T
             WsMessage::Binary(_) | WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => {}
             WsMessage::Close(_) => return Err(TuiClientError::Closed),
         }
-    }
-}
-
-struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-}
-
-impl TerminalGuard {
-    fn new() -> Result<Self, TuiClientError> {
-        enable_raw_mode().map_err(TuiClientError::Io)?;
-
-        let mut stdout = stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture).map_err(TuiClientError::Io)?;
-
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend).map_err(TuiClientError::Io)?;
-        Ok(Self { terminal })
-    }
-
-    fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
-        &mut self.terminal
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        );
-        let _ = self.terminal.show_cursor();
     }
 }
 
