@@ -927,7 +927,8 @@ fn handle_key_event(
     if matches!(
         key.code,
         KeyCode::Char('?') if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    ) {
+    ) && app.editor.text().is_empty()
+    {
         app.clear_autocomplete();
         app.toggle_help_overlay();
         return Ok(());
