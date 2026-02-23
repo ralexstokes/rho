@@ -1,0 +1,10 @@
+[book]
+authors = ["rho contributors"]
+language = "en"
+multilingual = false
+src = "src"
+title = "rho"
+
+[build]
+build-dir = "book"
+create-missing = false

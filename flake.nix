@@ -28,6 +28,7 @@
             ripgrep
             git
             just
+            mdbook
 
             # we need all of these, _and_ the order is important!
             rustup
