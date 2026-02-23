@@ -6,36 +6,17 @@ Minimal Rust reimplementation of core pi-mono ideas with:
 - websocket TUI client in `rho-tui`
 - top-level CLI in `rho`
 
-## Quickstart
+## Documentation
 
-Run server (Machine A) with OpenAI:
+- mdBook source lives in `docs/`
+- Quickstart: [`docs/src/quickstart.md`](docs/src/quickstart.md)
+- Entry page: [`docs/src/index.md`](docs/src/index.md)
 
-```sh
-OPENAI_API_KEY=... cargo run -p rho -- serve \
-  --bind 0.0.0.0:8787 \
-  --provider openai \
-  --model gpt-4o-mini
-```
-
-or Anthropic:
+To build docs locally:
 
 ```sh
-ANTHROPIC_API_KEY=... cargo run -p rho -- serve \
-  --bind 0.0.0.0:8787 \
-  --provider anthropic \
-  --model claude-3-5-haiku-latest
+mdbook build docs
 ```
-
-Run TUI client (Machine B):
-
-```sh
-cargo run -p rho -- tui --url ws://<machine-a-host>:8787/ws
-```
-
-Inside TUI:
-- type a prompt and press Enter to send
-- `/cancel` cancels an in-flight request
-- `/quit` exits the client
 
 ## License
 
