@@ -775,7 +775,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
         "tools=expanded"
     };
     let footer_text = format!(
-        "url={} session_id={}  enter=send  shift+enter=newline  tab=complete  up/down=scroll  ctrl+p/n=history  ctrl+b/f/a/e=move  ctrl+t=tools  {}  {}  esc=quit",
+        "url={} session_id={}  enter=send  alt+enter=newline  tab=complete  up/down=scroll  ctrl+p/n=history  ctrl+b/f/a/e=move  ctrl+t=tools  {}  {}  esc=quit",
         app.url, app.session_id, tool_state, scroll_state
     );
     let status = Paragraph::new(truncate_to_width(
