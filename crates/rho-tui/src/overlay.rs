@@ -81,6 +81,7 @@ impl Default for OverlayOptions {
 struct OverlayEntry {
     id: u64,
     lines: Vec<Line<'static>>,
+    widget: Paragraph<'static>,
     options: OverlayOptions,
     hidden: bool,
 }
@@ -102,9 +103,11 @@ impl OverlayStack {
     pub fn show(&mut self, lines: Vec<Line<'static>>, options: OverlayOptions) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
+        let widget = build_overlay_widget(lines.as_slice(), &options);
         self.entries.push(OverlayEntry {
             id,
             lines,
+            widget,
             options,
             hidden: false,
         });
@@ -115,7 +118,9 @@ impl OverlayStack {
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
             return false;
         };
+        let widget = build_overlay_widget(lines.as_slice(), &entry.options);
         entry.lines = lines;
+        entry.widget = widget;
         true
     }
 
@@ -161,12 +166,8 @@ impl OverlayStack {
                 continue;
             }
 
-            let title = entry.options.title.as_deref().unwrap_or("overlay");
-            let widget = Paragraph::new(entry.lines.clone())
-                .block(Block::default().borders(Borders::ALL).title(title))
-                .wrap(Wrap { trim: false });
             frame.render_widget(Clear, rect);
-            frame.render_widget(widget, rect);
+            frame.render_widget(&entry.widget, rect);
         }
     }
 
@@ -257,13 +258,24 @@ fn resolve_overlay_rect(area: Rect, lines: &[Line<'_>], options: &OverlayOptions
     }
 }
 
+fn build_overlay_widget(lines: &[Line<'static>], options: &OverlayOptions) -> Paragraph<'static> {
+    let title = options
+        .title
+        .clone()
+        .unwrap_or_else(|| "overlay".to_string());
+    Paragraph::new(lines.to_vec())
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false })
+}
+
 fn max_content_width(lines: &[Line<'_>]) -> u16 {
     let mut max_width = 1u16;
     for line in lines {
         let width = line
-            .to_string()
-            .chars()
-            .count()
+            .spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum::<usize>()
             .try_into()
             .unwrap_or(u16::MAX);
         max_width = max_width.max(width);

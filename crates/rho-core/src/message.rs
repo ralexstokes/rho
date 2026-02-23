@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -44,20 +46,34 @@ pub fn encode_assistant_message_content(
         return plain_text;
     }
 
-    let payload = AssistantToolCallsPayload {
-        kind: ASSISTANT_TOOL_CALLS_PAYLOAD_KIND.to_string(),
-        text: plain_text.clone(),
-        tool_calls: tool_calls
-            .iter()
-            .map(AssistantToolCallPayload::from)
-            .collect(),
+    let payload = AssistantToolCallsPayloadRef {
+        kind: ASSISTANT_TOOL_CALLS_PAYLOAD_KIND,
+        text: &plain_text,
+        tool_calls,
     };
 
     serde_json::to_string(&payload).unwrap_or(plain_text)
 }
 
 pub fn decode_assistant_message_content(content: &str) -> ParsedAssistantMessageContent {
-    match serde_json::from_str::<AssistantToolCallsPayload>(content) {
+    decode_assistant_message_content_cow(Cow::Borrowed(content))
+}
+
+pub(crate) fn decode_assistant_message_content_owned(
+    content: String,
+) -> ParsedAssistantMessageContent {
+    decode_assistant_message_content_cow(Cow::Owned(content))
+}
+
+fn decode_assistant_message_content_cow(content: Cow<'_, str>) -> ParsedAssistantMessageContent {
+    if !looks_like_json_object(content.as_ref()) {
+        return ParsedAssistantMessageContent {
+            text: content.into_owned(),
+            tool_calls: Vec::new(),
+        };
+    }
+
+    match serde_json::from_str::<AssistantToolCallsPayload>(content.as_ref()) {
         Ok(payload) if payload.kind == ASSISTANT_TOOL_CALLS_PAYLOAD_KIND => {
             ParsedAssistantMessageContent {
                 text: payload.text,
@@ -65,10 +81,21 @@ pub fn decode_assistant_message_content(content: &str) -> ParsedAssistantMessage
             }
         }
         _ => ParsedAssistantMessageContent {
-            text: content.to_string(),
+            text: content.into_owned(),
             tool_calls: Vec::new(),
         },
     }
+}
+
+fn looks_like_json_object(content: &str) -> bool {
+    content.trim_start().starts_with('{')
+}
+
+#[derive(Debug, Serialize)]
+struct AssistantToolCallsPayloadRef<'a> {
+    kind: &'static str,
+    text: &'a str,
+    tool_calls: &'a [ToolCall],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
