@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::{
+    editor::EditorState,
     theme::UiTheme,
     widgets::{
         TextBlock, loader_frame, render_markdown, section_block, spacer_lines, truncate_to_width,
@@ -168,8 +169,7 @@ struct AppState {
     theme: UiTheme,
     log_lines: Vec<LogLine>,
     active_assistant_line: Option<usize>,
-    input: String,
-    cursor_chars: usize,
+    editor: EditorState,
     frame_tick: u64,
     should_quit: bool,
 }
@@ -182,8 +182,7 @@ impl AppState {
             theme: UiTheme::default(),
             log_lines: Vec::new(),
             active_assistant_line: None,
-            input: String::new(),
-            cursor_chars: 0,
+            editor: EditorState::new(),
             frame_tick: 0,
             should_quit: false,
         };
@@ -272,90 +271,6 @@ impl AppState {
         }
     }
 
-    fn commit_input_line(&mut self) -> String {
-        self.cursor_chars = 0;
-        std::mem::take(&mut self.input)
-    }
-
-    fn input_char_len(&self) -> usize {
-        self.input.chars().count()
-    }
-
-    fn cursor_char_index(&self) -> usize {
-        self.cursor_chars.min(self.input_char_len())
-    }
-
-    fn move_cursor_left(&mut self) {
-        self.cursor_chars = self.cursor_char_index().saturating_sub(1);
-    }
-
-    fn move_cursor_right(&mut self) {
-        let len = self.input_char_len();
-        self.cursor_chars = (self.cursor_char_index() + 1).min(len);
-    }
-
-    fn move_cursor_home(&mut self) {
-        self.cursor_chars = 0;
-    }
-
-    fn move_cursor_end(&mut self) {
-        self.cursor_chars = self.input_char_len();
-    }
-
-    fn insert_char(&mut self, ch: char) {
-        let cursor = self.cursor_char_index();
-        let byte_index = char_to_byte_index(self.input.as_str(), cursor);
-        self.input.insert(byte_index, ch);
-        self.cursor_chars = cursor + 1;
-    }
-
-    fn backspace(&mut self) {
-        let cursor = self.cursor_char_index();
-        if cursor == 0 {
-            return;
-        }
-
-        let remove_start = char_to_byte_index(self.input.as_str(), cursor - 1);
-        let remove_end = char_to_byte_index(self.input.as_str(), cursor);
-        self.input.replace_range(remove_start..remove_end, "");
-        self.cursor_chars = cursor - 1;
-    }
-
-    fn delete(&mut self) {
-        let cursor = self.cursor_char_index();
-        let len = self.input_char_len();
-        if cursor >= len {
-            return;
-        }
-
-        let remove_start = char_to_byte_index(self.input.as_str(), cursor);
-        let remove_end = char_to_byte_index(self.input.as_str(), cursor + 1);
-        self.input.replace_range(remove_start..remove_end, "");
-    }
-
-    fn render_input(&self, max_cols: usize) -> (String, usize) {
-        if max_cols == 0 {
-            return (String::new(), 0);
-        }
-
-        let total_chars = self.input_char_len();
-        let cursor = self.cursor_char_index();
-        if total_chars <= max_cols {
-            return (self.input.clone(), cursor.min(max_cols));
-        }
-
-        let max_start = total_chars.saturating_sub(max_cols);
-        let start = cursor.saturating_sub(max_cols.saturating_sub(1)).min(max_start);
-        let end = (start + max_cols).min(total_chars);
-        let rendered = self
-            .input
-            .chars()
-            .skip(start)
-            .take(end.saturating_sub(start))
-            .collect();
-        let cursor_col = cursor.saturating_sub(start).min(max_cols.saturating_sub(1));
-        (rendered, cursor_col)
-    }
 }
 
 async fn run_writer(
@@ -413,7 +328,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(3),
+            Constraint::Length(6),
             Constraint::Length(1),
         ])
         .split(frame.area());
@@ -473,9 +388,12 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
         .wrap(Wrap { trim: false });
     frame.render_widget(history, layout[0]);
 
-    let input_width = usize::from(layout[1].width.saturating_sub(2));
-    let (input_display, cursor_col) = app.render_input(input_width);
-    let input = Paragraph::new(input_display).block(section_block("input", app.theme.input_border));
+    let editor_height = usize::from(layout[1].height.saturating_sub(2));
+    let editor_width = usize::from(layout[1].width.saturating_sub(2));
+    let editor_render = app.editor.render(editor_width, editor_height);
+    let input = Paragraph::new(editor_render.lines.join("\n"))
+        .block(section_block("editor", app.theme.input_border))
+        .wrap(Wrap { trim: false });
     frame.render_widget(input, layout[1]);
 
     let footer_text = format!(
@@ -492,8 +410,11 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
     let input_x = layout[1]
         .x
         .saturating_add(1)
-        .saturating_add(u16::try_from(cursor_col).unwrap_or(u16::MAX));
-    let input_y = layout[1].y.saturating_add(1);
+        .saturating_add(u16::try_from(editor_render.cursor_col).unwrap_or(u16::MAX));
+    let input_y = layout[1]
+        .y
+        .saturating_add(1)
+        .saturating_add(u16::try_from(editor_render.cursor_row).unwrap_or(u16::MAX));
     frame.set_cursor_position((input_x, input_y));
 }
 
@@ -504,6 +425,10 @@ fn handle_terminal_event(
 ) -> Result<(), TuiClientError> {
     match event {
         Event::Key(key) => handle_key_event(key, app, outbound_tx),
+        Event::Paste(text) => {
+            app.editor.handle_paste(text);
+            Ok(())
+        }
         Event::Resize(_, _) => Ok(()),
         _ => Ok(()),
     }
@@ -528,19 +453,69 @@ fn handle_key_event(
             app.should_quit = true;
         }
         KeyCode::Enter => {
-            submit_input(app, outbound_tx)?;
+            if key.modifiers.intersects(
+                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+            ) {
+                app.editor.insert_newline();
+            } else {
+                submit_input(app, outbound_tx)?;
+            }
         }
-        KeyCode::Backspace => app.backspace(),
-        KeyCode::Delete => app.delete(),
-        KeyCode::Left => app.move_cursor_left(),
-        KeyCode::Right => app.move_cursor_right(),
-        KeyCode::Home => app.move_cursor_home(),
-        KeyCode::End => app.move_cursor_end(),
+        KeyCode::Backspace => app.editor.backspace(),
+        KeyCode::Delete => app.editor.delete(),
+        KeyCode::Left => app.editor.move_left(),
+        KeyCode::Right => app.editor.move_right(),
+        KeyCode::Up => {
+            if app.editor.text().contains('\n') {
+                app.editor.move_up();
+            } else {
+                app.editor.history_up();
+            }
+        }
+        KeyCode::Down => {
+            if app.editor.text().contains('\n') {
+                app.editor.move_down();
+            } else {
+                app.editor.history_down();
+            }
+        }
+        KeyCode::Home => app.editor.move_home(),
+        KeyCode::End => app.editor.move_end(),
+        KeyCode::Char(ch)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'w' =>
+        {
+            app.editor.delete_word_backward();
+        }
+        KeyCode::Char(ch)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'u' =>
+        {
+            app.editor.delete_to_line_start();
+        }
+        KeyCode::Char(ch)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'k' =>
+        {
+            app.editor.delete_to_line_end();
+        }
+        KeyCode::Char(ch)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'y' =>
+        {
+            app.editor.yank();
+        }
+        KeyCode::Char(ch)
+            if key.modifiers.contains(KeyModifiers::ALT) && ch == 'y' =>
+        {
+            app.editor.yank_pop();
+        }
+        KeyCode::Char(ch)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && ch == '-' =>
+        {
+            app.editor.undo();
+        }
         KeyCode::Char(ch)
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
         {
-            app.insert_char(ch)
+            app.editor.insert_char(ch)
         }
         _ => {}
     }
@@ -552,7 +527,8 @@ fn submit_input(
     app: &mut AppState,
     outbound_tx: &mpsc::UnboundedSender<ClientEvent>,
 ) -> Result<(), TuiClientError> {
-    let line = app.commit_input_line();
+    let submission = app.editor.submit();
+    let line = submission.raw;
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Ok(());
@@ -579,7 +555,7 @@ fn submit_input(
         outbound_tx,
         ClientEvent::UserMessage(UserMessage {
             session_id: app.session_id.clone(),
-            message: Message::new(MessageRole::User, line),
+            message: Message::new(MessageRole::User, submission.expanded),
         }),
     )?;
 
@@ -666,17 +642,6 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn char_to_byte_index(text: &str, char_index: usize) -> usize {
-    if char_index == 0 {
-        return 0;
-    }
-
-    text.char_indices()
-        .nth(char_index)
-        .map(|(index, _)| index)
-        .unwrap_or(text.len())
-}
-
 fn format_tool_started(call: &rho_core::ToolCall) -> String {
     format!(
         "started call_id={} name={} input={}",
@@ -753,22 +718,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn render_input_keeps_cursor_visible_when_clipped() {
-        let app = AppState {
-            url: "ws://localhost:8787/ws".to_string(),
-            session_id: "session-1".to_string(),
-            theme: UiTheme::default(),
-            log_lines: Vec::new(),
-            active_assistant_line: None,
-            input: "abcdefghij".to_string(),
-            cursor_chars: 9,
-            frame_tick: 0,
-            should_quit: false,
-        };
-
-        let (visible, col) = app.render_input(5);
-        assert_eq!(visible, "fghij");
-        assert_eq!(col, 4);
-    }
 }
