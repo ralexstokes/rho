@@ -606,9 +606,9 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
         .y
         .saturating_add(1)
         .saturating_add(u16::try_from(editor_render.cursor_row).unwrap_or(u16::MAX));
-    frame.set_cursor_position((input_x, input_y));
 
     app.overlays.render(frame, frame.area());
+    frame.set_cursor_position((input_x, input_y));
 }
 
 fn handle_terminal_event(

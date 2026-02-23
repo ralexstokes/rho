@@ -317,4 +317,14 @@ mod tests {
         assert!(rect.x + rect.width <= 80);
         assert!(rect.y + rect.height <= 24);
     }
+
+    #[test]
+    fn hide_topmost_removes_last_overlay_first() {
+        let mut stack = OverlayStack::new();
+        let first = stack.show(vec![Line::from("first")], OverlayOptions::default());
+        let second = stack.show(vec![Line::from("second")], OverlayOptions::default());
+        assert!(stack.hide_topmost());
+        assert!(!stack.hide(second));
+        assert!(stack.hide(first));
+    }
 }

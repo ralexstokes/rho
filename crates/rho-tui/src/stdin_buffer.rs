@@ -82,4 +82,30 @@ mod tests {
             vec![StdinBufferChunk::Paste("line1\nline2".to_string())]
         );
     }
+
+    #[test]
+    fn handles_paste_split_across_chunks() {
+        let mut buffer = StdinBuffer::new();
+        let first = buffer.process("\u{1b}[200~line1");
+        assert!(first.is_empty());
+        let second = buffer.process("\nline2\u{1b}[201~");
+        assert_eq!(
+            second,
+            vec![StdinBufferChunk::Paste("line1\nline2".to_string())]
+        );
+    }
+
+    #[test]
+    fn handles_mixed_text_and_paste() {
+        let mut buffer = StdinBuffer::new();
+        let chunks = buffer.process("a\u{1b}[200~b\u{1b}[201~c");
+        assert_eq!(
+            chunks,
+            vec![
+                StdinBufferChunk::Data("a".to_string()),
+                StdinBufferChunk::Paste("b".to_string()),
+                StdinBufferChunk::Data("c".to_string())
+            ]
+        );
+    }
 }

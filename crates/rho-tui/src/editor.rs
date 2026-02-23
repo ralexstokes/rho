@@ -676,4 +676,27 @@ mod tests {
         editor.undo();
         assert_eq!(editor.text(), "abc");
     }
+
+    #[test]
+    fn unicode_backspace_removes_single_grapheme_cluster_codepoint_sequence() {
+        let mut editor = EditorState::new();
+        editor.insert_text("A🙂");
+        editor.backspace();
+        assert_eq!(editor.text(), "A");
+    }
+
+    #[test]
+    fn kill_ring_yank_and_yank_pop_cycle_values() {
+        let mut editor = EditorState::new();
+        editor.insert_text("one two");
+        editor.delete_word_backward(); // kills "two"
+        editor.insert_text(" three");
+        editor.delete_word_backward(); // kills "three"
+
+        editor.yank();
+        assert!(editor.text().ends_with("three"));
+
+        editor.yank_pop();
+        assert!(editor.text().ends_with("two"));
+    }
 }

@@ -83,4 +83,22 @@ mod tests {
         let event = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
         assert!(matches_key(&event, Key::UP));
     }
+
+    #[test]
+    fn detects_release_and_repeat_events() {
+        let repeat = KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Repeat,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        let release = KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        assert!(is_key_repeat(&repeat));
+        assert!(is_key_release(&release));
+    }
 }
