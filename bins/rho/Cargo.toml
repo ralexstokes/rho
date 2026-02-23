@@ -9,4 +9,4 @@ clap.workspace = true
 rho-agent = { path = "../../crates/rho-agent" }
 rho-core = { path = "../../crates/rho-core" }
 rho-tui = { path = "../../crates/rho-tui" }
-tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread"] }

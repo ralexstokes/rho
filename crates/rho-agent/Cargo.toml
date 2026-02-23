@@ -6,12 +6,12 @@ license.workspace = true
 
 [dependencies]
 rho-core = { path = "../rho-core" }
-axum = { version = "0.8.6", features = ["ws"] }
+axum = { version = "0.8.8", features = ["ws"] }
 futures-util.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 uuid.workspace = true
 
 [dev-dependencies]
-futures = "0.3.31"
+futures = "0.3.32"

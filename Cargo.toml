@@ -11,11 +11,11 @@ resolver = "3"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-clap = { version = "4.5.48", features = ["derive"] }
-futures-core = "0.3.31"
-futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
+clap = { version = "4.5.60", features = ["derive"] }
+futures-core = "0.3.32"
+futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 rig = { package = "rig-core", version = "0.31.0" }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
-thiserror = "2.0.16"
-uuid = { version = "1.18.1", features = ["v4"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+uuid = { version = "1.21.0", features = ["v4"] }
