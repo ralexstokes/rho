@@ -134,7 +134,7 @@ impl AgentRuntime {
                             session_id: session_id.clone(),
                             call: call.clone(),
                         }));
-                        let result = execute_builtin_tool(&call);
+                        let result = execute_builtin_tool(call.clone()).await;
                         assistant_tool_calls.push(call);
 
                         push_tool_result_event(emit_event, &session_id, result, &mut tool_messages);
@@ -290,7 +290,20 @@ fn builtin_tool_definitions() -> &'static [ToolDefinition] {
     BUILTIN_TOOL_DEFINITIONS.as_slice()
 }
 
-fn execute_builtin_tool(call: &ToolCall) -> ToolResult {
+async fn execute_builtin_tool(call: ToolCall) -> ToolResult {
+    let call_id = call.call_id.clone();
+    let tool_name = call.name.clone();
+
+    match tokio::task::spawn_blocking(move || execute_builtin_tool_blocking(&call)).await {
+        Ok(result) => result,
+        Err(error) => tool_error(
+            &call_id,
+            format!("tool `{tool_name}` execution task failed: {error}"),
+        ),
+    }
+}
+
+fn execute_builtin_tool_blocking(call: &ToolCall) -> ToolResult {
     match call.name.as_str() {
         "read" => read_tool(call),
         "write" => write_tool(call),
@@ -473,253 +486,243 @@ mod tests {
     type FakeResponse = Vec<Result<ProviderEvent, ProviderError>>;
     type FakeResponseQueue = VecDeque<FakeResponse>;
 
-    #[test]
-    fn run_user_message_without_tool_calls_emits_final() {
-        futures::executor::block_on(async {
-            let runtime = AgentRuntime::new();
-            let mut session = runtime.start_session("session-1");
-            let provider = FakeProvider::new(vec![vec![
-                Ok(ProviderEvent::AssistantDelta {
-                    delta: "hello".to_string(),
+    #[tokio::test]
+    async fn run_user_message_without_tool_calls_emits_final() {
+        let runtime = AgentRuntime::new();
+        let mut session = runtime.start_session("session-1");
+        let provider = FakeProvider::new(vec![vec![
+            Ok(ProviderEvent::AssistantDelta {
+                delta: "hello".to_string(),
+            }),
+            Ok(ProviderEvent::Message {
+                message: Message::new(MessageRole::Assistant, "hello"),
+            }),
+            Ok(ProviderEvent::Finished),
+        ]]);
+
+        let events = runtime
+            .run_user_message(&mut session, &provider, ModelKind::Gpt52, "hi")
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            ServerEvent::AssistantDelta(AssistantDelta { session_id, delta })
+            if session_id == "session-1" && delta == "hello"
+        ));
+        assert!(matches!(
+            &events[1],
+            ServerEvent::Final(FinalMessage { session_id, message })
+            if session_id == "session-1"
+                && message.role == MessageRole::Assistant
+                && message.content == "hello"
+        ));
+        assert_eq!(
+            session.messages(),
+            [
+                Message::new(MessageRole::User, "hi"),
+                Message::new(MessageRole::Assistant, "hello")
+            ]
+        );
+        assert_eq!(provider.requests().len(), 1);
+        let tool_names: Vec<String> = provider.requests()[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        assert_eq!(tool_names, ["read", "write", "bash"]);
+    }
+
+    #[tokio::test]
+    async fn run_user_message_executes_read_tool_and_continues() {
+        let runtime = AgentRuntime::new();
+        let mut session = runtime.start_session("session-2");
+        let file_path = temp_file_path("read");
+        fs::write(&file_path, "file-content").expect("write fixture file");
+
+        let provider = FakeProvider::new(vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: None,
+                        call_id: "call-1".to_string(),
+                        name: "read".to_string(),
+                        input: json!({ "path": file_path.display().to_string() }),
+                    },
                 }),
                 Ok(ProviderEvent::Message {
-                    message: Message::new(MessageRole::Assistant, "hello"),
+                    message: Message::new(MessageRole::Assistant, ""),
                 }),
                 Ok(ProviderEvent::Finished),
-            ]]);
+            ],
+            vec![
+                Ok(ProviderEvent::AssistantDelta {
+                    delta: "done".to_string(),
+                }),
+                Ok(ProviderEvent::Message {
+                    message: Message::new(MessageRole::Assistant, "done"),
+                }),
+                Ok(ProviderEvent::Finished),
+            ],
+        ]);
 
-            let events = runtime
-                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "hi")
-                .await
-                .expect("run should succeed");
+        let events = runtime
+            .run_user_message(&mut session, &provider, ModelKind::Gpt52, "read the file")
+            .await
+            .expect("run should succeed");
 
-            assert_eq!(events.len(), 2);
-            assert!(matches!(
-                &events[0],
-                ServerEvent::AssistantDelta(AssistantDelta { session_id, delta })
-                if session_id == "session-1" && delta == "hello"
-            ));
-            assert!(matches!(
-                &events[1],
-                ServerEvent::Final(FinalMessage { session_id, message })
-                if session_id == "session-1"
-                    && message.role == MessageRole::Assistant
-                    && message.content == "hello"
-            ));
-            assert_eq!(
-                session.messages(),
-                [
-                    Message::new(MessageRole::User, "hi"),
-                    Message::new(MessageRole::Assistant, "hello")
-                ]
-            );
-            assert_eq!(provider.requests().len(), 1);
-            let tool_names: Vec<String> = provider.requests()[0]
-                .tools
-                .iter()
-                .map(|tool| tool.name.clone())
-                .collect();
-            assert_eq!(tool_names, ["read", "write", "bash"]);
-        });
+        assert!(events.iter().any(
+            |event| matches!(event, ServerEvent::ToolStarted(tool_started) if tool_started.call.name == "read")
+        ));
+        let tool_completed = events
+            .iter()
+            .find_map(|event| match event {
+                ServerEvent::ToolCompleted(tool_completed) => Some(tool_completed),
+                _ => None,
+            })
+            .expect("expected a tool completion event");
+        assert!(!tool_completed.result.is_error);
+        assert_eq!(tool_completed.result.output, "file-content");
+
+        assert!(events.iter().any(
+            |event| matches!(event, ServerEvent::Final(final_message) if final_message.message.content == "done")
+        ));
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        let second_request_tool_message = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .expect("second request should contain a tool message");
+        let payload: Value = serde_json::from_str(&second_request_tool_message.content)
+            .expect("tool message should be JSON");
+        assert_eq!(payload["call_id"], json!("call-1"));
+        assert_eq!(payload["is_error"], json!(false));
+        assert_eq!(payload["output"], json!("file-content"));
+        let second_request_assistant_message = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("second request should contain assistant tool calls");
+        let parsed_assistant =
+            decode_assistant_message_content(&second_request_assistant_message.content);
+        assert_eq!(parsed_assistant.text, "");
+        assert_eq!(parsed_assistant.tool_calls.len(), 1);
+        assert_eq!(parsed_assistant.tool_calls[0].call_id, "call-1");
+        assert_eq!(parsed_assistant.tool_calls[0].name, "read");
+        assert_eq!(
+            parsed_assistant.tool_calls[0].input,
+            json!({ "path": file_path.display().to_string() })
+        );
+
+        let _ = fs::remove_file(file_path);
     }
 
-    #[test]
-    fn run_user_message_executes_read_tool_and_continues() {
-        futures::executor::block_on(async {
-            let runtime = AgentRuntime::new();
-            let mut session = runtime.start_session("session-2");
-            let file_path = temp_file_path("read");
-            fs::write(&file_path, "file-content").expect("write fixture file");
+    #[tokio::test]
+    async fn tool_failures_surface_as_structured_tool_results() {
+        let runtime = AgentRuntime::new();
+        let mut session = runtime.start_session("session-3");
+        let provider = FakeProvider::new(vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: None,
+                        call_id: "call-2".to_string(),
+                        name: "missing_tool".to_string(),
+                        input: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Message {
+                    message: Message::new(MessageRole::Assistant, ""),
+                }),
+                Ok(ProviderEvent::Finished),
+            ],
+            vec![
+                Ok(ProviderEvent::Message {
+                    message: Message::new(MessageRole::Assistant, "tool failed"),
+                }),
+                Ok(ProviderEvent::Finished),
+            ],
+        ]);
 
-            let provider = FakeProvider::new(vec![
-                vec![
-                    Ok(ProviderEvent::ToolCall {
-                        call: ToolCall {
-                            id: None,
-                            call_id: "call-1".to_string(),
-                            name: "read".to_string(),
-                            input: json!({ "path": file_path.display().to_string() }),
-                        },
-                    }),
-                    Ok(ProviderEvent::Message {
-                        message: Message::new(MessageRole::Assistant, ""),
-                    }),
-                    Ok(ProviderEvent::Finished),
-                ],
-                vec![
-                    Ok(ProviderEvent::AssistantDelta {
-                        delta: "done".to_string(),
-                    }),
-                    Ok(ProviderEvent::Message {
-                        message: Message::new(MessageRole::Assistant, "done"),
-                    }),
-                    Ok(ProviderEvent::Finished),
-                ],
-            ]);
+        let events = runtime
+            .run_user_message(&mut session, &provider, ModelKind::Gpt52, "do something")
+            .await
+            .expect("run should continue after tool failure");
 
-            let events = runtime
-                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "read the file")
-                .await
-                .expect("run should succeed");
-
-            assert!(events
-                .iter()
-                .any(|event| matches!(event, ServerEvent::ToolStarted(tool_started) if tool_started.call.name == "read")));
-            let tool_completed = events
-                .iter()
-                .find_map(|event| match event {
-                    ServerEvent::ToolCompleted(tool_completed) => Some(tool_completed),
-                    _ => None,
-                })
-                .expect("expected a tool completion event");
-            assert!(!tool_completed.result.is_error);
-            assert_eq!(tool_completed.result.output, "file-content");
-
-            assert!(events
-                .iter()
-                .any(|event| matches!(event, ServerEvent::Final(final_message) if final_message.message.content == "done")));
-
-            let requests = provider.requests();
-            assert_eq!(requests.len(), 2);
-            let second_request_tool_message = requests[1]
-                .messages
-                .iter()
-                .find(|message| message.role == MessageRole::Tool)
-                .expect("second request should contain a tool message");
-            let payload: Value = serde_json::from_str(&second_request_tool_message.content)
-                .expect("tool message should be JSON");
-            assert_eq!(payload["call_id"], json!("call-1"));
-            assert_eq!(payload["is_error"], json!(false));
-            assert_eq!(payload["output"], json!("file-content"));
-            let second_request_assistant_message = requests[1]
-                .messages
-                .iter()
-                .find(|message| message.role == MessageRole::Assistant)
-                .expect("second request should contain assistant tool calls");
-            let parsed_assistant =
-                decode_assistant_message_content(&second_request_assistant_message.content);
-            assert_eq!(parsed_assistant.text, "");
-            assert_eq!(parsed_assistant.tool_calls.len(), 1);
-            assert_eq!(parsed_assistant.tool_calls[0].call_id, "call-1");
-            assert_eq!(parsed_assistant.tool_calls[0].name, "read");
-            assert_eq!(
-                parsed_assistant.tool_calls[0].input,
-                json!({ "path": file_path.display().to_string() })
-            );
-
-            let _ = fs::remove_file(file_path);
-        });
+        let tool_completed = events
+            .iter()
+            .find_map(|event| match event {
+                ServerEvent::ToolCompleted(tool_completed) => Some(tool_completed),
+                _ => None,
+            })
+            .expect("expected tool completion");
+        assert!(tool_completed.result.is_error);
+        assert!(tool_completed.result.output.contains("unknown tool"));
+        assert!(events.iter().any(
+            |event| matches!(event, ServerEvent::Final(final_message) if final_message.message.content == "tool failed")
+        ));
     }
 
-    #[test]
-    fn tool_failures_surface_as_structured_tool_results() {
-        futures::executor::block_on(async {
-            let runtime = AgentRuntime::new();
-            let mut session = runtime.start_session("session-3");
-            let provider = FakeProvider::new(vec![
-                vec![
-                    Ok(ProviderEvent::ToolCall {
-                        call: ToolCall {
-                            id: None,
-                            call_id: "call-2".to_string(),
-                            name: "missing_tool".to_string(),
-                            input: json!({}),
-                        },
-                    }),
-                    Ok(ProviderEvent::Message {
-                        message: Message::new(MessageRole::Assistant, ""),
-                    }),
-                    Ok(ProviderEvent::Finished),
-                ],
-                vec![
-                    Ok(ProviderEvent::Message {
-                        message: Message::new(MessageRole::Assistant, "tool failed"),
-                    }),
-                    Ok(ProviderEvent::Finished),
-                ],
-            ]);
+    #[tokio::test]
+    async fn run_user_message_enforces_tool_iteration_limit() {
+        let runtime = AgentRuntime::with_max_tool_iterations(1);
+        let mut session = runtime.start_session("session-4");
+        let provider = FakeProvider::new(vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: None,
+                        call_id: "call-3".to_string(),
+                        name: "bash".to_string(),
+                        input: json!({ "command": "echo first" }),
+                    },
+                }),
+                Ok(ProviderEvent::Finished),
+            ],
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: None,
+                        call_id: "call-4".to_string(),
+                        name: "bash".to_string(),
+                        input: json!({ "command": "echo second" }),
+                    },
+                }),
+                Ok(ProviderEvent::Finished),
+            ],
+        ]);
 
-            let events = runtime
-                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "do something")
-                .await
-                .expect("run should continue after tool failure");
-
-            let tool_completed = events
-                .iter()
-                .find_map(|event| match event {
-                    ServerEvent::ToolCompleted(tool_completed) => Some(tool_completed),
-                    _ => None,
-                })
-                .expect("expected tool completion");
-            assert!(tool_completed.result.is_error);
-            assert!(tool_completed.result.output.contains("unknown tool"));
-            assert!(events
-                .iter()
-                .any(|event| matches!(event, ServerEvent::Final(final_message) if final_message.message.content == "tool failed")));
-        });
+        let error = runtime
+            .run_user_message(&mut session, &provider, ModelKind::Gpt52, "loop")
+            .await
+            .expect_err("run should fail once the limit is exceeded");
+        assert!(matches!(error, AgentError::MaxToolIterationsExceeded(1)));
     }
 
-    #[test]
-    fn run_user_message_enforces_tool_iteration_limit() {
-        futures::executor::block_on(async {
-            let runtime = AgentRuntime::with_max_tool_iterations(1);
-            let mut session = runtime.start_session("session-4");
-            let provider = FakeProvider::new(vec![
-                vec![
-                    Ok(ProviderEvent::ToolCall {
-                        call: ToolCall {
-                            id: None,
-                            call_id: "call-3".to_string(),
-                            name: "bash".to_string(),
-                            input: json!({ "command": "echo first" }),
-                        },
-                    }),
-                    Ok(ProviderEvent::Finished),
-                ],
-                vec![
-                    Ok(ProviderEvent::ToolCall {
-                        call: ToolCall {
-                            id: None,
-                            call_id: "call-4".to_string(),
-                            name: "bash".to_string(),
-                            input: json!({ "command": "echo second" }),
-                        },
-                    }),
-                    Ok(ProviderEvent::Finished),
-                ],
-            ]);
+    #[tokio::test]
+    async fn run_user_message_borrows_history_and_reuses_builtin_tools() {
+        let runtime = AgentRuntime::new();
+        let mut session = runtime.start_session("session-5");
+        let provider = PointerRecordingProvider::new(vec![vec![Ok(ProviderEvent::Finished)]]);
 
-            let error = runtime
-                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "loop")
-                .await
-                .expect_err("run should fail once the limit is exceeded");
-            assert!(matches!(error, AgentError::MaxToolIterationsExceeded(1)));
-        });
-    }
+        runtime
+            .run_user_message(&mut session, &provider, ModelKind::Gpt52, "hello")
+            .await
+            .expect("run should succeed");
 
-    #[test]
-    fn run_user_message_borrows_history_and_reuses_builtin_tools() {
-        futures::executor::block_on(async {
-            let runtime = AgentRuntime::new();
-            let mut session = runtime.start_session("session-5");
-            let provider = PointerRecordingProvider::new(vec![vec![Ok(ProviderEvent::Finished)]]);
-
-            runtime
-                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "hello")
-                .await
-                .expect("run should succeed");
-
-            let request_pointers = provider.request_pointers();
-            assert_eq!(request_pointers.len(), 1);
-            assert_eq!(
-                request_pointers[0].message_ptr,
-                session.messages().as_ptr() as usize
-            );
-            assert_eq!(
-                request_pointers[0].tool_ptr,
-                builtin_tool_definitions().as_ptr() as usize
-            );
-        });
+        let request_pointers = provider.request_pointers();
+        assert_eq!(request_pointers.len(), 1);
+        assert_eq!(
+            request_pointers[0].message_ptr,
+            session.messages().as_ptr() as usize
+        );
+        assert_eq!(
+            request_pointers[0].tool_ptr,
+            builtin_tool_definitions().as_ptr() as usize
+        );
     }
 
     #[derive(Debug, Clone)]

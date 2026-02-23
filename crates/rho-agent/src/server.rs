@@ -432,7 +432,9 @@ mod tests {
         Message,
         providers::{ModelKind, ProviderError, ProviderRequest, ProviderStream},
         stream::ProviderEvent,
+        tool::ToolCall,
     };
+    use serde_json::json;
     use tokio::sync::mpsc;
     use uuid::Uuid;
 
@@ -558,6 +560,101 @@ mod tests {
                 | ServerEvent::ToolCompleted(_)
         ));
         assert!(matches!(second.event, ServerEvent::Final(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_tool_execution_does_not_stall_other_sessions() {
+        let provider = Arc::new(FakeProvider::new(vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: None,
+                        call_id: "call-slow".to_string(),
+                        name: "bash".to_string(),
+                        input: json!({ "command": "sleep 0.6" }),
+                    },
+                }),
+                Ok(ProviderEvent::Finished),
+            ],
+            vec![
+                Ok(ProviderEvent::Message {
+                    message: Message::new(MessageRole::Assistant, "fast done"),
+                }),
+                Ok(ProviderEvent::Finished),
+            ],
+            vec![
+                Ok(ProviderEvent::Message {
+                    message: Message::new(MessageRole::Assistant, "slow done"),
+                }),
+                Ok(ProviderEvent::Finished),
+            ],
+        ]));
+        let state = test_state(provider);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slow_session_id = "00000000-0000-4000-8000-00000000000c".to_string();
+        let fast_session_id = "00000000-0000-4000-8000-00000000000d".to_string();
+
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::StartSession(rho_core::protocol::StartSession {
+                session_id: Some(slow_session_id.clone()),
+            }),
+        )
+        .await;
+        let _ = rx.recv().await;
+
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::StartSession(rho_core::protocol::StartSession {
+                session_id: Some(fast_session_id.clone()),
+            }),
+        )
+        .await;
+        let _ = rx.recv().await;
+
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::UserMessage(rho_core::protocol::UserMessage {
+                session_id: slow_session_id.clone(),
+                message: Message::new(MessageRole::User, "slow"),
+            }),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_millis(300), async {
+            tokio::task::yield_now().await;
+        })
+        .await
+        .expect("runtime worker should stay responsive while a blocking tool runs");
+
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::UserMessage(rho_core::protocol::UserMessage {
+                session_id: fast_session_id.clone(),
+                message: Message::new(MessageRole::User, "fast"),
+            }),
+        )
+        .await;
+
+        let expected_fast_session_id = fast_session_id.clone();
+        let fast_final = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let envelope = rx.recv().await.expect("missing outbound envelope");
+                if let ServerEvent::Final(final_message) = envelope.event
+                    && final_message.session_id == expected_fast_session_id
+                {
+                    break final_message;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for fast session response");
+
+        assert_eq!(fast_final.message.content, "fast done");
     }
 
     #[tokio::test]
