@@ -7,8 +7,8 @@ use crate::{
     Message, MessageRole,
     providers::{
         Provider, ProviderError, ProviderKind, ProviderRequest, ProviderStream,
-        map_rig_completion_error, map_rig_http_error, map_streamed_assistant_chunk,
-        rig_choice_text, to_rig_chat_request, validate_api_key,
+        apply_common_request_options, map_rig_completion_error, map_rig_http_error,
+        map_streamed_assistant_chunk, rig_choice_text, to_rig_chat_request, validate_api_key,
     },
     stream::ProviderEvent,
 };
@@ -38,18 +38,11 @@ impl Provider for AnthropicProvider {
             let model = client
                 .completion_model(rig_request.model.clone())
                 .with_prompt_caching();
-
-            let mut builder = model
+            let builder = model
                 .completion_request(rig_request.prompt)
                 .messages(rig_request.history);
-
-            if let Some(preamble) = rig_request.preamble {
-                builder = builder.preamble(preamble);
-            }
-
-            if !rig_request.tools.is_empty() {
-                builder = builder.tools(rig_request.tools);
-            }
+            let builder =
+                apply_common_request_options(builder, rig_request.preamble, rig_request.tools);
 
             let mut stream = builder
                 .stream()

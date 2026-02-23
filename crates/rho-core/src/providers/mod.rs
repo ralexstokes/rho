@@ -5,7 +5,9 @@ use rig::{
     OneOrMany,
     completion::{
         AssistantContent as RigAssistantContent, CompletionError as RigCompletionError,
-        Message as RigMessage, ToolDefinition as RigToolDefinition,
+        CompletionModel as RigCompletionModel,
+        CompletionRequestBuilder as RigCompletionRequestBuilder, Message as RigMessage,
+        ToolDefinition as RigToolDefinition,
         message::{ToolResultContent as RigToolResultContent, UserContent as RigUserContent},
     },
     http_client::Error as RigHttpError,
@@ -194,6 +196,27 @@ pub(crate) fn map_streamed_assistant_chunk<R>(
             },
         }),
         _ => None,
+    }
+}
+
+pub(crate) fn apply_common_request_options<M>(
+    builder: RigCompletionRequestBuilder<M>,
+    preamble: Option<String>,
+    tools: Vec<RigToolDefinition>,
+) -> RigCompletionRequestBuilder<M>
+where
+    M: RigCompletionModel,
+{
+    let builder = if let Some(preamble) = preamble {
+        builder.preamble(preamble)
+    } else {
+        builder
+    };
+
+    if tools.is_empty() {
+        builder
+    } else {
+        builder.tools(tools)
     }
 }
 
