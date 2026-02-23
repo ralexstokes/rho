@@ -78,41 +78,49 @@ impl TuiClient {
         let mut tick = tokio::time::interval(Duration::from_millis(33));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut render_state = RenderState::from_env();
+        let mut needs_redraw = true;
 
         while !app.should_quit {
-            render_state.prepare_draw(&mut terminal, app.estimated_rendered_lines())?;
-            if let Err(err) = terminal
-                .terminal_mut()
-                .draw(|frame| draw_ui(frame, &mut app))
-            {
-                let _ = render_state.finish_draw(&mut terminal);
-                return Err(TuiClientError::Io(err));
+            if needs_redraw {
+                render_state.prepare_draw(&mut terminal, app.estimated_rendered_lines())?;
+                if let Err(err) = terminal
+                    .terminal_mut()
+                    .draw(|frame| draw_ui(frame, &mut app))
+                {
+                    let _ = render_state.finish_draw(&mut terminal);
+                    return Err(TuiClientError::Io(err));
+                }
+                render_state.finish_draw(&mut terminal)?;
             }
-            render_state.finish_draw(&mut terminal)?;
 
             tokio::select! {
                 maybe_inbound = inbound_rx.recv() => {
                     match maybe_inbound {
-                        Some(event) => app.handle_network_event(event),
+                        Some(event) => {
+                            needs_redraw = app.handle_network_event(event);
+                        }
                         None => {
                             app.push_system("connection closed".to_string());
                             app.should_quit = true;
+                            needs_redraw = true;
                         }
                     }
                 }
                 maybe_event = events.next() => {
                     match maybe_event {
                         Some(Ok(event)) => {
-                            handle_terminal_event(event, &mut app, &outbound_tx)?;
+                            needs_redraw = handle_terminal_event(event, &mut app, &outbound_tx)?;
                         }
                         Some(Err(err)) => return Err(TuiClientError::Io(err)),
                         None => {
                             app.should_quit = true;
+                            needs_redraw = true;
                         }
                     }
                 }
-                _ = tick.tick() => {
+                _ = tick.tick(), if app.should_animate() => {
                     app.frame_tick = app.frame_tick.wrapping_add(1);
+                    needs_redraw = true;
                 }
             }
         }
@@ -194,8 +202,65 @@ struct AppState {
     awaiting_assistant: bool,
     transcript_scroll_up: usize,
     transcript_viewport_height: usize,
+    transcript_cache: TranscriptRenderCache,
     frame_tick: u64,
     should_quit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum TranscriptRenderMode {
+    Plain,
+    Markdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TranscriptRenderKey {
+    width: u16,
+    mode: TranscriptRenderMode,
+    text: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TranscriptRenderCache {
+    entries: HashMap<TranscriptRenderKey, Vec<Line<'static>>>,
+}
+
+impl TranscriptRenderCache {
+    const MAX_ENTRIES: usize = 512;
+
+    fn render_lines(
+        &mut self,
+        text: &str,
+        width: u16,
+        mode: TranscriptRenderMode,
+        theme: &UiTheme,
+        text_block: &TextBlock,
+    ) -> Vec<Line<'static>> {
+        let key = TranscriptRenderKey {
+            width,
+            mode: mode.clone(),
+            text: text.to_string(),
+        };
+
+        if let Some(lines) = self.entries.get(&key) {
+            return lines.clone();
+        }
+
+        let lines = match mode {
+            TranscriptRenderMode::Plain => text_block.render_lines(text, width),
+            TranscriptRenderMode::Markdown => render_markdown(text, width, theme),
+        };
+
+        if self.entries.len() >= Self::MAX_ENTRIES {
+            self.entries.clear();
+        }
+        self.entries.insert(key, lines.clone());
+        lines
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +343,7 @@ impl AppState {
             awaiting_assistant: false,
             transcript_scroll_up: 0,
             transcript_viewport_height: 0,
+            transcript_cache: TranscriptRenderCache::default(),
             frame_tick: 0,
             should_quit: false,
         };
@@ -361,19 +427,21 @@ impl AppState {
         self.active_assistant_line = None;
     }
 
-    fn handle_network_event(&mut self, event: NetworkEvent) {
+    fn handle_network_event(&mut self, event: NetworkEvent) -> bool {
         match event {
             NetworkEvent::Server(server_event) => match server_event {
-                ServerEvent::SessionAck(_) => {}
+                ServerEvent::SessionAck(_) => false,
                 ServerEvent::AssistantDelta(delta) => {
                     self.awaiting_assistant = false;
-                    self.append_assistant_delta(delta.delta.as_str())
+                    self.append_assistant_delta(delta.delta.as_str());
+                    true
                 }
                 ServerEvent::ToolStarted(tool_started) => {
                     let call = tool_started.call;
                     self.tool_call_names
                         .insert(call.call_id.clone(), call.name.clone());
                     self.push_tool_line(format_tool_started(&call), call.call_id, call.name, true);
+                    true
                 }
                 ServerEvent::ToolCompleted(tool_completed) => {
                     let result = tool_completed.result;
@@ -387,30 +455,36 @@ impl AppState {
                         tool_name,
                         false,
                     );
+                    true
                 }
                 ServerEvent::Final(final_message) => {
                     self.awaiting_assistant = false;
                     self.finalize_assistant(final_message.message.content);
+                    true
                 }
                 ServerEvent::Error(error) => {
                     self.awaiting_assistant = false;
                     self.push_error(format_error(&error));
+                    true
                 }
             },
             NetworkEvent::Closed => {
                 self.awaiting_assistant = false;
                 self.push_error("websocket closed unexpectedly".to_string());
                 self.should_quit = true;
+                true
             }
             NetworkEvent::ReceiveError(err) => {
                 self.awaiting_assistant = false;
                 self.push_error(err);
                 self.should_quit = true;
+                true
             }
             NetworkEvent::ProtocolError(err) => {
                 self.awaiting_assistant = false;
                 self.push_error(err);
                 self.should_quit = true;
+                true
             }
         }
     }
@@ -635,6 +709,18 @@ impl AppState {
         let editor = self.editor.lines().len().max(1);
         history + editor + 3
     }
+
+    fn should_animate(&self) -> bool {
+        if self.awaiting_assistant || self.active_assistant_line.is_some() {
+            return true;
+        }
+
+        self.collapse_tool_calls
+            && self
+                .log_lines
+                .iter()
+                .any(|entry| matches!(entry.kind, LogKind::Tool) && entry.tool_running)
+    }
 }
 
 async fn run_writer(
@@ -783,11 +869,18 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
 
         let prefix_width = u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX);
         let body_width = flow_width.saturating_sub(prefix_width).max(1);
-        let body_lines = if markdown_mode {
-            render_markdown(entry.text.as_str(), body_width, &app.theme)
+        let render_mode = if markdown_mode {
+            TranscriptRenderMode::Markdown
         } else {
-            text_block.render_lines(entry.text.as_str(), body_width)
+            TranscriptRenderMode::Plain
         };
+        let body_lines = app.transcript_cache.render_lines(
+            entry.text.as_str(),
+            body_width,
+            render_mode,
+            &app.theme,
+            &text_block,
+        );
 
         let indent = " ".repeat(prefix.chars().count());
         for (index, line) in body_lines.into_iter().enumerate() {
@@ -892,45 +985,50 @@ fn handle_terminal_event(
     event: Event,
     app: &mut AppState,
     outbound_tx: &mpsc::UnboundedSender<ClientEvent>,
-) -> Result<(), TuiClientError> {
+) -> Result<bool, TuiClientError> {
     match event {
         Event::Key(key) => handle_key_event(key, app, outbound_tx),
         Event::Paste(text) => {
             app.editor.handle_paste(text);
             app.scroll_to_bottom();
             app.refresh_autocomplete(false);
-            Ok(())
+            Ok(true)
         }
         Event::Mouse(mouse) => handle_mouse_event(mouse, app),
-        Event::Resize(_, _) => Ok(()),
-        _ => Ok(()),
+        Event::Resize(_, _) => Ok(true),
+        _ => Ok(false),
     }
 }
 
-fn handle_mouse_event(mouse: MouseEvent, app: &mut AppState) -> Result<(), TuiClientError> {
+fn handle_mouse_event(mouse: MouseEvent, app: &mut AppState) -> Result<bool, TuiClientError> {
     match mouse.kind {
-        MouseEventKind::ScrollUp => app.scroll_up_lines(3),
-        MouseEventKind::ScrollDown => app.scroll_down_lines(3),
-        _ => {}
+        MouseEventKind::ScrollUp => {
+            app.scroll_up_lines(3);
+            Ok(true)
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll_down_lines(3);
+            Ok(true)
+        }
+        _ => Ok(false),
     }
-    Ok(())
 }
 
 fn handle_key_event(
     key: KeyEvent,
     app: &mut AppState,
     outbound_tx: &mpsc::UnboundedSender<ClientEvent>,
-) -> Result<(), TuiClientError> {
+) -> Result<bool, TuiClientError> {
     if is_key_release(&key) {
-        return Ok(());
+        return Ok(false);
     }
     if is_key_repeat(&key) && matches_key(&key, Key::TAB) {
-        return Ok(());
+        return Ok(false);
     }
 
     if matches_key(&key, Key::ctrl('c').as_str()) {
         app.should_quit = true;
-        return Ok(());
+        return Ok(true);
     }
     if matches!(
         key.code,
@@ -939,22 +1037,26 @@ fn handle_key_event(
     {
         app.clear_autocomplete();
         app.toggle_help_overlay();
-        return Ok(());
+        return Ok(true);
     }
     if matches_key(&key, Key::ctrl('t').as_str()) {
         app.collapse_tool_calls = !app.collapse_tool_calls;
-        return Ok(());
+        return Ok(true);
     }
 
     let mut edited = false;
+    let mut state_changed = false;
     match key.code {
         KeyCode::Esc => {
             if app.has_autocomplete() {
                 app.clear_autocomplete();
+                state_changed = true;
             } else if app.overlays.hide_topmost() {
                 app.sync_overlay_ids();
+                state_changed = true;
             } else {
                 app.should_quit = true;
+                state_changed = true;
             }
         }
         KeyCode::Enter => {
@@ -963,7 +1065,7 @@ fn handle_key_event(
                     .modifiers
                     .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
             {
-                app.apply_autocomplete_selection();
+                state_changed |= app.apply_autocomplete_selection();
             } else if key
                 .modifiers
                 .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
@@ -973,10 +1075,12 @@ fn handle_key_event(
             } else {
                 submit_input(app, outbound_tx)?;
                 app.clear_autocomplete();
+                state_changed = true;
             }
         }
         KeyCode::Tab => {
             app.refresh_autocomplete(true);
+            state_changed = true;
         }
         KeyCode::Backspace => {
             app.editor.backspace();
@@ -989,10 +1093,12 @@ fn handle_key_event(
         KeyCode::Left => {
             app.editor.move_left();
             app.scroll_to_bottom();
+            state_changed = true;
         }
         KeyCode::Right => {
             app.editor.move_right();
             app.scroll_to_bottom();
+            state_changed = true;
         }
         KeyCode::Up => {
             if app.has_autocomplete() {
@@ -1000,6 +1106,7 @@ fn handle_key_event(
             } else {
                 app.scroll_up_lines(1);
             }
+            state_changed = true;
         }
         KeyCode::Down => {
             if app.has_autocomplete() {
@@ -1007,10 +1114,12 @@ fn handle_key_event(
             } else {
                 app.scroll_down_lines(1);
             }
+            state_changed = true;
         }
         KeyCode::Home => {
             app.editor.move_home();
             app.scroll_to_bottom();
+            state_changed = true;
         }
         KeyCode::End => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1019,6 +1128,7 @@ fn handle_key_event(
                 app.editor.move_end();
                 app.scroll_to_bottom();
             }
+            state_changed = true;
         }
         KeyCode::Char(ch)
             if key.modifiers.contains(KeyModifiers::CONTROL) && ch.eq_ignore_ascii_case(&'p') =>
@@ -1031,6 +1141,7 @@ fn handle_key_event(
                 app.editor.history_up();
             }
             app.scroll_to_bottom();
+            state_changed = true;
         }
         KeyCode::Char(ch)
             if key.modifiers.contains(KeyModifiers::CONTROL) && ch.eq_ignore_ascii_case(&'n') =>
@@ -1043,30 +1154,35 @@ fn handle_key_event(
                 app.editor.history_down();
             }
             app.scroll_to_bottom();
+            state_changed = true;
         }
         KeyCode::Char(ch)
             if key.modifiers.contains(KeyModifiers::CONTROL) && ch.eq_ignore_ascii_case(&'b') =>
         {
             app.editor.move_left();
             app.scroll_to_bottom();
+            state_changed = true;
         }
         KeyCode::Char(ch)
             if key.modifiers.contains(KeyModifiers::CONTROL) && ch.eq_ignore_ascii_case(&'f') =>
         {
             app.editor.move_right();
             app.scroll_to_bottom();
+            state_changed = true;
         }
         KeyCode::Char(ch)
             if key.modifiers.contains(KeyModifiers::CONTROL) && ch.eq_ignore_ascii_case(&'a') =>
         {
             app.editor.move_home();
             app.scroll_to_bottom();
+            state_changed = true;
         }
         KeyCode::Char(ch)
             if key.modifiers.contains(KeyModifiers::CONTROL) && ch.eq_ignore_ascii_case(&'e') =>
         {
             app.editor.move_end();
             app.scroll_to_bottom();
+            state_changed = true;
         }
         KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'w' => {
             app.editor.delete_word_backward();
@@ -1105,9 +1221,10 @@ fn handle_key_event(
     if edited {
         app.scroll_to_bottom();
         app.refresh_autocomplete(false);
+        state_changed = true;
     }
 
-    Ok(())
+    Ok(state_changed)
 }
 
 fn submit_input(
@@ -1141,6 +1258,7 @@ fn submit_input(
     if trimmed == "/clear" {
         app.log_lines.clear();
         app.tool_call_names.clear();
+        app.transcript_cache.clear();
         app.awaiting_assistant = false;
         app.active_assistant_line = None;
         app.push_system("cleared transcript".to_string());
@@ -1376,5 +1494,75 @@ mod tests {
 
         assert!(!app.awaiting_assistant);
         assert!(app.active_assistant_line.is_some());
+    }
+
+    #[test]
+    fn app_should_animate_for_assistant_spinner() {
+        let mut app = AppState::new(
+            "ws://localhost:8787/ws".to_string(),
+            "session-1".to_string(),
+        );
+        app.awaiting_assistant = true;
+
+        assert!(app.should_animate());
+    }
+
+    #[test]
+    fn app_should_animate_for_running_collapsed_tool() {
+        let mut app = AppState::new(
+            "ws://localhost:8787/ws".to_string(),
+            "session-1".to_string(),
+        );
+        app.push_tool_line(
+            "started".to_string(),
+            "call-1".to_string(),
+            "bash".to_string(),
+            true,
+        );
+
+        assert!(app.should_animate());
+    }
+
+    #[test]
+    fn app_should_not_animate_for_running_expanded_tool() {
+        let mut app = AppState::new(
+            "ws://localhost:8787/ws".to_string(),
+            "session-1".to_string(),
+        );
+        app.collapse_tool_calls = false;
+        app.push_tool_line(
+            "started".to_string(),
+            "call-1".to_string(),
+            "bash".to_string(),
+            true,
+        );
+
+        assert!(!app.should_animate());
+    }
+
+    #[test]
+    fn transcript_cache_reuses_rendered_entry() {
+        let mut cache = TranscriptRenderCache::default();
+        let theme = UiTheme::default();
+        let text_block = TextBlock::new(0, 0);
+        let width = 20;
+
+        let _ = cache.render_lines(
+            "hello world",
+            width,
+            TranscriptRenderMode::Plain,
+            &theme,
+            &text_block,
+        );
+        assert_eq!(cache.entries.len(), 1);
+
+        let _ = cache.render_lines(
+            "hello world",
+            width,
+            TranscriptRenderMode::Plain,
+            &theme,
+            &text_block,
+        );
+        assert_eq!(cache.entries.len(), 1);
     }
 }
