@@ -1,18 +1,16 @@
 use futures_util::StreamExt;
 use rig::{
     client::completion::CompletionClient, completion::CompletionModel, providers::anthropic,
-    streaming::StreamedAssistantContent,
 };
 
 use crate::{
     Message, MessageRole,
     providers::{
         Provider, ProviderError, ProviderKind, ProviderRequest, ProviderStream,
-        map_rig_completion_error, map_rig_http_error, rig_choice_text, to_rig_chat_request,
-        validate_api_key,
+        map_rig_completion_error, map_rig_http_error, map_streamed_assistant_chunk,
+        rig_choice_text, to_rig_chat_request, validate_api_key,
     },
     stream::ProviderEvent,
-    tool::ToolCall,
 };
 
 const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
@@ -59,29 +57,10 @@ impl Provider for AnthropicProvider {
                 .map_err(|error| map_rig_completion_error(ANTHROPIC_API_KEY_ENV, error))?;
 
             while let Some(next_chunk) = stream.next().await {
-                match next_chunk.map_err(|error| map_rig_completion_error(ANTHROPIC_API_KEY_ENV, error))? {
-                    StreamedAssistantContent::Text(text) => {
-                        if !text.text.is_empty() {
-                            yield ProviderEvent::AssistantDelta { delta: text.text };
-                        }
-                    }
-                    StreamedAssistantContent::ToolCall { tool_call, .. } => {
-                        let call_id = tool_call
-                            .call_id
-                            .unwrap_or_else(|| tool_call.id.clone());
-
-                        yield ProviderEvent::ToolCall {
-                            call: ToolCall {
-                                call_id,
-                                name: tool_call.function.name,
-                                input: tool_call.function.arguments,
-                            },
-                        };
-                    }
-                    StreamedAssistantContent::ToolCallDelta { .. }
-                    | StreamedAssistantContent::Reasoning(_)
-                    | StreamedAssistantContent::ReasoningDelta { .. }
-                    | StreamedAssistantContent::Final(_) => {}
+                let chunk = next_chunk
+                    .map_err(|error| map_rig_completion_error(ANTHROPIC_API_KEY_ENV, error))?;
+                if let Some(event) = map_streamed_assistant_chunk(chunk) {
+                    yield event;
                 }
             }
 

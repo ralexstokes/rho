@@ -109,9 +109,11 @@ impl AgentRuntime {
         F: FnMut(ServerEvent),
     {
         let session_id = session.id.clone();
+        let builtin_tools = builtin_tool_definitions();
+
         for iteration in 0..=self.max_tool_iterations {
             let request = ProviderRequest::new(model.to_string(), session.messages.clone())
-                .with_tools(builtin_tool_definitions());
+                .with_tools(builtin_tools.clone());
             let mut stream = provider.stream(request);
 
             let mut assistant_message = None;

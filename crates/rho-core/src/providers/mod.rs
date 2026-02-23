@@ -9,6 +9,7 @@ use rig::{
         message::{ToolResultContent as RigToolResultContent, UserContent as RigUserContent},
     },
     http_client::Error as RigHttpError,
+    streaming::StreamedAssistantContent,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -94,7 +95,13 @@ pub(crate) fn to_rig_chat_request(
     for message in request.messages {
         match message.role {
             MessageRole::System => system_sections.push(message.content),
-            role => chat_messages.push(to_rig_message(role, message.content)),
+            MessageRole::User => {
+                chat_messages.push(RigMessage::from(RigUserContent::text(message.content)))
+            }
+            MessageRole::Assistant => {
+                chat_messages.push(RigMessage::from(RigAssistantContent::text(message.content)))
+            }
+            MessageRole::Tool => chat_messages.push(to_rig_tool_result_message(message.content)),
         }
     }
 
@@ -154,12 +161,8 @@ pub(crate) fn map_rig_completion_error(
 pub(crate) fn map_rig_http_error(env_var: &'static str, error: RigHttpError) -> ProviderError {
     match error {
         RigHttpError::InvalidStatusCode(status)
-            if status.as_u16() == 401 || status.as_u16() == 403 =>
-        {
-            ProviderError::InvalidApiKey(env_var)
-        }
-        RigHttpError::InvalidStatusCodeWithMessage(status, _message)
-            if status.as_u16() == 401 || status.as_u16() == 403 =>
+        | RigHttpError::InvalidStatusCodeWithMessage(status, _)
+            if is_auth_status(status.as_u16()) =>
         {
             ProviderError::InvalidApiKey(env_var)
         }
@@ -176,18 +179,26 @@ fn looks_like_auth_error(message: &str) -> bool {
         || lower.contains("status code: 403")
 }
 
-fn to_rig_message(role: MessageRole, content: String) -> RigMessage {
-    match role {
-        MessageRole::User => RigMessage::from(RigUserContent::text(content)),
-        MessageRole::Assistant => RigMessage::from(RigAssistantContent::text(content)),
-        MessageRole::Tool => to_rig_tool_result_message(content),
-        MessageRole::System => RigMessage::from(RigUserContent::text(content)),
+pub(crate) fn map_streamed_assistant_chunk<R>(
+    chunk: StreamedAssistantContent<R>,
+) -> Option<ProviderEvent> {
+    match chunk {
+        StreamedAssistantContent::Text(text) if !text.text.is_empty() => {
+            Some(ProviderEvent::AssistantDelta { delta: text.text })
+        }
+        StreamedAssistantContent::ToolCall { tool_call, .. } => Some(ProviderEvent::ToolCall {
+            call: crate::tool::ToolCall {
+                call_id: tool_call.call_id.unwrap_or(tool_call.id),
+                name: tool_call.function.name,
+                input: tool_call.function.arguments,
+            },
+        }),
+        _ => None,
     }
 }
 
 fn to_rig_tool_result_message(content: String) -> RigMessage {
-    let payload = parse_tool_message_payload(&content);
-    let (call_id, output) = match payload {
+    let (call_id, output) = match serde_json::from_str::<ToolMessagePayload>(&content) {
         Ok(payload) => {
             let call_id = if payload.call_id.trim().is_empty() {
                 "tool-result".to_string()
@@ -218,8 +229,8 @@ struct ToolMessagePayload {
     output: String,
 }
 
-fn parse_tool_message_payload(content: &str) -> Result<ToolMessagePayload, serde_json::Error> {
-    serde_json::from_str(content)
+fn is_auth_status(status_code: u16) -> bool {
+    status_code == 401 || status_code == 403
 }
 
 pub trait Provider: Send + Sync {
