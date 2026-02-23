@@ -41,12 +41,20 @@ Child issues:
 7) https://github.com/ralexstokes/rho/issues/7
    MVP: wire bins/rho CLI and end-to-end flow
 
+Current Execution Status
+- [x] #1 merged (completed on 2026-02-23)
+- [x] #2 merged (completed on 2026-02-23)
+- [x] #3 merged (completed on 2026-02-23)
+- [ ] #4 pending
+- [ ] #5 pending
+- [ ] #6 pending
+- [ ] #7 pending
+
 Recommended Execution Order
-1) Issue #1 first (foundation contracts and crate boundaries)
-2) Issues #2 and #3 in parallel (provider modules)
-3) Issue #4 after #1 (can start with mocks, then integrate providers)
-4) Issues #5 and #6 in parallel (transport + tui client)
-5) Issue #7 last (full wiring and e2e)
+1) Issues #1, #2, and #3 are complete (contracts + providers)
+2) Issue #4 next (agent loop + tools)
+3) Issues #5 and #6 in parallel (transport + tui client)
+4) Issue #7 last (full wiring and e2e)
 
 Suggested Branch Naming
 - codex/issue-1-rho-core-scaffold
@@ -107,7 +115,5 @@ Cross-Machine Smoke Test (target)
 
 Notes for Coordinating Multiple Threads
 - Keep PRs single-issue scoped.
-- Rebase onto main frequently, especially after #1 merges.
-- Treat rho-core protocol from #1 as authoritative for #5 and #6.
-- If provider event shapes diverge (#2 vs #3), normalize inside rho-core before merge.
-
+- Rebase onto main frequently, especially before starting #4, #5, or #6.
+- Treat rho-core contracts/providers from #1-#3 as authoritative for downstream work.
