@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use crate::{
     autocomplete::{AutocompleteItem, AutocompleteProvider, CombinedAutocompleteProvider},
@@ -167,6 +170,7 @@ enum LogKind {
 struct LogLine {
     kind: LogKind,
     text: String,
+    tool_call_id: Option<String>,
     tool_name: Option<String>,
     tool_running: bool,
 }
@@ -281,15 +285,23 @@ impl AppState {
         self.log_lines.push(LogLine {
             kind,
             text,
+            tool_call_id: None,
             tool_name: None,
             tool_running: false,
         });
     }
 
-    fn push_tool_line(&mut self, text: String, tool_name: String, tool_running: bool) {
+    fn push_tool_line(
+        &mut self,
+        text: String,
+        tool_call_id: String,
+        tool_name: String,
+        tool_running: bool,
+    ) {
         self.log_lines.push(LogLine {
             kind: LogKind::Tool,
             text,
+            tool_call_id: Some(tool_call_id),
             tool_name: Some(tool_name),
             tool_running,
         });
@@ -321,6 +333,7 @@ impl AppState {
         self.log_lines.push(LogLine {
             kind: LogKind::Assistant,
             text: delta.to_string(),
+            tool_call_id: None,
             tool_name: None,
             tool_running: false,
         });
@@ -336,6 +349,7 @@ impl AppState {
             self.log_lines.push(LogLine {
                 kind: LogKind::Assistant,
                 text: message,
+                tool_call_id: None,
                 tool_name: None,
                 tool_running: false,
             });
@@ -354,7 +368,7 @@ impl AppState {
                     let call = tool_started.call;
                     self.tool_call_names
                         .insert(call.call_id.clone(), call.name.clone());
-                    self.push_tool_line(format_tool_started(&call), call.name, true);
+                    self.push_tool_line(format_tool_started(&call), call.call_id, call.name, true);
                 }
                 ServerEvent::ToolCompleted(tool_completed) => {
                     let result = tool_completed.result;
@@ -362,7 +376,12 @@ impl AppState {
                         .tool_call_names
                         .remove(result.call_id.as_str())
                         .unwrap_or_else(|| "tool".to_string());
-                    self.push_tool_line(format_tool_completed(&result), tool_name, false);
+                    self.push_tool_line(
+                        format_tool_completed(&result),
+                        result.call_id,
+                        tool_name,
+                        false,
+                    );
                 }
                 ServerEvent::Final(final_message) => {
                     self.finalize_assistant(final_message.message.content);
@@ -579,6 +598,47 @@ fn send_outbound(
         .map_err(|_| TuiClientError::OutboundChannelClosed)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CollapsedToolState {
+    name: String,
+    running: bool,
+}
+
+fn collapsed_tool_states(log_lines: &[LogLine]) -> HashMap<String, CollapsedToolState> {
+    let mut states: HashMap<String, CollapsedToolState> = HashMap::new();
+    for entry in log_lines {
+        if !matches!(entry.kind, LogKind::Tool) {
+            continue;
+        }
+        let Some(call_id) = entry.tool_call_id.as_ref() else {
+            continue;
+        };
+
+        let tool_name = entry
+            .tool_name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "tool".to_string());
+
+        if let Some(state) = states.get_mut(call_id) {
+            state.running &= entry.tool_running;
+            if state.name == "tool" && tool_name != "tool" {
+                state.name = tool_name;
+            }
+        } else {
+            states.insert(
+                call_id.clone(),
+                CollapsedToolState {
+                    name: tool_name,
+                    running: entry.tool_running,
+                },
+            );
+        }
+    }
+
+    states
+}
+
 fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -593,16 +653,28 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
     let flow_width = flow_inner.width.max(1);
     let text_block = TextBlock::new(0, 0);
     let mut flow_lines = Vec::new();
+    let tool_states = collapsed_tool_states(app.log_lines.as_slice());
+    let mut rendered_collapsed_calls = HashSet::new();
 
     for entry in &app.log_lines {
         if app.collapse_tool_calls && matches!(entry.kind, LogKind::Tool) {
-            let spinner_tick = if entry.tool_running {
+            let Some(call_id) = entry.tool_call_id.as_ref() else {
+                continue;
+            };
+            if !rendered_collapsed_calls.insert(call_id.clone()) {
+                continue;
+            }
+            let state = tool_states.get(call_id);
+            let spinner_tick = if state.is_some_and(|state| state.running) {
                 app.frame_tick
             } else {
                 0
             };
             let spinner = loader_frame(spinner_tick);
-            let tool_name = entry.tool_name.as_deref().unwrap_or("tool");
+            let tool_name = state
+                .map(|state| state.name.as_str())
+                .or(entry.tool_name.as_deref())
+                .unwrap_or("tool");
             flow_lines.push(Line::from(vec![
                 Span::styled("tool> ", app.theme.tool_prefix),
                 Span::styled(format!("{spinner} "), app.theme.tool_prefix),
@@ -1126,6 +1198,55 @@ mod tests {
         assert_eq!(
             rendered,
             "session_id=session-z code=runtime_error message=boom"
+        );
+    }
+
+    #[test]
+    fn collapsed_tool_states_stop_running_after_completion() {
+        let lines = vec![
+            LogLine {
+                kind: LogKind::Tool,
+                text: "started".to_string(),
+                tool_call_id: Some("call-1".to_string()),
+                tool_name: Some("bash".to_string()),
+                tool_running: true,
+            },
+            LogLine {
+                kind: LogKind::Tool,
+                text: "completed".to_string(),
+                tool_call_id: Some("call-1".to_string()),
+                tool_name: Some("bash".to_string()),
+                tool_running: false,
+            },
+        ];
+
+        let states = collapsed_tool_states(lines.as_slice());
+        assert_eq!(
+            states.get("call-1"),
+            Some(&CollapsedToolState {
+                name: "bash".to_string(),
+                running: false
+            })
+        );
+    }
+
+    #[test]
+    fn collapsed_tool_states_keep_running_without_completion() {
+        let lines = vec![LogLine {
+            kind: LogKind::Tool,
+            text: "started".to_string(),
+            tool_call_id: Some("call-2".to_string()),
+            tool_name: Some("read".to_string()),
+            tool_running: true,
+        }];
+
+        let states = collapsed_tool_states(lines.as_slice());
+        assert_eq!(
+            states.get("call-2"),
+            Some(&CollapsedToolState {
+                name: "read".to_string(),
+                running: true
+            })
         );
     }
 }
