@@ -586,9 +586,7 @@ mod tests {
         handle_client_event(
             &state,
             &tx,
-            ClientEvent::Cancel(rho_core::protocol::CancelRequest {
-                session_id,
-            }),
+            ClientEvent::Cancel(rho_core::protocol::CancelRequest { session_id }),
         )
         .await;
 
