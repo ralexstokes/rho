@@ -433,6 +433,29 @@ impl EditorState {
         EditorSubmit { raw, expanded }
     }
 
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    pub fn cursor_position(&self) -> (usize, usize) {
+        (self.cursor_line, self.cursor_col)
+    }
+
+    pub fn replace_prefix_before_cursor(&mut self, prefix_chars: usize, replacement: &str) {
+        self.push_undo_snapshot();
+        self.exit_history_mode();
+
+        let start_col = self.cursor_col.saturating_sub(prefix_chars);
+        let line = &mut self.lines[self.cursor_line];
+        let start_byte = char_to_byte_index(line.as_str(), start_col);
+        let end_byte = char_to_byte_index(line.as_str(), self.cursor_col);
+        line.replace_range(start_byte..end_byte, replacement);
+        self.cursor_col = start_col + replacement.chars().count();
+        self.preferred_visual_col = None;
+        self.last_action = LastAction::Other;
+        self.last_yank_len = None;
+    }
+
     pub fn render(&self, width: usize, height: usize) -> EditorRender {
         let width = width.max(1);
         let height = height.max(1);

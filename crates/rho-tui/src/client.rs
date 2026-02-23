@@ -4,7 +4,9 @@ use std::{
 };
 
 use crate::{
+    autocomplete::{AutocompleteItem, AutocompleteProvider, CombinedAutocompleteProvider},
     editor::EditorState,
+    select_list::SelectList,
     theme::UiTheme,
     widgets::{
         TextBlock, loader_frame, render_markdown, section_block, spacer_lines, truncate_to_width,
@@ -170,6 +172,9 @@ struct AppState {
     log_lines: Vec<LogLine>,
     active_assistant_line: Option<usize>,
     editor: EditorState,
+    autocomplete_provider: CombinedAutocompleteProvider,
+    autocomplete_list: Option<SelectList>,
+    autocomplete_prefix: String,
     frame_tick: u64,
     should_quit: bool,
 }
@@ -183,6 +188,11 @@ impl AppState {
             log_lines: Vec::new(),
             active_assistant_line: None,
             editor: EditorState::new(),
+            autocomplete_provider: CombinedAutocompleteProvider::default_commands(
+                std::env::current_dir().unwrap_or_else(|_| ".".into()),
+            ),
+            autocomplete_list: None,
+            autocomplete_prefix: String::new(),
             frame_tick: 0,
             should_quit: false,
         };
@@ -271,6 +281,77 @@ impl AppState {
         }
     }
 
+    fn clear_autocomplete(&mut self) {
+        self.autocomplete_list = None;
+        self.autocomplete_prefix.clear();
+    }
+
+    fn has_autocomplete(&self) -> bool {
+        self.autocomplete_list.is_some()
+    }
+
+    fn refresh_autocomplete(&mut self, force_file: bool) {
+        let (cursor_line, cursor_col) = self.editor.cursor_position();
+        let lines = self.editor.lines();
+        let suggestions = if force_file {
+            self.autocomplete_provider
+                .force_file_suggestions(lines, cursor_line, cursor_col)
+        } else {
+            self.autocomplete_provider
+                .suggestions(lines, cursor_line, cursor_col)
+        };
+
+        let Some(suggestions) = suggestions else {
+            self.clear_autocomplete();
+            return;
+        };
+
+        if force_file && suggestions.items.len() == 1 {
+            if let Some(item) = suggestions.items.first() {
+                self.apply_autocomplete_item(item.clone(), suggestions.prefix);
+            }
+            return;
+        }
+
+        self.autocomplete_prefix = suggestions.prefix;
+        self.autocomplete_list = Some(SelectList::new(suggestions.items, 6));
+    }
+
+    fn autocomplete_up(&mut self) {
+        if let Some(list) = &mut self.autocomplete_list {
+            list.move_up();
+        }
+    }
+
+    fn autocomplete_down(&mut self) {
+        if let Some(list) = &mut self.autocomplete_list {
+            list.move_down();
+        }
+    }
+
+    fn apply_autocomplete_selection(&mut self) -> bool {
+        let Some(list) = &self.autocomplete_list else {
+            return false;
+        };
+        let Some(item) = list.selected_item().cloned() else {
+            return false;
+        };
+        let prefix = self.autocomplete_prefix.clone();
+        self.apply_autocomplete_item(item, prefix);
+        true
+    }
+
+    fn apply_autocomplete_item(&mut self, item: AutocompleteItem, prefix: String) {
+        let mut replacement = item.value;
+        if item.trailing_space {
+            replacement.push(' ');
+        }
+        let prefix_chars = prefix.chars().count();
+        self.editor
+            .replace_prefix_before_cursor(prefix_chars, replacement.as_str());
+        self.clear_autocomplete();
+    }
+
 }
 
 async fn run_writer(
@@ -324,11 +405,13 @@ fn send_outbound(
 }
 
 fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
+    let autocomplete_height = if app.has_autocomplete() { 5 } else { 0 };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(6),
+            Constraint::Length(autocomplete_height),
             Constraint::Length(1),
         ])
         .split(frame.area());
@@ -397,15 +480,24 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
     frame.render_widget(input, layout[1]);
 
     let footer_text = format!(
-        "url={} session_id={}  enter=send  /cancel  esc=quit",
+        "url={} session_id={}  enter=send  shift+enter=newline  tab=complete  esc=quit",
         app.url, app.session_id
     );
+    if let Some(list) = &app.autocomplete_list {
+        let completion_width = usize::from(layout[2].width.saturating_sub(2));
+        let completion_lines: Vec<Line<'_>> = list.render_lines(completion_width);
+        let completions = Paragraph::new(completion_lines)
+            .block(section_block("completions", app.theme.input_border))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(completions, layout[2]);
+    }
+
     let status = Paragraph::new(truncate_to_width(
         footer_text.as_str(),
-        usize::from(layout[2].width),
+        usize::from(layout[3].width),
     ))
     .style(app.theme.footer);
-    frame.render_widget(status, layout[2]);
+    frame.render_widget(status, layout[3]);
 
     let input_x = layout[1]
         .x
@@ -427,6 +519,7 @@ fn handle_terminal_event(
         Event::Key(key) => handle_key_event(key, app, outbound_tx),
         Event::Paste(text) => {
             app.editor.handle_paste(text);
+            app.refresh_autocomplete(false);
             Ok(())
         }
         Event::Resize(_, _) => Ok(()),
@@ -448,32 +541,55 @@ fn handle_key_event(
         return Ok(());
     }
 
+    let mut edited = false;
     match key.code {
         KeyCode::Esc => {
-            app.should_quit = true;
-        }
-        KeyCode::Enter => {
-            if key.modifiers.intersects(
-                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
-            ) {
-                app.editor.insert_newline();
+            if app.has_autocomplete() {
+                app.clear_autocomplete();
             } else {
-                submit_input(app, outbound_tx)?;
+                app.should_quit = true;
             }
         }
-        KeyCode::Backspace => app.editor.backspace(),
-        KeyCode::Delete => app.editor.delete(),
+        KeyCode::Enter => {
+            if app.has_autocomplete() && !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+                app.apply_autocomplete_selection();
+            } else if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+            {
+                app.editor.insert_newline();
+                edited = true;
+            } else {
+                submit_input(app, outbound_tx)?;
+                app.clear_autocomplete();
+            }
+        }
+        KeyCode::Tab => {
+            app.refresh_autocomplete(true);
+        }
+        KeyCode::Backspace => {
+            app.editor.backspace();
+            edited = true;
+        }
+        KeyCode::Delete => {
+            app.editor.delete();
+            edited = true;
+        }
         KeyCode::Left => app.editor.move_left(),
         KeyCode::Right => app.editor.move_right(),
         KeyCode::Up => {
-            if app.editor.text().contains('\n') {
+            if app.has_autocomplete() {
+                app.autocomplete_up();
+            } else if app.editor.text().contains('\n') {
                 app.editor.move_up();
             } else {
                 app.editor.history_up();
             }
         }
         KeyCode::Down => {
-            if app.editor.text().contains('\n') {
+            if app.has_autocomplete() {
+                app.autocomplete_down();
+            } else if app.editor.text().contains('\n') {
                 app.editor.move_down();
             } else {
                 app.editor.history_down();
@@ -485,39 +601,50 @@ fn handle_key_event(
             if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'w' =>
         {
             app.editor.delete_word_backward();
+            edited = true;
         }
         KeyCode::Char(ch)
             if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'u' =>
         {
             app.editor.delete_to_line_start();
+            edited = true;
         }
         KeyCode::Char(ch)
             if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'k' =>
         {
             app.editor.delete_to_line_end();
+            edited = true;
         }
         KeyCode::Char(ch)
             if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'y' =>
         {
             app.editor.yank();
+            edited = true;
         }
         KeyCode::Char(ch)
             if key.modifiers.contains(KeyModifiers::ALT) && ch == 'y' =>
         {
             app.editor.yank_pop();
+            edited = true;
         }
         KeyCode::Char(ch)
             if key.modifiers.contains(KeyModifiers::CONTROL) && ch == '-' =>
         {
             app.editor.undo();
+            edited = true;
         }
         KeyCode::Char(ch)
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
         {
-            app.editor.insert_char(ch)
+            app.editor.insert_char(ch);
+            edited = true;
         }
         _ => {}
+    }
+
+    if edited {
+        app.refresh_autocomplete(false);
     }
 
     Ok(())
@@ -547,6 +674,13 @@ fn submit_input(
             }),
         )?;
         app.push_system("cancel requested".to_string());
+        return Ok(());
+    }
+
+    if trimmed == "/clear" {
+        app.log_lines.clear();
+        app.active_assistant_line = None;
+        app.push_system("cleared transcript".to_string());
         return Ok(());
     }
 
