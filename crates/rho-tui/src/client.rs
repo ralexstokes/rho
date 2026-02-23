@@ -73,12 +73,18 @@ impl TuiClient {
         let mut events = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_millis(33));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut render_state = RenderState::from_env();
 
         while !app.should_quit {
-            terminal
+            render_state.prepare_draw(&mut terminal, app.estimated_rendered_lines())?;
+            if let Err(err) = terminal
                 .terminal_mut()
                 .draw(|frame| draw_ui(frame, &app))
-                .map_err(TuiClientError::Io)?;
+            {
+                let _ = render_state.finish_draw(&mut terminal);
+                return Err(TuiClientError::Io(err));
+            }
+            render_state.finish_draw(&mut terminal)?;
 
             tokio::select! {
                 maybe_inbound = inbound_rx.recv() => {
@@ -176,6 +182,59 @@ struct AppState {
     autocomplete_overlay_id: Option<u64>,
     frame_tick: u64,
     should_quit: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RenderState {
+    previous_width: Option<u16>,
+    max_rendered_lines: usize,
+    clear_on_shrink: bool,
+    sync_output: bool,
+}
+
+impl RenderState {
+    fn from_env() -> Self {
+        Self {
+            previous_width: None,
+            max_rendered_lines: 0,
+            clear_on_shrink: std::env::var("PI_CLEAR_ON_SHRINK").is_ok_and(|v| v == "1"),
+            sync_output: std::env::var("PI_SYNC_OUTPUT").is_ok_and(|v| v == "1"),
+        }
+    }
+
+    fn prepare_draw(
+        &mut self,
+        terminal: &mut ProcessTerminal,
+        estimated_lines: usize,
+    ) -> Result<(), TuiClientError> {
+        let width = terminal.width().map_err(TuiClientError::Io)?;
+        if self.previous_width.is_some_and(|previous| previous != width) {
+            terminal.clear().map_err(TuiClientError::Io)?;
+            self.max_rendered_lines = 0;
+        }
+
+        if self.clear_on_shrink && estimated_lines < self.max_rendered_lines {
+            terminal.clear().map_err(TuiClientError::Io)?;
+            self.max_rendered_lines = estimated_lines;
+        } else {
+            self.max_rendered_lines = self.max_rendered_lines.max(estimated_lines);
+        }
+
+        self.previous_width = Some(width);
+        if self.sync_output {
+            terminal
+                .begin_synchronized_output()
+                .map_err(TuiClientError::Io)?;
+        }
+        Ok(())
+    }
+
+    fn finish_draw(&self, terminal: &mut ProcessTerminal) -> Result<(), TuiClientError> {
+        if self.sync_output {
+            terminal.end_synchronized_output().map_err(TuiClientError::Io)?;
+        }
+        Ok(())
+    }
 }
 
 impl AppState {
@@ -395,6 +454,12 @@ impl AppState {
 
         let id = self.overlays.show(lines, options);
         self.autocomplete_overlay_id = Some(id);
+    }
+
+    fn estimated_rendered_lines(&self) -> usize {
+        let history = self.log_lines.len();
+        let editor = self.editor.lines().len().max(1);
+        history + editor + 4
     }
 
 }

@@ -34,6 +34,24 @@ impl ProcessTerminal {
         &mut self.terminal
     }
 
+    pub fn clear(&mut self) -> std::io::Result<()> {
+        self.terminal.clear()
+    }
+
+    pub fn width(&mut self) -> std::io::Result<u16> {
+        Ok(self.terminal.size()?.width)
+    }
+
+    pub fn begin_synchronized_output(&mut self) -> std::io::Result<()> {
+        self.terminal.backend_mut().write_all(b"\x1b[?2026h")?;
+        self.terminal.backend_mut().flush()
+    }
+
+    pub fn end_synchronized_output(&mut self) -> std::io::Result<()> {
+        self.terminal.backend_mut().write_all(b"\x1b[?2026l")?;
+        self.terminal.backend_mut().flush()
+    }
+
 }
 
 impl Drop for ProcessTerminal {
