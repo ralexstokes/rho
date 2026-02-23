@@ -71,6 +71,7 @@ Keep `bins/rho` as wiring only; core behavior belongs in crate libraries.
 - Keep each PR scoped to one coherent change.
 - Reference the relevant issue (if any) in PR title/body.
 - Rebase frequently on `main`.
+- Before opening a PR, or doing final handoff, make sure the primary checks pass.
 
 ## Tooling and Validation
 
