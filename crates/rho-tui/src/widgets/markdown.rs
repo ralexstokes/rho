@@ -1,6 +1,9 @@
 use ratatui::text::{Line, Span};
 
-use crate::theme::UiTheme;
+use crate::{
+    terminal_image::{image_fallback, render_image_sequence},
+    theme::UiTheme,
+};
 
 use super::text::wrap_text;
 
@@ -24,6 +27,37 @@ pub fn render_markdown(markdown: &str, width: u16, theme: &UiTheme) -> Vec<Line<
             for wrapped in wrap_text(line, content_width) {
                 lines.push(Line::from(vec![Span::styled(wrapped, theme.code)]));
             }
+            continue;
+        }
+
+        if let Some((_alt, src)) = parse_markdown_image(line) {
+            if let Some((mime_type, base64_data)) = parse_data_uri(src) {
+                if let Some((sequence, rows)) =
+                    render_image_sequence(base64_data, mime_type, width.saturating_sub(4).max(1))
+                {
+                    for _ in 1..rows {
+                        lines.push(Line::from(String::new()));
+                    }
+                    let move_up = if rows > 1 {
+                        format!("\u{1b}[{}A", rows - 1)
+                    } else {
+                        String::new()
+                    };
+                    lines.push(Line::from(format!("{move_up}{sequence}")));
+                    continue;
+                }
+
+                lines.push(Line::from(vec![Span::styled(
+                    image_fallback(mime_type, None, None),
+                    theme.quote,
+                )]));
+                continue;
+            }
+
+            lines.push(Line::from(vec![Span::styled(
+                image_fallback("image/*", None, Some(src)),
+                theme.quote,
+            )]));
             continue;
         }
 
@@ -91,4 +125,35 @@ fn parse_heading(line: &str) -> Option<&str> {
     }
 
     Some(chars.as_str())
+}
+
+fn parse_markdown_image(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    if !line.starts_with("![") {
+        return None;
+    }
+
+    let alt_end = line.find("](")?;
+    let src_end = line.rfind(')')?;
+    if src_end <= alt_end + 2 {
+        return None;
+    }
+
+    let alt = &line[2..alt_end];
+    let src = &line[alt_end + 2..src_end];
+    Some((alt, src))
+}
+
+fn parse_data_uri(uri: &str) -> Option<(&str, &str)> {
+    let uri = uri.trim();
+    if !uri.starts_with("data:") {
+        return None;
+    }
+    let without_prefix = uri.trim_start_matches("data:");
+    let (meta, data) = without_prefix.split_once(',')?;
+    let (mime, encoding) = meta.split_once(';')?;
+    if encoding != "base64" {
+        return None;
+    }
+    Some((mime, data))
 }
