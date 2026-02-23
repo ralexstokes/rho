@@ -20,7 +20,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::Paragraph,
 };
 use rho_core::{
     Message, MessageRole,
@@ -647,8 +647,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
 
     let flow = Paragraph::new(flow_lines)
         .block(flow_block)
-        .scroll((scroll_top, 0))
-        .wrap(Wrap { trim: false });
+        .scroll((scroll_top, 0));
     frame.render_widget(flow, flow_area);
 
     let scroll_state = if app.transcript_scroll_up == 0 {
@@ -657,7 +656,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
         format!("scroll+{}", app.transcript_scroll_up)
     };
     let footer_text = format!(
-        "url={} session_id={}  enter=send  shift+enter=newline  tab=complete  pgup/pgdn=scroll  {}  esc=quit",
+        "url={} session_id={}  enter=send  shift+enter=newline  tab=complete  up/down=scroll  ctrl+up/down=edit/history  {}  esc=quit",
         app.url, app.session_id, scroll_state
     );
     let status = Paragraph::new(truncate_to_width(
@@ -790,29 +789,31 @@ fn handle_key_event(
             app.scroll_to_bottom();
         }
         KeyCode::Up => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                app.scroll_up_lines(1);
-            } else if app.has_autocomplete() {
+            if app.has_autocomplete() {
                 app.autocomplete_up();
-            } else if app.editor.text().contains('\n') {
-                app.editor.move_up();
+            } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if app.editor.text().contains('\n') {
+                    app.editor.move_up();
+                } else {
+                    app.editor.history_up();
+                }
                 app.scroll_to_bottom();
             } else {
-                app.editor.history_up();
-                app.scroll_to_bottom();
+                app.scroll_up_lines(1);
             }
         }
         KeyCode::Down => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                app.scroll_down_lines(1);
-            } else if app.has_autocomplete() {
+            if app.has_autocomplete() {
                 app.autocomplete_down();
-            } else if app.editor.text().contains('\n') {
-                app.editor.move_down();
+            } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if app.editor.text().contains('\n') {
+                    app.editor.move_down();
+                } else {
+                    app.editor.history_down();
+                }
                 app.scroll_to_bottom();
             } else {
-                app.editor.history_down();
-                app.scroll_to_bottom();
+                app.scroll_down_lines(1);
             }
         }
         KeyCode::Home => {
