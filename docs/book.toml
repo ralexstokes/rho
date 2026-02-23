@@ -1,7 +1,6 @@
 [book]
 authors = ["rho contributors"]
 language = "en"
-multilingual = false
 src = "src"
 title = "rho"
 
