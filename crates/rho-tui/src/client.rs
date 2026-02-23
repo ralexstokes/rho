@@ -487,10 +487,6 @@ impl AppState {
         self.transcript_scroll_up = self.transcript_scroll_up.saturating_sub(lines);
     }
 
-    fn page_scroll_amount(&self) -> usize {
-        self.transcript_viewport_height.saturating_sub(1).max(1)
-    }
-
     fn estimated_rendered_lines(&self) -> usize {
         let history = self.log_lines.len();
         let editor = self.editor.lines().len().max(1);
@@ -656,7 +652,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
         format!("scroll+{}", app.transcript_scroll_up)
     };
     let footer_text = format!(
-        "url={} session_id={}  enter=send  shift+enter=newline  tab=complete  up/down=scroll  ctrl+up/down=edit/history  {}  esc=quit",
+        "url={} session_id={}  enter=send  shift+enter=newline  tab=complete  up/down=scroll  ctrl+p/n=history  ctrl+b/f/a/e=move  {}  esc=quit",
         app.url, app.session_id, scroll_state
     );
     let status = Paragraph::new(truncate_to_width(
@@ -766,12 +762,6 @@ fn handle_key_event(
         KeyCode::Tab => {
             app.refresh_autocomplete(true);
         }
-        KeyCode::PageUp => {
-            app.scroll_up_lines(app.page_scroll_amount());
-        }
-        KeyCode::PageDown => {
-            app.scroll_down_lines(app.page_scroll_amount());
-        }
         KeyCode::Backspace => {
             app.editor.backspace();
             edited = true;
@@ -791,13 +781,6 @@ fn handle_key_event(
         KeyCode::Up => {
             if app.has_autocomplete() {
                 app.autocomplete_up();
-            } else if key.modifiers.contains(KeyModifiers::CONTROL) {
-                if app.editor.text().contains('\n') {
-                    app.editor.move_up();
-                } else {
-                    app.editor.history_up();
-                }
-                app.scroll_to_bottom();
             } else {
                 app.scroll_up_lines(1);
             }
@@ -805,13 +788,6 @@ fn handle_key_event(
         KeyCode::Down => {
             if app.has_autocomplete() {
                 app.autocomplete_down();
-            } else if key.modifiers.contains(KeyModifiers::CONTROL) {
-                if app.editor.text().contains('\n') {
-                    app.editor.move_down();
-                } else {
-                    app.editor.history_down();
-                }
-                app.scroll_to_bottom();
             } else {
                 app.scroll_down_lines(1);
             }
@@ -827,6 +803,54 @@ fn handle_key_event(
                 app.editor.move_end();
                 app.scroll_to_bottom();
             }
+        }
+        KeyCode::Char(ch)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && ch.eq_ignore_ascii_case(&'p') =>
+        {
+            if app.has_autocomplete() {
+                app.autocomplete_up();
+            } else if app.editor.text().contains('\n') {
+                app.editor.move_up();
+            } else {
+                app.editor.history_up();
+            }
+            app.scroll_to_bottom();
+        }
+        KeyCode::Char(ch)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && ch.eq_ignore_ascii_case(&'n') =>
+        {
+            if app.has_autocomplete() {
+                app.autocomplete_down();
+            } else if app.editor.text().contains('\n') {
+                app.editor.move_down();
+            } else {
+                app.editor.history_down();
+            }
+            app.scroll_to_bottom();
+        }
+        KeyCode::Char(ch)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && ch.eq_ignore_ascii_case(&'b') =>
+        {
+            app.editor.move_left();
+            app.scroll_to_bottom();
+        }
+        KeyCode::Char(ch)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && ch.eq_ignore_ascii_case(&'f') =>
+        {
+            app.editor.move_right();
+            app.scroll_to_bottom();
+        }
+        KeyCode::Char(ch)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && ch.eq_ignore_ascii_case(&'a') =>
+        {
+            app.editor.move_home();
+            app.scroll_to_bottom();
+        }
+        KeyCode::Char(ch)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && ch.eq_ignore_ascii_case(&'e') =>
+        {
+            app.editor.move_end();
+            app.scroll_to_bottom();
         }
         KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'w' => {
             app.editor.delete_word_backward();
