@@ -98,25 +98,3 @@ just build
 just test
 just ci
 ```
-
-## End-to-End Smoke Test
-
-Machine A:
-
-```sh
-OPENAI_API_KEY=... cargo run -p rho -- serve --bind 0.0.0.0:8787 --provider openai --model <model>
-```
-
-or
-
-```sh
-ANTHROPIC_API_KEY=... cargo run -p rho -- serve --bind 0.0.0.0:8787 --provider anthropic --model <model>
-```
-
-Machine B:
-
-```sh
-cargo run -p rho -- tui --url ws://<machine-a-host>:8787/ws
-```
-
-Verify streaming deltas, tool events, and final response.
