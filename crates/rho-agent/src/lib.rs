@@ -1,3 +1,3 @@
 pub mod runtime;
 
-pub use runtime::{AgentRuntime, AgentSession};
+pub use runtime::{AgentError, AgentRuntime, AgentSession};
