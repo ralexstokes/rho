@@ -1,4 +1,12 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Router,
@@ -23,12 +31,16 @@ use rho_core::{
 use thiserror::Error;
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, mpsc},
+    sync::{Mutex, mpsc, watch},
     task::JoinHandle,
 };
 use uuid::Uuid;
 
 use crate::{AgentRuntime, AgentSession};
+
+const WS_OUTBOUND_BUFFER_CAPACITY: usize = 256;
+const WS_OUTBOUND_RESERVED_ERROR_SLOTS: usize = 1;
+const BACKPRESSURE_OVERFLOW_CODE: &str = "backpressure_overflow";
 
 #[derive(Clone)]
 pub struct AgentServer {
@@ -123,15 +135,69 @@ impl SessionState {
     }
 }
 
+#[derive(Clone)]
+struct OutboundChannel {
+    sender: mpsc::Sender<ServerEnvelope>,
+    overflow_tx: watch::Sender<bool>,
+    overflow_reported: Arc<AtomicBool>,
+}
+
+impl OutboundChannel {
+    fn new(sender: mpsc::Sender<ServerEnvelope>, overflow_tx: watch::Sender<bool>) -> Self {
+        Self {
+            sender,
+            overflow_tx,
+            overflow_reported: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn send(&self, envelope: ServerEnvelope) {
+        if self.overflow_reported.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let is_error_event = matches!(envelope.event, ServerEvent::Error(_));
+        if !is_error_event && self.sender.capacity() <= WS_OUTBOUND_RESERVED_ERROR_SLOTS {
+            self.report_overflow();
+            return;
+        }
+
+        match self.sender.try_send(envelope) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => self.report_overflow(),
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
+    fn report_overflow(&self) {
+        if self.overflow_reported.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let overflow_event = ServerEnvelope::new(ServerEvent::Error(ErrorEvent {
+            session_id: None,
+            code: BACKPRESSURE_OVERFLOW_CODE.to_string(),
+            message: format!(
+                "outbound websocket buffer exceeded safe capacity (buffer_size={WS_OUTBOUND_BUFFER_CAPACITY})"
+            ),
+        }));
+        let _ = self.sender.try_send(overflow_event);
+        let _ = self.overflow_tx.send(true);
+    }
+}
+
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_websocket(socket, state))
 }
 
 async fn handle_websocket(stream: WebSocket, state: AppState) {
     let (mut sink, mut source) = stream.split();
-    let (outbound_sender, mut outbound_receiver) = mpsc::unbounded_channel::<ServerEnvelope>();
+    let (outbound_sender, mut outbound_receiver) =
+        mpsc::channel::<ServerEnvelope>(WS_OUTBOUND_BUFFER_CAPACITY);
+    let (overflow_tx, mut overflow_rx) = watch::channel(false);
+    let outbound = OutboundChannel::new(outbound_sender, overflow_tx);
 
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         while let Some(envelope) = outbound_receiver.recv().await {
             let payload = match serde_json::to_string(&envelope) {
                 Ok(payload) => payload,
@@ -144,39 +210,61 @@ async fn handle_websocket(stream: WebSocket, state: AppState) {
         }
     });
 
-    while let Some(next_message) = source.next().await {
-        match next_message {
-            Ok(Message::Text(text)) => {
-                handle_text_message(&state, &outbound_sender, text.as_str()).await;
+    let mut overflow_disconnect = false;
+    loop {
+        tokio::select! {
+            changed = overflow_rx.changed() => {
+                if changed.is_ok() && *overflow_rx.borrow() {
+                    overflow_disconnect = true;
+                    break;
+                }
+                if changed.is_err() {
+                    break;
+                }
             }
-            Ok(Message::Binary(_)) => send_error(
-                &outbound_sender,
-                None,
-                "invalid_message",
-                "binary websocket frames are not supported",
-            ),
-            Ok(Message::Ping(_) | Message::Pong(_)) => {}
-            Ok(Message::Close(_)) => break,
-            Err(error) => {
-                send_error(
-                    &outbound_sender,
-                    None,
-                    "websocket_receive_error",
-                    format!("failed to receive websocket frame: {error}"),
-                );
-                break;
+            next_message = source.next() => {
+                let Some(next_message) = next_message else {
+                    break;
+                };
+                match next_message {
+                    Ok(Message::Text(text)) => {
+                        handle_text_message(&state, &outbound, text.as_str()).await;
+                    }
+                    Ok(Message::Binary(_)) => send_error(
+                        &outbound,
+                        None,
+                        "invalid_message",
+                        "binary websocket frames are not supported",
+                    ),
+                    Ok(Message::Ping(_) | Message::Pong(_)) => {}
+                    Ok(Message::Close(_)) => break,
+                    Err(error) => {
+                        send_error(
+                            &outbound,
+                            None,
+                            "websocket_receive_error",
+                            format!("failed to receive websocket frame: {error}"),
+                        );
+                        break;
+                    }
+                }
             }
         }
     }
 
-    writer_task.abort();
+    if overflow_disconnect {
+        if tokio::time::timeout(Duration::from_millis(250), &mut writer_task)
+            .await
+            .is_err()
+        {
+            writer_task.abort();
+        }
+    } else {
+        writer_task.abort();
+    }
 }
 
-async fn handle_text_message(
-    state: &AppState,
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
-    text: &str,
-) {
+async fn handle_text_message(state: &AppState, outbound_sender: &OutboundChannel, text: &str) {
     let envelope: ClientEnvelope = match serde_json::from_str(text) {
         Ok(envelope) => envelope,
         Err(error) => {
@@ -208,7 +296,7 @@ async fn handle_text_message(
 
 async fn handle_client_event(
     state: &AppState,
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+    outbound_sender: &OutboundChannel,
     event: ClientEvent,
 ) {
     match event {
@@ -371,7 +459,7 @@ async fn handle_client_event(
 
 fn get_session_state_mut<'a>(
     sessions: &'a mut HashMap<String, SessionState>,
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+    outbound_sender: &OutboundChannel,
     session_id: &str,
 ) -> Option<&'a mut SessionState> {
     if let Some(session_state) = sessions.get_mut(session_id) {
@@ -400,12 +488,12 @@ fn is_valid_session_id(session_id: &str) -> bool {
     Uuid::try_parse(session_id).is_ok()
 }
 
-fn send_event(outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>, event: ServerEvent) {
-    let _ = outbound_sender.send(ServerEnvelope::new(event));
+fn send_event(outbound_sender: &OutboundChannel, event: ServerEvent) {
+    outbound_sender.send(ServerEnvelope::new(event));
 }
 
 fn send_error(
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+    outbound_sender: &OutboundChannel,
     session_id: Option<String>,
     code: impl Into<String>,
     message: impl Into<String>,
@@ -433,7 +521,7 @@ mod tests {
         providers::{ModelKind, ProviderError, ProviderRequest, ProviderStream},
         stream::ProviderEvent,
     };
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
     use uuid::Uuid;
 
     use super::*;
@@ -444,7 +532,7 @@ mod tests {
     #[tokio::test]
     async fn start_session_emits_session_ack() {
         let state = test_state(Arc::new(FakeProvider::new(vec![])));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbound_channel();
 
         handle_client_event(
             &state,
@@ -465,7 +553,7 @@ mod tests {
     #[tokio::test]
     async fn start_session_with_invalid_id_emits_error() {
         let state = test_state(Arc::new(FakeProvider::new(vec![])));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbound_channel();
 
         handle_client_event(
             &state,
@@ -487,7 +575,7 @@ mod tests {
     #[tokio::test]
     async fn user_message_for_unknown_session_emits_error() {
         let state = test_state(Arc::new(FakeProvider::new(vec![])));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbound_channel();
         let missing_session_id = "00000000-0000-4000-8000-0000000000ff".to_string();
 
         handle_client_event(
@@ -519,7 +607,7 @@ mod tests {
             Ok(ProviderEvent::Finished),
         ]]));
         let state = test_state(provider);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbound_channel();
         let session_id = "00000000-0000-4000-8000-00000000000a".to_string();
 
         handle_client_event(
@@ -563,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_in_flight_request_emits_cancelled_error() {
         let state = test_state(Arc::new(PendingProvider));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = test_outbound_channel();
         let session_id = "00000000-0000-4000-8000-00000000000b".to_string();
 
         handle_client_event(
@@ -606,6 +694,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn outbound_channel_overflow_emits_terminal_error() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let (overflow_tx, mut overflow_rx) = watch::channel(false);
+        let outbound = OutboundChannel::new(sender, overflow_tx);
+
+        send_event(
+            &outbound,
+            ServerEvent::SessionAck(SessionAck {
+                session_id: "session-1".to_string(),
+            }),
+        );
+        send_event(
+            &outbound,
+            ServerEvent::SessionAck(SessionAck {
+                session_id: "session-2".to_string(),
+            }),
+        );
+
+        overflow_rx
+            .changed()
+            .await
+            .expect("overflow signal should be delivered");
+        assert!(*overflow_rx.borrow());
+
+        let first = receiver.recv().await.expect("expected first envelope");
+        let second = receiver.recv().await.expect("expected overflow envelope");
+
+        assert!(matches!(first.event, ServerEvent::SessionAck(_)));
+        assert!(matches!(
+            second.event,
+            ServerEvent::Error(ErrorEvent { code, .. }) if code == BACKPRESSURE_OVERFLOW_CODE
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
     fn test_state(provider: Arc<dyn Provider>) -> AppState {
         AppState {
             runtime: AgentRuntime::new(),
@@ -613,6 +737,12 @@ mod tests {
             model: ModelKind::Gpt52,
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    fn test_outbound_channel() -> (OutboundChannel, mpsc::Receiver<ServerEnvelope>) {
+        let (sender, receiver) = mpsc::channel(WS_OUTBOUND_BUFFER_CAPACITY);
+        let (overflow_tx, _overflow_rx) = watch::channel(false);
+        (OutboundChannel::new(sender, overflow_tx), receiver)
     }
 
     #[derive(Debug, Clone)]
