@@ -191,6 +191,7 @@ struct AppState {
     help_overlay_id: Option<u64>,
     tool_call_names: HashMap<String, String>,
     collapse_tool_calls: bool,
+    awaiting_assistant: bool,
     transcript_scroll_up: usize,
     transcript_viewport_height: usize,
     frame_tick: u64,
@@ -274,6 +275,7 @@ impl AppState {
             help_overlay_id: None,
             tool_call_names: HashMap::new(),
             collapse_tool_calls: true,
+            awaiting_assistant: false,
             transcript_scroll_up: 0,
             transcript_viewport_height: 0,
             frame_tick: 0,
@@ -364,6 +366,7 @@ impl AppState {
             NetworkEvent::Server(server_event) => match server_event {
                 ServerEvent::SessionAck(_) => {}
                 ServerEvent::AssistantDelta(delta) => {
+                    self.awaiting_assistant = false;
                     self.append_assistant_delta(delta.delta.as_str())
                 }
                 ServerEvent::ToolStarted(tool_started) => {
@@ -386,21 +389,26 @@ impl AppState {
                     );
                 }
                 ServerEvent::Final(final_message) => {
+                    self.awaiting_assistant = false;
                     self.finalize_assistant(final_message.message.content);
                 }
                 ServerEvent::Error(error) => {
+                    self.awaiting_assistant = false;
                     self.push_error(format_error(&error));
                 }
             },
             NetworkEvent::Closed => {
+                self.awaiting_assistant = false;
                 self.push_error("websocket closed unexpectedly".to_string());
                 self.should_quit = true;
             }
             NetworkEvent::ReceiveError(err) => {
+                self.awaiting_assistant = false;
                 self.push_error(err);
                 self.should_quit = true;
             }
             NetworkEvent::ProtocolError(err) => {
+                self.awaiting_assistant = false;
                 self.push_error(err);
                 self.should_quit = true;
             }
@@ -794,7 +802,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
         }
     }
 
-    if app.active_assistant_line.is_some() {
+    if app.awaiting_assistant || app.active_assistant_line.is_some() {
         flow_lines.extend(spacer_lines(1));
         flow_lines.push(Line::from(vec![
             Span::styled("assistant> ", app.theme.assistant_prefix),
@@ -1133,6 +1141,7 @@ fn submit_input(
     if trimmed == "/clear" {
         app.log_lines.clear();
         app.tool_call_names.clear();
+        app.awaiting_assistant = false;
         app.active_assistant_line = None;
         app.push_system("cleared transcript".to_string());
         return Ok(());
@@ -1146,6 +1155,7 @@ fn submit_input(
             message: Message::new(MessageRole::User, submission.expanded),
         }),
     )?;
+    app.awaiting_assistant = true;
 
     Ok(())
 }
@@ -1231,7 +1241,12 @@ fn format_error(error: &ErrorEvent) -> String {
 
 #[cfg(test)]
 mod tests {
-    use rho_core::tool::{ToolCall, ToolResult};
+    use tokio::sync::mpsc;
+
+    use rho_core::{
+        protocol::{AssistantDelta, ServerEvent},
+        tool::{ToolCall, ToolResult},
+    };
     use serde_json::json;
 
     use super::*;
@@ -1327,5 +1342,39 @@ mod tests {
                 running: true
             })
         );
+    }
+
+    #[test]
+    fn submit_input_sets_optimistic_assistant_spinner_state() {
+        let mut app = AppState::new(
+            "ws://localhost:8787/ws".to_string(),
+            "session-1".to_string(),
+        );
+        app.editor.insert_text("hello");
+        let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel();
+
+        submit_input(&mut app, &outbound_tx).expect("submit should succeed");
+
+        assert!(app.awaiting_assistant);
+        assert!(app.active_assistant_line.is_none());
+    }
+
+    #[test]
+    fn first_assistant_delta_clears_optimistic_spinner_state() {
+        let mut app = AppState::new(
+            "ws://localhost:8787/ws".to_string(),
+            "session-1".to_string(),
+        );
+        app.awaiting_assistant = true;
+
+        app.handle_network_event(NetworkEvent::Server(ServerEvent::AssistantDelta(
+            AssistantDelta {
+                session_id: app.session_id.clone(),
+                delta: "hi".to_string(),
+            },
+        )));
+
+        assert!(!app.awaiting_assistant);
+        assert!(app.active_assistant_line.is_some());
     }
 }
