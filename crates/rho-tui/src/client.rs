@@ -271,7 +271,7 @@ impl AppState {
             overlays: OverlayStack::new(),
             autocomplete_overlay_id: None,
             tool_call_names: HashMap::new(),
-            collapse_tool_calls: false,
+            collapse_tool_calls: true,
             transcript_scroll_up: 0,
             transcript_viewport_height: 0,
             frame_tick: 0,
