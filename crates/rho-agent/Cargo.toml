@@ -11,6 +11,7 @@ futures-util.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+uuid.workspace = true
 
 [dev-dependencies]
 futures = "0.3.31"

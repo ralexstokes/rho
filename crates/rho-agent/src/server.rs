@@ -1,11 +1,4 @@
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
@@ -31,6 +24,7 @@ use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
 };
+use uuid::Uuid;
 
 use crate::{AgentRuntime, AgentSession};
 
@@ -50,7 +44,6 @@ impl AgentServer {
             provider,
             model: model.into(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            next_session_id: Arc::new(AtomicU64::new(1)),
         };
         Self { state }
     }
@@ -111,7 +104,6 @@ struct AppState {
     provider: Arc<dyn Provider>,
     model: String,
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
-    next_session_id: Arc<AtomicU64>,
 }
 
 struct SessionState {
@@ -221,7 +213,17 @@ async fn handle_client_event(
             let mut sessions = state.sessions.lock().await;
             let session_id = start_session
                 .session_id
-                .unwrap_or_else(|| allocate_session_id(state, &sessions));
+                .unwrap_or_else(|| allocate_session_id(&sessions));
+
+            if !is_valid_session_id(&session_id) {
+                send_error(
+                    outbound_sender,
+                    Some(session_id),
+                    "invalid_session_id",
+                    "session_id must be a UUID",
+                );
+                return;
+            }
 
             if sessions.contains_key(&session_id) {
                 send_error(
@@ -254,6 +256,15 @@ async fn handle_client_event(
             }
 
             let session_id = user_message.session_id;
+            if !is_valid_session_id(&session_id) {
+                send_error(
+                    outbound_sender,
+                    Some(session_id),
+                    "invalid_session_id",
+                    "session_id must be a UUID",
+                );
+                return;
+            }
             let user_content = user_message.message.content;
             let mut sessions = state.sessions.lock().await;
 
@@ -318,6 +329,15 @@ async fn handle_client_event(
         }
         ClientEvent::Cancel(cancel_request) => {
             let session_id = cancel_request.session_id;
+            if !is_valid_session_id(&session_id) {
+                send_error(
+                    outbound_sender,
+                    Some(session_id),
+                    "invalid_session_id",
+                    "session_id must be a UUID",
+                );
+                return;
+            }
             let mut sessions = state.sessions.lock().await;
 
             let Some(session_state) =
@@ -364,16 +384,17 @@ fn get_session_state_mut<'a>(
     }
 }
 
-fn allocate_session_id(state: &AppState, sessions: &HashMap<String, SessionState>) -> String {
+fn allocate_session_id(sessions: &HashMap<String, SessionState>) -> String {
     loop {
-        let id = format!(
-            "session-{}",
-            state.next_session_id.fetch_add(1, Ordering::Relaxed)
-        );
+        let id = Uuid::new_v4().to_string();
         if !sessions.contains_key(&id) {
             return id;
         }
     }
+}
+
+fn is_valid_session_id(session_id: &str) -> bool {
+    Uuid::try_parse(session_id).is_ok()
 }
 
 fn send_event(outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>, event: ServerEvent) {
@@ -410,6 +431,7 @@ mod tests {
         stream::ProviderEvent,
     };
     use tokio::sync::mpsc;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -429,23 +451,47 @@ mod tests {
         .await;
 
         let envelope = rx.recv().await.expect("expected outbound envelope");
-        assert!(matches!(
-            envelope.event,
-            ServerEvent::SessionAck(SessionAck { .. })
-        ));
+        let session_id = match envelope.event {
+            ServerEvent::SessionAck(SessionAck { session_id }) => session_id,
+            _ => panic!("expected session ack"),
+        };
+        assert!(Uuid::try_parse(&session_id).is_ok());
         assert_eq!(state.sessions.lock().await.len(), 1);
     }
 
     #[tokio::test]
-    async fn user_message_for_unknown_session_emits_error() {
+    async fn start_session_with_invalid_id_emits_error() {
         let state = test_state(Arc::new(FakeProvider::new(vec![])));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         handle_client_event(
             &state,
             &tx,
+            ClientEvent::StartSession(rho_core::protocol::StartSession {
+                session_id: Some("not-a-uuid".to_string()),
+            }),
+        )
+        .await;
+
+        let envelope = rx.recv().await.expect("expected outbound envelope");
+        assert!(matches!(
+            envelope.event,
+            ServerEvent::Error(ErrorEvent { code, .. }) if code == "invalid_session_id"
+        ));
+        assert!(state.sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_message_for_unknown_session_emits_error() {
+        let state = test_state(Arc::new(FakeProvider::new(vec![])));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let missing_session_id = "00000000-0000-4000-8000-0000000000ff".to_string();
+
+        handle_client_event(
+            &state,
+            &tx,
             ClientEvent::UserMessage(rho_core::protocol::UserMessage {
-                session_id: "missing".to_string(),
+                session_id: missing_session_id,
                 message: Message::new(MessageRole::User, "hi"),
             }),
         )
@@ -471,12 +517,13 @@ mod tests {
         ]]));
         let state = test_state(provider);
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let session_id = "00000000-0000-4000-8000-00000000000a".to_string();
 
         handle_client_event(
             &state,
             &tx,
             ClientEvent::StartSession(rho_core::protocol::StartSession {
-                session_id: Some("session-a".to_string()),
+                session_id: Some(session_id.clone()),
             }),
         )
         .await;
@@ -486,7 +533,7 @@ mod tests {
             &state,
             &tx,
             ClientEvent::UserMessage(rho_core::protocol::UserMessage {
-                session_id: "session-a".to_string(),
+                session_id: session_id.clone(),
                 message: Message::new(MessageRole::User, "hello"),
             }),
         )
@@ -514,12 +561,13 @@ mod tests {
     async fn cancel_in_flight_request_emits_cancelled_error() {
         let state = test_state(Arc::new(PendingProvider));
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let session_id = "00000000-0000-4000-8000-00000000000b".to_string();
 
         handle_client_event(
             &state,
             &tx,
             ClientEvent::StartSession(rho_core::protocol::StartSession {
-                session_id: Some("session-b".to_string()),
+                session_id: Some(session_id.clone()),
             }),
         )
         .await;
@@ -529,7 +577,7 @@ mod tests {
             &state,
             &tx,
             ClientEvent::UserMessage(rho_core::protocol::UserMessage {
-                session_id: "session-b".to_string(),
+                session_id: session_id.clone(),
                 message: Message::new(MessageRole::User, "hello"),
             }),
         )
@@ -539,7 +587,7 @@ mod tests {
             &state,
             &tx,
             ClientEvent::Cancel(rho_core::protocol::CancelRequest {
-                session_id: "session-b".to_string(),
+                session_id: session_id,
             }),
         )
         .await;
@@ -563,7 +611,6 @@ mod tests {
             provider,
             model: "test-model".to_string(),
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            next_session_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
