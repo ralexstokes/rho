@@ -1,3 +1,5 @@
+use std::sync::{Arc, OnceLock};
+
 use futures_util::StreamExt;
 use rig::{
     client::completion::CompletionClient, completion::CompletionModel, providers::anthropic,
@@ -16,11 +18,29 @@ use crate::{
 const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
 #[derive(Debug, Clone, Default)]
-pub struct AnthropicProvider;
+pub struct AnthropicProvider {
+    client: Arc<OnceLock<anthropic::Client>>,
+}
 
 impl AnthropicProvider {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    fn client(&self) -> Result<anthropic::Client, ProviderError> {
+        if let Some(client) = self.client.get() {
+            return Ok(client.clone());
+        }
+
+        let api_key = anthropic_api_key()?;
+        let client = anthropic_client(api_key)?;
+        let _ = self.client.set(client);
+
+        Ok(self
+            .client
+            .get()
+            .expect("anthropic client should be initialized")
+            .clone())
     }
 }
 
@@ -31,9 +51,9 @@ impl Provider for AnthropicProvider {
 
     fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
         let rig_request = to_rig_chat_request(request);
+        let client = self.client();
         Box::pin(async_stream::try_stream! {
-            let api_key = anthropic_api_key()?;
-            let client = anthropic_client(api_key)?;
+            let client = client?;
             let rig_request = rig_request?;
 
             let model = client

@@ -1,3 +1,5 @@
+use std::sync::{Arc, OnceLock};
+
 use futures_util::StreamExt;
 use rig::{client::completion::CompletionClient, completion::CompletionModel, providers::openai};
 
@@ -14,11 +16,29 @@ use crate::{
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 
 #[derive(Debug, Clone, Default)]
-pub struct OpenAiProvider;
+pub struct OpenAiProvider {
+    client: Arc<OnceLock<openai::Client>>,
+}
 
 impl OpenAiProvider {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    fn client(&self) -> Result<openai::Client, ProviderError> {
+        if let Some(client) = self.client.get() {
+            return Ok(client.clone());
+        }
+
+        let api_key = openai_api_key()?;
+        let client = openai_client(api_key)?;
+        let _ = self.client.set(client);
+
+        Ok(self
+            .client
+            .get()
+            .expect("openai client should be initialized")
+            .clone())
     }
 }
 
@@ -29,9 +49,9 @@ impl Provider for OpenAiProvider {
 
     fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
         let rig_request = to_rig_chat_request(request);
+        let client = self.client();
         Box::pin(async_stream::try_stream! {
-            let api_key = openai_api_key()?;
-            let client = openai_client(api_key)?;
+            let client = client?;
             let rig_request = rig_request?;
             let builder = client
                 .completion_model(rig_request.model.clone())
