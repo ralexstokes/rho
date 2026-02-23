@@ -6,35 +6,32 @@ use rho_core::{protocol::PROTOCOL_VERSION, providers::ProviderKind};
 use rho_tui::TuiClient;
 use tokio::net::TcpListener;
 
+const DEFAULT_BIND: &str = "127.0.0.1:0";
+const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+const DEFAULT_PROVIDER: ProviderArg = ProviderArg::Anthropic;
+
 #[derive(Debug, Parser)]
 #[command(name = "rho", about = "rho CLI scaffold")]
 struct Cli {
     #[command(flatten)]
-    local: LocalModeArgs,
+    local: ServeArgs,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Debug, Clone, Args)]
-struct LocalModeArgs {
-    #[arg(long, default_value = "127.0.0.1:0")]
+struct ServeArgs {
+    #[arg(long, default_value = DEFAULT_BIND)]
     bind: String,
-    #[arg(long, value_enum, default_value_t = ProviderArg::Anthropic)]
+    #[arg(long, value_enum, default_value_t = DEFAULT_PROVIDER)]
     provider: ProviderArg,
-    #[arg(long, default_value = "claude-sonnet-4-6")]
+    #[arg(long, default_value = DEFAULT_MODEL)]
     model: String,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Serve {
-        #[arg(long)]
-        bind: String,
-        #[arg(long, value_enum)]
-        provider: ProviderArg,
-        #[arg(long)]
-        model: String,
-    },
+    Serve(ServeArgs),
     Tui {
         #[arg(long)]
         url: String,
@@ -68,11 +65,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Serve {
-            bind,
-            provider,
-            model,
-        }) => run_serve(bind, provider, model).await?,
+        Some(Command::Serve(serve)) => run_serve(serve).await?,
         Some(Command::Tui { url }) => TuiClient::new(url).run().await?,
         None => run_local(cli.local).await?,
     }
@@ -108,11 +101,12 @@ fn websocket_client_addr(listener_addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(ip, listener_addr.port())
 }
 
-async fn run_serve(
-    bind: String,
-    provider: ProviderArg,
-    model: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_serve(serve: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let ServeArgs {
+        bind,
+        provider,
+        model,
+    } = serve;
     let (provider_kind, server) = build_server(provider, model)?;
     println!(
         "rho serve listening on {bind} with provider={provider_kind:?} protocol_version={}",
@@ -122,8 +116,13 @@ async fn run_serve(
     Ok(())
 }
 
-async fn run_local(local: LocalModeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let bind_addr = parse_bind_address(&local.bind)?;
+async fn run_local(local: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let ServeArgs {
+        bind,
+        provider,
+        model,
+    } = local;
+    let bind_addr = parse_bind_address(&bind)?;
     let listener = TcpListener::bind(bind_addr)
         .await
         .map_err(AgentServerError::Bind)?;
@@ -131,7 +130,7 @@ async fn run_local(local: LocalModeArgs) -> Result<(), Box<dyn std::error::Error
     let connect_addr = websocket_client_addr(listen_addr);
     let url = format!("ws://{connect_addr}/ws");
 
-    let (provider_kind, server) = build_server(local.provider, local.model)?;
+    let (provider_kind, server) = build_server(provider, model)?;
     println!(
         "rho running local mode on {listen_addr} with provider={provider_kind:?} protocol_version={} (tui={url})",
         PROTOCOL_VERSION
@@ -161,9 +160,30 @@ mod tests {
     fn cli_defaults_to_local_mode() {
         let cli = Cli::parse_from(["rho"]);
         assert!(cli.command.is_none());
-        assert_eq!(cli.local.bind, "127.0.0.1:0");
-        assert_eq!(cli.local.provider, ProviderArg::Openai);
-        assert_eq!(cli.local.model, "gpt-4o-mini");
+        assert_eq!(cli.local.bind, DEFAULT_BIND);
+        assert_eq!(cli.local.provider, DEFAULT_PROVIDER);
+        assert_eq!(cli.local.model, DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn serve_subcommand_parses_shared_args() {
+        let cli = Cli::parse_from([
+            "rho",
+            "serve",
+            "--bind",
+            "0.0.0.0:8787",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-4o-mini",
+        ]);
+
+        let Some(Command::Serve(serve)) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(serve.bind, "0.0.0.0:8787");
+        assert_eq!(serve.provider, ProviderArg::Openai);
+        assert_eq!(serve.model, "gpt-4o-mini");
     }
 
     #[test]
