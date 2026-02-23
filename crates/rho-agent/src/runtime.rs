@@ -531,6 +531,7 @@ mod tests {
                 vec![
                     Ok(ProviderEvent::ToolCall {
                         call: ToolCall {
+                            id: None,
                             call_id: "call-1".to_string(),
                             name: "read".to_string(),
                             input: json!({ "path": file_path.display().to_string() }),
@@ -615,6 +616,7 @@ mod tests {
                 vec![
                     Ok(ProviderEvent::ToolCall {
                         call: ToolCall {
+                            id: None,
                             call_id: "call-2".to_string(),
                             name: "missing_tool".to_string(),
                             input: json!({}),
@@ -662,6 +664,7 @@ mod tests {
                 vec![
                     Ok(ProviderEvent::ToolCall {
                         call: ToolCall {
+                            id: None,
                             call_id: "call-3".to_string(),
                             name: "bash".to_string(),
                             input: json!({ "command": "echo first" }),
@@ -672,6 +675,7 @@ mod tests {
                 vec![
                     Ok(ProviderEvent::ToolCall {
                         call: ToolCall {
+                            id: None,
                             call_id: "call-4".to_string(),
                             name: "bash".to_string(),
                             input: json!({ "command": "echo second" }),

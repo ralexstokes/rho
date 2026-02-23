@@ -10,6 +10,8 @@ pub struct ToolDefinition {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub call_id: String,
     pub name: String,
     pub input: Value,

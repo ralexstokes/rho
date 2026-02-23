@@ -188,13 +188,18 @@ pub(crate) fn map_streamed_assistant_chunk<R>(
         StreamedAssistantContent::Text(text) if !text.text.is_empty() => {
             Some(ProviderEvent::AssistantDelta { delta: text.text })
         }
-        StreamedAssistantContent::ToolCall { tool_call, .. } => Some(ProviderEvent::ToolCall {
-            call: crate::tool::ToolCall {
-                call_id: tool_call.call_id.unwrap_or(tool_call.id),
-                name: tool_call.function.name,
-                input: tool_call.function.arguments,
-            },
-        }),
+        StreamedAssistantContent::ToolCall { tool_call, .. } => {
+            let id = tool_call.id;
+            let call_id = tool_call.call_id.unwrap_or_else(|| id.clone());
+            Some(ProviderEvent::ToolCall {
+                call: crate::tool::ToolCall {
+                    id: Some(id),
+                    call_id,
+                    name: tool_call.function.name,
+                    input: tool_call.function.arguments,
+                },
+            })
+        }
         _ => None,
     }
 }
@@ -270,12 +275,8 @@ fn to_rig_assistant_message(content: String) -> RigMessage {
 }
 
 fn to_rig_assistant_tool_call(call: ToolCall) -> RigAssistantContent {
-    RigAssistantContent::tool_call_with_call_id(
-        call.call_id.clone(),
-        call.call_id,
-        call.name,
-        call.input,
-    )
+    let id = call.id.unwrap_or_else(|| call.call_id.clone());
+    RigAssistantContent::tool_call_with_call_id(id, call.call_id, call.name, call.input)
 }
 
 #[derive(Debug, Deserialize)]
@@ -410,6 +411,7 @@ mod tests {
                     encode_assistant_message_content(
                         "",
                         &[ToolCall {
+                            id: Some("toolu_123".to_string()),
                             call_id: "toolu_123".to_string(),
                             name: "read".to_string(),
                             input: json!({ "path": "README.md" }),
@@ -440,6 +442,50 @@ mod tests {
                             && tool_call.call_id.as_deref() == Some("toolu_123")
                             && tool_call.function.name == "read"
                             && tool_call.function.arguments == json!({ "path": "README.md" })
+                )
+        ));
+    }
+
+    #[test]
+    fn to_rig_chat_request_preserves_distinct_tool_call_id_and_call_id() {
+        let request = ProviderRequest::new(
+            "test-model",
+            vec![
+                Message::new(MessageRole::User, "first"),
+                Message::new(
+                    MessageRole::Assistant,
+                    encode_assistant_message_content(
+                        "",
+                        &[ToolCall {
+                            id: Some("fc_123".to_string()),
+                            call_id: "call_123".to_string(),
+                            name: "read".to_string(),
+                            input: json!({ "path": "README.md" }),
+                        }],
+                    ),
+                ),
+                Message::new(
+                    MessageRole::Tool,
+                    json!({
+                        "call_id": "call_123",
+                        "is_error": false,
+                        "output": "ok",
+                    })
+                    .to_string(),
+                ),
+                Message::new(MessageRole::User, "next"),
+            ],
+        );
+
+        let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
+        assert!(matches!(
+            &rig_request.history[1],
+            RigMessage::Assistant { content, .. }
+                if matches!(
+                    content.first_ref(),
+                    RigAssistantContent::ToolCall(tool_call)
+                        if tool_call.id == "fc_123"
+                            && tool_call.call_id.as_deref() == Some("call_123")
                 )
         ));
     }

@@ -241,6 +241,7 @@ mod tests {
     #[test]
     fn tool_started_format_includes_call_id_name_and_input() {
         let call = ToolCall {
+            id: None,
             call_id: "call-1".to_string(),
             name: "read".to_string(),
             input: json!({"path":"/tmp/demo.txt"}),

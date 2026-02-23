@@ -82,6 +82,8 @@ struct AssistantToolCallsPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AssistantToolCallPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     call_id: String,
     name: String,
     #[serde(default)]
@@ -91,6 +93,7 @@ struct AssistantToolCallPayload {
 impl From<&ToolCall> for AssistantToolCallPayload {
     fn from(call: &ToolCall) -> Self {
         Self {
+            id: call.id.clone(),
             call_id: call.call_id.clone(),
             name: call.name.clone(),
             input: call.input.clone(),
@@ -101,6 +104,7 @@ impl From<&ToolCall> for AssistantToolCallPayload {
 impl From<AssistantToolCallPayload> for ToolCall {
     fn from(call: AssistantToolCallPayload) -> Self {
         Self {
+            id: call.id,
             call_id: call.call_id,
             name: call.name,
             input: call.input,
@@ -119,6 +123,7 @@ mod tests {
         let encoded = encode_assistant_message_content(
             "thinking",
             &[ToolCall {
+                id: Some("fc-1".to_string()),
                 call_id: "call-1".to_string(),
                 name: "read".to_string(),
                 input: json!({ "path": "README.md" }),
@@ -128,6 +133,7 @@ mod tests {
         let parsed = decode_assistant_message_content(&encoded);
         assert_eq!(parsed.text, "thinking");
         assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id.as_deref(), Some("fc-1"));
         assert_eq!(parsed.tool_calls[0].call_id, "call-1");
         assert_eq!(parsed.tool_calls[0].name, "read");
         assert_eq!(parsed.tool_calls[0].input, json!({ "path": "README.md" }));
@@ -138,5 +144,24 @@ mod tests {
         let parsed = decode_assistant_message_content("just text");
         assert_eq!(parsed.text, "just text");
         assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn assistant_message_content_decodes_legacy_payload_without_id() {
+        let legacy = json!({
+            "kind": "rho_assistant_tool_calls_v1",
+            "text": "",
+            "tool_calls": [{
+                "call_id": "call-legacy",
+                "name": "read",
+                "input": { "path": "README.md" }
+            }]
+        })
+        .to_string();
+
+        let parsed = decode_assistant_message_content(&legacy);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert!(parsed.tool_calls[0].id.is_none());
+        assert_eq!(parsed.tool_calls[0].call_id, "call-legacy");
     }
 }
