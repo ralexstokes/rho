@@ -1,5 +1,20 @@
 # Quickstart
 
+Run local mode (single process server + TUI):
+
+```sh
+OPENAI_API_KEY=... cargo run -p rho --
+```
+
+Override local mode options:
+
+```sh
+ANTHROPIC_API_KEY=... cargo run -p rho -- \
+  --provider anthropic \
+  --model claude-3-5-haiku-latest \
+  --bind 127.0.0.1:8787
+```
+
 Run server (Machine A) with OpenAI:
 
 ```sh
