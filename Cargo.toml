@@ -1,0 +1,6 @@
+[workspace]
+members = []
+resolver = "3"
+
+[workspace.package]
+license = "MIT OR Apache-2.0"

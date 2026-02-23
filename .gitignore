@@ -1,0 +1,10 @@
+/target/
+
+.direnv/
+
+.DS_Store
+
+.claude/
+.codex/
+
+.env
