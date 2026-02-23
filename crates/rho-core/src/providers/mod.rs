@@ -34,17 +34,46 @@ pub enum ProviderKind {
     Anthropic,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ModelKind {
+    Gpt52,
+    ClaudeSonnet46,
+}
+
+impl ModelKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gpt52 => "gpt-5.2-2025-12-11",
+            Self::ClaudeSonnet46 => "claude-sonnet-4-6",
+        }
+    }
+
+    pub fn provider_kind(self) -> ProviderKind {
+        match self {
+            Self::Gpt52 => ProviderKind::OpenAi,
+            Self::ClaudeSonnet46 => ProviderKind::Anthropic,
+        }
+    }
+}
+
+impl std::fmt::Display for ModelKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRequest {
-    pub model: String,
+    pub model: ModelKind,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
 }
 
 impl ProviderRequest {
-    pub fn new(model: impl Into<String>, messages: Vec<Message>) -> Self {
+    pub fn new(model: ModelKind, messages: Vec<Message>) -> Self {
         Self {
-            model: model.into(),
+            model,
             messages,
             tools: Vec::new(),
         }
@@ -120,7 +149,7 @@ pub(crate) fn to_rig_chat_request(
     };
 
     Ok(RigChatRequest {
-        model: request.model,
+        model: request.model.to_string(),
         prompt,
         history: chat_messages,
         preamble,
@@ -311,7 +340,7 @@ mod tests {
     #[test]
     fn to_rig_chat_request_extracts_preamble_prompt_history_and_tools() {
         let request = ProviderRequest::new(
-            "test-model",
+            ModelKind::Gpt52,
             vec![
                 Message::new(MessageRole::System, "system-a"),
                 Message::new(MessageRole::System, "system-b"),
@@ -341,7 +370,7 @@ mod tests {
 
         let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
 
-        assert_eq!(rig_request.model, "test-model");
+        assert_eq!(rig_request.model, ModelKind::Gpt52.as_str());
         assert_eq!(
             rig_request.preamble,
             Some("system-a\n\nsystem-b".to_string())
@@ -360,7 +389,7 @@ mod tests {
     #[test]
     fn to_rig_chat_request_requires_a_non_system_prompt() {
         let request = ProviderRequest::new(
-            "test-model",
+            ModelKind::Gpt52,
             vec![Message::new(MessageRole::System, "only system")],
         );
 
@@ -371,7 +400,7 @@ mod tests {
     #[test]
     fn to_rig_chat_request_preserves_tool_result_call_id() {
         let request = ProviderRequest::new(
-            "test-model",
+            ModelKind::Gpt52,
             vec![
                 Message::new(MessageRole::User, "first"),
                 Message::new(
@@ -403,7 +432,7 @@ mod tests {
     #[test]
     fn to_rig_chat_request_preserves_assistant_tool_calls() {
         let request = ProviderRequest::new(
-            "test-model",
+            ModelKind::Gpt52,
             vec![
                 Message::new(MessageRole::User, "first"),
                 Message::new(
@@ -449,7 +478,7 @@ mod tests {
     #[test]
     fn to_rig_chat_request_preserves_distinct_tool_call_id_and_call_id() {
         let request = ProviderRequest::new(
-            "test-model",
+            ModelKind::Gpt52,
             vec![
                 Message::new(MessageRole::User, "first"),
                 Message::new(

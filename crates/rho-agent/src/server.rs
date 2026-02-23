@@ -16,7 +16,9 @@ use rho_core::{
         ClientEnvelope, ClientEvent, ErrorEvent, PROTOCOL_VERSION, ServerEnvelope, ServerEvent,
         SessionAck,
     },
-    providers::{Provider, ProviderKind, anthropic::AnthropicProvider, openai::OpenAiProvider},
+    providers::{
+        ModelKind, Provider, ProviderKind, anthropic::AnthropicProvider, openai::OpenAiProvider,
+    },
 };
 use thiserror::Error;
 use tokio::{
@@ -34,15 +36,11 @@ pub struct AgentServer {
 }
 
 impl AgentServer {
-    pub fn new(
-        runtime: AgentRuntime,
-        provider: Arc<dyn Provider>,
-        model: impl Into<String>,
-    ) -> Self {
+    pub fn new(runtime: AgentRuntime, provider: Arc<dyn Provider>, model: ModelKind) -> Self {
         let state = AppState {
             runtime,
             provider,
-            model: model.into(),
+            model,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         };
         Self { state }
@@ -86,6 +84,11 @@ pub enum AgentServerError {
     Serve(#[source] std::io::Error),
     #[error("unsupported provider kind `{0}`")]
     UnsupportedProviderKind(String),
+    #[error("model `{model}` is not supported for provider `{provider:?}`")]
+    UnsupportedModelForProvider {
+        provider: ProviderKind,
+        model: ModelKind,
+    },
 }
 
 pub fn build_provider(kind: ProviderKind) -> Result<Arc<dyn Provider>, AgentServerError> {
@@ -102,7 +105,7 @@ pub fn build_provider(kind: ProviderKind) -> Result<Arc<dyn Provider>, AgentServ
 struct AppState {
     runtime: AgentRuntime,
     provider: Arc<dyn Provider>,
-    model: String,
+    model: ModelKind,
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
 }
 
@@ -289,7 +292,7 @@ async fn handle_client_event(
             session_state.in_flight = None;
 
             let runtime = state.runtime.clone();
-            let model = state.model.clone();
+            let model = state.model;
             let provider = Arc::clone(&state.provider);
             let session = Arc::clone(&session_state.session);
             let outbound_sender = outbound_sender.clone();
@@ -427,7 +430,7 @@ mod tests {
 
     use rho_core::{
         Message,
-        providers::{ProviderError, ProviderRequest, ProviderStream},
+        providers::{ModelKind, ProviderError, ProviderRequest, ProviderStream},
         stream::ProviderEvent,
     };
     use tokio::sync::mpsc;
@@ -607,7 +610,7 @@ mod tests {
         AppState {
             runtime: AgentRuntime::new(),
             provider,
-            model: "test-model".to_string(),
+            model: ModelKind::Gpt52,
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }

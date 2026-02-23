@@ -11,7 +11,7 @@ use rho_core::{
     protocol::{
         AssistantDelta, FinalMessage, PROTOCOL_VERSION, ServerEvent, ToolCompleted, ToolStarted,
     },
-    providers::{Provider, ProviderError, ProviderRequest},
+    providers::{ModelKind, Provider, ProviderError, ProviderRequest},
     stream::ProviderEvent,
     tool::{ToolCall, ToolDefinition, ToolResult},
 };
@@ -66,10 +66,9 @@ impl AgentRuntime {
         &self,
         session: &mut AgentSession,
         provider: &dyn Provider,
-        model: impl Into<String>,
+        model: ModelKind,
         user_content: impl Into<String>,
     ) -> Result<Vec<ServerEvent>, AgentError> {
-        let model = model.into();
         let user_content = user_content.into();
         let mut emitted_events = Vec::new();
         self.run_user_message_streaming(session, provider, model, user_content, |event| {
@@ -83,19 +82,18 @@ impl AgentRuntime {
         &self,
         session: &mut AgentSession,
         provider: &dyn Provider,
-        model: impl Into<String>,
+        model: ModelKind,
         user_content: impl Into<String>,
         mut emit_event: F,
     ) -> Result<(), AgentError>
     where
         F: FnMut(ServerEvent),
     {
-        let model = model.into();
         let user_content = user_content.into();
         session
             .messages
             .push(Message::new(MessageRole::User, user_content));
-        self.run_completion_loop(session, provider, &model, &mut emit_event)
+        self.run_completion_loop(session, provider, model, &mut emit_event)
             .await
     }
 
@@ -103,7 +101,7 @@ impl AgentRuntime {
         &self,
         session: &mut AgentSession,
         provider: &dyn Provider,
-        model: &str,
+        model: ModelKind,
         emit_event: &mut F,
     ) -> Result<(), AgentError>
     where
@@ -113,7 +111,7 @@ impl AgentRuntime {
         let builtin_tools = builtin_tool_definitions();
 
         for iteration in 0..=self.max_tool_iterations {
-            let request = ProviderRequest::new(model.to_string(), session.messages.clone())
+            let request = ProviderRequest::new(model, session.messages.clone())
                 .with_tools(builtin_tools.clone());
             let mut stream = provider.stream(request);
 
@@ -459,7 +457,7 @@ mod tests {
 
     use rho_core::{
         message::decode_assistant_message_content,
-        providers::{ProviderKind, ProviderRequest, ProviderStream},
+        providers::{ModelKind, ProviderKind, ProviderRequest, ProviderStream},
         tool::ToolCall,
     };
     use serde_json::{Value, json};
@@ -485,7 +483,7 @@ mod tests {
             ]]);
 
             let events = runtime
-                .run_user_message(&mut session, &provider, "test-model", "hi")
+                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "hi")
                 .await
                 .expect("run should succeed");
 
@@ -554,7 +552,7 @@ mod tests {
             ]);
 
             let events = runtime
-                .run_user_message(&mut session, &provider, "test-model", "read the file")
+                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "read the file")
                 .await
                 .expect("run should succeed");
 
@@ -636,7 +634,7 @@ mod tests {
             ]);
 
             let events = runtime
-                .run_user_message(&mut session, &provider, "test-model", "do something")
+                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "do something")
                 .await
                 .expect("run should continue after tool failure");
 
@@ -686,7 +684,7 @@ mod tests {
             ]);
 
             let error = runtime
-                .run_user_message(&mut session, &provider, "test-model", "loop")
+                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "loop")
                 .await
                 .expect_err("run should fail once the limit is exceeded");
             assert!(matches!(error, AgentError::MaxToolIterationsExceeded(1)));
