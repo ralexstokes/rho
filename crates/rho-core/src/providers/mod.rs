@@ -17,9 +17,9 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{
-    message::{Message, MessageRole},
+    message::{Message, MessageRole, decode_assistant_message_content},
     stream::ProviderEvent,
-    tool::ToolDefinition,
+    tool::{ToolCall, ToolDefinition},
 };
 
 pub mod anthropic;
@@ -101,7 +101,7 @@ pub(crate) fn to_rig_chat_request(
                 chat_messages.push(RigMessage::from(RigUserContent::text(message.content)))
             }
             MessageRole::Assistant => {
-                chat_messages.push(RigMessage::from(RigAssistantContent::text(message.content)))
+                chat_messages.push(to_rig_assistant_message(message.content));
             }
             MessageRole::Tool => chat_messages.push(to_rig_tool_result_message(message.content)),
         }
@@ -245,6 +245,39 @@ fn to_rig_tool_result_message(content: String) -> RigMessage {
     ))
 }
 
+fn to_rig_assistant_message(content: String) -> RigMessage {
+    let parsed = decode_assistant_message_content(&content);
+    if parsed.tool_calls.is_empty() {
+        return RigMessage::from(RigAssistantContent::text(parsed.text));
+    }
+
+    let mut assistant_content = Vec::new();
+    if !parsed.text.is_empty() {
+        assistant_content.push(RigAssistantContent::text(parsed.text));
+    }
+    assistant_content.extend(
+        parsed
+            .tool_calls
+            .into_iter()
+            .map(to_rig_assistant_tool_call),
+    );
+
+    RigMessage::Assistant {
+        id: None,
+        content: OneOrMany::many(assistant_content)
+            .expect("assistant message with tool calls should not be empty"),
+    }
+}
+
+fn to_rig_assistant_tool_call(call: ToolCall) -> RigAssistantContent {
+    RigAssistantContent::tool_call_with_call_id(
+        call.call_id.clone(),
+        call.call_id,
+        call.name,
+        call.input,
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct ToolMessagePayload {
     call_id: String,
@@ -265,11 +298,14 @@ pub trait Provider: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use rig::completion::{Message as RigMessage, message::UserContent as RigUserContent};
+    use rig::completion::{
+        AssistantContent as RigAssistantContent, Message as RigMessage,
+        message::UserContent as RigUserContent,
+    };
     use serde_json::json;
 
     use super::*;
-    use crate::Message;
+    use crate::{Message, message::encode_assistant_message_content};
 
     #[test]
     fn to_rig_chat_request_extracts_preamble_prompt_history_and_tools() {
@@ -359,6 +395,51 @@ mod tests {
                     RigUserContent::ToolResult(tool_result)
                         if tool_result.id == "call-123"
                             && tool_result.call_id.as_deref() == Some("call-123")
+                )
+        ));
+    }
+
+    #[test]
+    fn to_rig_chat_request_preserves_assistant_tool_calls() {
+        let request = ProviderRequest::new(
+            "test-model",
+            vec![
+                Message::new(MessageRole::User, "first"),
+                Message::new(
+                    MessageRole::Assistant,
+                    encode_assistant_message_content(
+                        "",
+                        &[ToolCall {
+                            call_id: "toolu_123".to_string(),
+                            name: "read".to_string(),
+                            input: json!({ "path": "README.md" }),
+                        }],
+                    ),
+                ),
+                Message::new(
+                    MessageRole::Tool,
+                    json!({
+                        "call_id": "toolu_123",
+                        "is_error": false,
+                        "output": "ok",
+                    })
+                    .to_string(),
+                ),
+                Message::new(MessageRole::User, "next"),
+            ],
+        );
+
+        let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
+        assert!(matches!(
+            &rig_request.history[1],
+            RigMessage::Assistant { content, .. }
+                if matches!(
+                    content.first_ref(),
+                    RigAssistantContent::ToolCall(tool_call)
+                        if tool_call.id == "toolu_123"
+                            && tool_call.call_id.as_deref() == Some("toolu_123")
+                            && tool_call.function.name == "read"
+                            && tool_call.function.arguments == json!({ "path": "README.md" })
                 )
         ));
     }

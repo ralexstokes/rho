@@ -7,6 +7,7 @@ use std::{
 use futures_util::StreamExt;
 use rho_core::{
     Message, MessageRole,
+    message::encode_assistant_message_content,
     protocol::{
         AssistantDelta, FinalMessage, PROTOCOL_VERSION, ServerEvent, ToolCompleted, ToolStarted,
     },
@@ -118,6 +119,7 @@ impl AgentRuntime {
 
             let mut assistant_message = None;
             let mut assistant_delta_text = String::new();
+            let mut assistant_tool_calls = Vec::new();
             let mut tool_results = Vec::new();
 
             while let Some(next_event) = stream.next().await {
@@ -134,6 +136,7 @@ impl AgentRuntime {
                             session_id: session_id.clone(),
                             call: call.clone(),
                         }));
+                        assistant_tool_calls.push(call.clone());
 
                         let result = execute_builtin_tool(&call);
                         push_tool_result_event(emit_event, &session_id, result, &mut tool_results);
@@ -153,6 +156,10 @@ impl AgentRuntime {
             let assistant_message = assistant_message.unwrap_or_else(|| {
                 Message::new(MessageRole::Assistant, assistant_delta_text.clone())
             });
+            let assistant_message = Message::new(
+                MessageRole::Assistant,
+                encode_assistant_message_content(assistant_message.content, &assistant_tool_calls),
+            );
 
             if !assistant_message.content.is_empty() {
                 session.messages.push(assistant_message.clone());
@@ -451,6 +458,7 @@ mod tests {
     };
 
     use rho_core::{
+        message::decode_assistant_message_content,
         providers::{ProviderKind, ProviderRequest, ProviderStream},
         tool::ToolCall,
     };
@@ -578,6 +586,21 @@ mod tests {
             assert_eq!(payload["call_id"], json!("call-1"));
             assert_eq!(payload["is_error"], json!(false));
             assert_eq!(payload["output"], json!("file-content"));
+            let second_request_assistant_message = requests[1]
+                .messages
+                .iter()
+                .find(|message| message.role == MessageRole::Assistant)
+                .expect("second request should contain assistant tool calls");
+            let parsed_assistant =
+                decode_assistant_message_content(&second_request_assistant_message.content);
+            assert_eq!(parsed_assistant.text, "");
+            assert_eq!(parsed_assistant.tool_calls.len(), 1);
+            assert_eq!(parsed_assistant.tool_calls[0].call_id, "call-1");
+            assert_eq!(parsed_assistant.tool_calls[0].name, "read");
+            assert_eq!(
+                parsed_assistant.tool_calls[0].input,
+                json!({ "path": file_path.display().to_string() })
+            );
 
             let _ = fs::remove_file(file_path);
         });
