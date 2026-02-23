@@ -89,10 +89,12 @@ impl AgentRuntime {
     where
         F: FnMut(ServerEvent),
     {
+        let model = model.into();
+        let user_content = user_content.into();
         session
             .messages
-            .push(Message::new(MessageRole::User, user_content.into()));
-        self.run_completion_loop(session, provider, &model.into(), &mut emit_event)
+            .push(Message::new(MessageRole::User, user_content));
+        self.run_completion_loop(session, provider, &model, &mut emit_event)
             .await
     }
 
@@ -106,6 +108,7 @@ impl AgentRuntime {
     where
         F: FnMut(ServerEvent),
     {
+        let session_id = session.id.clone();
         for iteration in 0..=self.max_tool_iterations {
             let request = ProviderRequest::new(model.to_string(), session.messages.clone());
             let mut stream = provider.stream(request);
@@ -119,29 +122,21 @@ impl AgentRuntime {
                     ProviderEvent::AssistantDelta { delta } => {
                         assistant_delta_text.push_str(&delta);
                         emit_event(ServerEvent::AssistantDelta(AssistantDelta {
-                            session_id: session.id.clone(),
+                            session_id: session_id.clone(),
                             delta,
                         }));
                     }
                     ProviderEvent::ToolCall { call } => {
                         emit_event(ServerEvent::ToolStarted(ToolStarted {
-                            session_id: session.id.clone(),
+                            session_id: session_id.clone(),
                             call: call.clone(),
                         }));
 
                         let result = execute_builtin_tool(&call);
-                        emit_event(ServerEvent::ToolCompleted(ToolCompleted {
-                            session_id: session.id.clone(),
-                            result: result.clone(),
-                        }));
-                        tool_results.push(result);
+                        push_tool_result_event(emit_event, &session_id, result, &mut tool_results);
                     }
                     ProviderEvent::ToolResult { result } => {
-                        emit_event(ServerEvent::ToolCompleted(ToolCompleted {
-                            session_id: session.id.clone(),
-                            result: result.clone(),
-                        }));
-                        tool_results.push(result);
+                        push_tool_result_event(emit_event, &session_id, result, &mut tool_results);
                     }
                     ProviderEvent::Message { message } => {
                         if message.role == MessageRole::Assistant {
@@ -162,7 +157,7 @@ impl AgentRuntime {
 
             if tool_results.is_empty() {
                 emit_event(ServerEvent::Final(FinalMessage {
-                    session_id: session.id.clone(),
+                    session_id: session_id.clone(),
                     message: assistant_message,
                 }));
                 return Ok(());
@@ -173,15 +168,11 @@ impl AgentRuntime {
             }
 
             if iteration == self.max_tool_iterations {
-                return Err(AgentError::MaxToolIterationsExceeded(
-                    self.max_tool_iterations,
-                ));
+                return Err(max_tool_iterations_error(self.max_tool_iterations));
             }
         }
 
-        Err(AgentError::MaxToolIterationsExceeded(
-            self.max_tool_iterations,
-        ))
+        Err(max_tool_iterations_error(self.max_tool_iterations))
     }
 }
 
@@ -203,6 +194,25 @@ pub enum AgentError {
     Provider(#[from] ProviderError),
     #[error("maximum tool iterations exceeded ({0})")]
     MaxToolIterationsExceeded(usize),
+}
+
+fn max_tool_iterations_error(max_tool_iterations: usize) -> AgentError {
+    AgentError::MaxToolIterationsExceeded(max_tool_iterations)
+}
+
+fn push_tool_result_event<F>(
+    emit_event: &mut F,
+    session_id: &str,
+    result: ToolResult,
+    tool_results: &mut Vec<ToolResult>,
+) where
+    F: FnMut(ServerEvent),
+{
+    emit_event(ServerEvent::ToolCompleted(ToolCompleted {
+        session_id: session_id.to_string(),
+        result: result.clone(),
+    }));
+    tool_results.push(result);
 }
 
 fn execute_builtin_tool(call: &ToolCall) -> ToolResult {
@@ -296,16 +306,13 @@ fn bash_tool(call: &ToolCall) -> ToolResult {
         "exit_code": output.status.code(),
         "stdout": String::from_utf8_lossy(&output.stdout),
         "stderr": String::from_utf8_lossy(&output.stderr),
-    });
+    })
+    .to_string();
 
     if output.status.success() {
-        tool_ok(&call.call_id, payload.to_string())
+        tool_ok(&call.call_id, payload)
     } else {
-        ToolResult {
-            call_id: call.call_id.clone(),
-            output: payload.to_string(),
-            is_error: true,
-        }
+        tool_error(&call.call_id, payload)
     }
 }
 

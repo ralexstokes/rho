@@ -93,17 +93,11 @@ impl TuiClient {
                         stdout().flush().map_err(TuiClientError::Io)?;
                     }
                     ServerEvent::ToolStarted(tool_started) => {
-                        if streaming_line_open {
-                            println!();
-                            streaming_line_open = false;
-                        }
+                        close_streaming_line(&mut streaming_line_open);
                         println!("[tool:start] {}", format_tool_started(&tool_started.call));
                     }
                     ServerEvent::ToolCompleted(tool_completed) => {
-                        if streaming_line_open {
-                            println!();
-                            streaming_line_open = false;
-                        }
+                        close_streaming_line(&mut streaming_line_open);
                         println!(
                             "[tool:done] {}",
                             format_tool_completed(&tool_completed.result)
@@ -111,16 +105,14 @@ impl TuiClient {
                     }
                     ServerEvent::Final(final_message) => {
                         if streaming_line_open {
-                            println!();
+                            close_streaming_line(&mut streaming_line_open);
                         } else {
                             println!("{}", final_message.message.content);
                         }
                         break;
                     }
                     ServerEvent::Error(error) => {
-                        if streaming_line_open {
-                            println!();
-                        }
+                        close_streaming_line(&mut streaming_line_open);
                         println!("{}", format_error(&error));
                         break;
                     }
@@ -198,11 +190,19 @@ async fn recv_server_envelope(
             WsMessage::Text(text) => {
                 return serde_json::from_str(text.as_str()).map_err(TuiClientError::Protocol);
             }
-            WsMessage::Binary(_) => {}
-            WsMessage::Ping(_) | WsMessage::Pong(_) => {}
-            WsMessage::Frame(_) => {}
+            WsMessage::Binary(_)
+            | WsMessage::Ping(_)
+            | WsMessage::Pong(_)
+            | WsMessage::Frame(_) => {}
             WsMessage::Close(_) => return Err(TuiClientError::Closed),
         }
+    }
+}
+
+fn close_streaming_line(streaming_line_open: &mut bool) {
+    if *streaming_line_open {
+        println!();
+        *streaming_line_open = false;
     }
 }
 

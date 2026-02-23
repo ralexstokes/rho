@@ -44,6 +44,17 @@ pub enum ProviderError {
     Transport(String),
 }
 
+pub(crate) fn validate_api_key(
+    env_var: &'static str,
+    api_key: Option<String>,
+) -> Result<String, ProviderError> {
+    let api_key = api_key.ok_or(ProviderError::MissingApiKey(env_var))?;
+    if api_key.trim().is_empty() {
+        return Err(ProviderError::InvalidApiKey(env_var));
+    }
+    Ok(api_key)
+}
+
 pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
 

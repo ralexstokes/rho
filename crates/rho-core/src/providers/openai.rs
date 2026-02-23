@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     message::{Message, MessageRole},
-    providers::{Provider, ProviderError, ProviderKind, ProviderRequest, ProviderStream},
+    providers::{
+        Provider, ProviderError, ProviderKind, ProviderRequest, ProviderStream, validate_api_key,
+    },
     stream::ProviderEvent,
 };
 
@@ -73,10 +75,7 @@ impl Provider for OpenAiProvider {
 
                 let data = event.data.trim();
                 if data == "[DONE]" {
-                    let message = Message::new(MessageRole::Assistant, aggregate_text);
-                    yield ProviderEvent::Message { message };
-                    yield ProviderEvent::Finished;
-                    return;
+                    break;
                 }
 
                 let chunk: OpenAiChunk = serde_json::from_str(data).map_err(|error| {
@@ -101,15 +100,7 @@ impl Provider for OpenAiProvider {
 }
 
 fn openai_api_key() -> Result<String, ProviderError> {
-    validate_api_key(std::env::var(OPENAI_API_KEY_ENV).ok())
-}
-
-fn validate_api_key(api_key: Option<String>) -> Result<String, ProviderError> {
-    let api_key = api_key.ok_or(ProviderError::MissingApiKey(OPENAI_API_KEY_ENV))?;
-    if api_key.trim().is_empty() {
-        return Err(ProviderError::InvalidApiKey(OPENAI_API_KEY_ENV));
-    }
-    Ok(api_key)
+    validate_api_key(OPENAI_API_KEY_ENV, std::env::var(OPENAI_API_KEY_ENV).ok())
 }
 
 #[derive(Debug, Serialize)]
@@ -177,7 +168,8 @@ mod tests {
 
     #[test]
     fn validate_api_key_rejects_missing_value() {
-        let error = validate_api_key(None).expect_err("missing API key should fail");
+        let error =
+            validate_api_key(OPENAI_API_KEY_ENV, None).expect_err("missing API key should fail");
         assert!(matches!(
             error,
             ProviderError::MissingApiKey(OPENAI_API_KEY_ENV)
@@ -186,8 +178,8 @@ mod tests {
 
     #[test]
     fn validate_api_key_rejects_blank_value() {
-        let error =
-            validate_api_key(Some("   ".to_string())).expect_err("blank API key should fail");
+        let error = validate_api_key(OPENAI_API_KEY_ENV, Some("   ".to_string()))
+            .expect_err("blank API key should fail");
         assert!(matches!(
             error,
             ProviderError::InvalidApiKey(OPENAI_API_KEY_ENV)

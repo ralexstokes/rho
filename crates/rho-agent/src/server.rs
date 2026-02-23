@@ -257,13 +257,9 @@ async fn handle_client_event(
             let user_content = user_message.message.content;
             let mut sessions = state.sessions.lock().await;
 
-            let Some(session_state) = sessions.get_mut(&session_id) else {
-                send_error(
-                    outbound_sender,
-                    Some(session_id),
-                    "session_not_found",
-                    "session was not found",
-                );
+            let Some(session_state) =
+                get_session_state_mut(&mut sessions, outbound_sender, &session_id)
+            else {
                 return;
             };
 
@@ -324,13 +320,9 @@ async fn handle_client_event(
             let session_id = cancel_request.session_id;
             let mut sessions = state.sessions.lock().await;
 
-            let Some(session_state) = sessions.get_mut(&session_id) else {
-                send_error(
-                    outbound_sender,
-                    Some(session_id),
-                    "session_not_found",
-                    "session was not found",
-                );
+            let Some(session_state) =
+                get_session_state_mut(&mut sessions, outbound_sender, &session_id)
+            else {
                 return;
             };
 
@@ -351,6 +343,24 @@ async fn handle_client_event(
                 );
             }
         }
+    }
+}
+
+fn get_session_state_mut<'a>(
+    sessions: &'a mut HashMap<String, SessionState>,
+    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+    session_id: &str,
+) -> Option<&'a mut SessionState> {
+    if let Some(session_state) = sessions.get_mut(session_id) {
+        Some(session_state)
+    } else {
+        send_error(
+            outbound_sender,
+            Some(session_id.to_string()),
+            "session_not_found",
+            "session was not found",
+        );
+        None
     }
 }
 
