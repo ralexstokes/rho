@@ -11,7 +11,7 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 const DEFAULT_PROVIDER: ProviderArg = ProviderArg::Anthropic;
 
 #[derive(Debug, Parser)]
-#[command(name = "rho", about = "rho CLI scaffold")]
+#[command(name = "rho", about = "rho, an agent harness")]
 struct Cli {
     #[command(flatten)]
     local: ServeArgs,

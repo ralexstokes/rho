@@ -21,8 +21,8 @@ test:
 run:
     cargo run -p rho
 
-book-build:
+build-book:
     mdbook build docs
 
-book-serve:
+serve-book:
     mdbook serve docs

@@ -1,5 +1,7 @@
 # rho ρ
 
+an agent harness.
+
 Minimal Rust reimplementation of core pi-mono ideas with:
 - shared provider/protocol contracts in `rho-core`
 - agent runtime + websocket server in `rho-agent`
