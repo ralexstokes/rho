@@ -5,6 +5,8 @@ use rho_agent::{AgentRuntime, AgentServer, AgentServerError, build_provider};
 use rho_core::{protocol::PROTOCOL_VERSION, providers::ProviderKind};
 use rho_tui::TuiClient;
 use tokio::net::TcpListener;
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 const DEFAULT_BIND: &str = "127.0.0.1:0";
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
@@ -55,8 +57,11 @@ impl ProviderArg {
 
 #[tokio::main]
 async fn main() {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+
     if let Err(error) = run().await {
-        eprintln!("error: {error}");
+        error!(%error, "rho exited with error");
         std::process::exit(1);
     }
 }
@@ -108,9 +113,11 @@ async fn run_serve(serve: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         model,
     } = serve;
     let (provider_kind, server) = build_server(provider, model)?;
-    println!(
-        "rho serve listening on {bind} with provider={provider_kind:?} protocol_version={}",
-        PROTOCOL_VERSION
+    info!(
+        bind = %bind,
+        provider = ?provider_kind,
+        protocol_version = PROTOCOL_VERSION,
+        "rho serve listening"
     );
     server.serve(bind).await?;
     Ok(())
@@ -131,9 +138,12 @@ async fn run_local(local: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("ws://{connect_addr}/ws");
 
     let (provider_kind, server) = build_server(provider, model)?;
-    println!(
-        "rho running local mode on {listen_addr} with provider={provider_kind:?} protocol_version={} (tui={url})",
-        PROTOCOL_VERSION
+    info!(
+        listen_addr = %listen_addr,
+        provider = ?provider_kind,
+        protocol_version = PROTOCOL_VERSION,
+        tui_url = %url,
+        "rho running local mode"
     );
 
     let server_task = tokio::spawn(server.serve_with_listener(listener));
