@@ -1,6 +1,6 @@
 RHO MVP HANDOFF
 
-Last updated: 2026-02-23
+Last updated: 2026-02-23 (post-#4..#7 merge update)
 Repo: https://github.com/ralexstokes/rho
 
 Goal
@@ -45,16 +45,18 @@ Current Execution Status
 - [x] #1 merged (completed on 2026-02-23)
 - [x] #2 merged (completed on 2026-02-23)
 - [x] #3 merged (completed on 2026-02-23)
-- [ ] #4 pending
-- [ ] #5 pending
-- [ ] #6 pending
-- [ ] #7 pending
+- [x] #4 merged (PR #13 merged to `main` on 2026-02-23)
+- [x] #5 merged (PR #14 merged on 2026-02-23; base branch `codex/issue-4-agent-loop-tools`)
+- [x] #6 merged (PR #15 merged on 2026-02-23; base branch `codex/issue-5-agent-ws-server`)
+- [x] #7 merged (PR #16 merged on 2026-02-23; base branch `codex/issue-6-tui-ws-client`)
 
-Recommended Execution Order
-1) Issues #1, #2, and #3 are complete (contracts + providers)
-2) Issue #4 next (agent loop + tools)
-3) Issues #5 and #6 in parallel (transport + tui client)
-4) Issue #7 last (full wiring and e2e)
+Execution Summary
+1) Issues #1 through #7 are implemented and merged.
+2) MVP feature scope is complete per issue tracker definitions.
+
+Stacked Merge Follow-up
+1) PRs #14, #15, and #16 were merged into stacked branch bases, not directly into `main`.
+2) Promote the final stacked result to `main` with one consolidation PR from the final stack branch.
 
 Suggested Branch Naming
 - codex/issue-1-rho-core-scaffold

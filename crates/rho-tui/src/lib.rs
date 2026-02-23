@@ -1,3 +1,3 @@
 pub mod client;
 
-pub use client::TuiClient;
+pub use client::{TuiClient, TuiClientError};

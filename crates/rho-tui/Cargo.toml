@@ -3,3 +3,11 @@ name = "rho-tui"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
+
+[dependencies]
+futures-util.workspace = true
+rho-core = { path = "../rho-core" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1.48.0", features = ["io-std", "io-util", "rt-multi-thread", "time"] }
+tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

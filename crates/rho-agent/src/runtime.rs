@@ -68,21 +68,44 @@ impl AgentRuntime {
         model: impl Into<String>,
         user_content: impl Into<String>,
     ) -> Result<Vec<ServerEvent>, AgentError> {
+        let model = model.into();
+        let user_content = user_content.into();
+        let mut emitted_events = Vec::new();
+        self.run_user_message_streaming(session, provider, model, user_content, |event| {
+            emitted_events.push(event);
+        })
+        .await?;
+        Ok(emitted_events)
+    }
+
+    pub async fn run_user_message_streaming<F>(
+        &self,
+        session: &mut AgentSession,
+        provider: &dyn Provider,
+        model: impl Into<String>,
+        user_content: impl Into<String>,
+        mut emit_event: F,
+    ) -> Result<(), AgentError>
+    where
+        F: FnMut(ServerEvent),
+    {
         session
             .messages
-            .push(Message::new(MessageRole::User, user_content));
-        self.run_completion_loop(session, provider, &model.into())
+            .push(Message::new(MessageRole::User, user_content.into()));
+        self.run_completion_loop(session, provider, &model.into(), &mut emit_event)
             .await
     }
 
-    async fn run_completion_loop(
+    async fn run_completion_loop<F>(
         &self,
         session: &mut AgentSession,
         provider: &dyn Provider,
         model: &str,
-    ) -> Result<Vec<ServerEvent>, AgentError> {
-        let mut emitted_events = Vec::new();
-
+        emit_event: &mut F,
+    ) -> Result<(), AgentError>
+    where
+        F: FnMut(ServerEvent),
+    {
         for iteration in 0..=self.max_tool_iterations {
             let request = ProviderRequest::new(model.to_string(), session.messages.clone());
             let mut stream = provider.stream(request);
@@ -95,26 +118,26 @@ impl AgentRuntime {
                 match next_event? {
                     ProviderEvent::AssistantDelta { delta } => {
                         assistant_delta_text.push_str(&delta);
-                        emitted_events.push(ServerEvent::AssistantDelta(AssistantDelta {
+                        emit_event(ServerEvent::AssistantDelta(AssistantDelta {
                             session_id: session.id.clone(),
                             delta,
                         }));
                     }
                     ProviderEvent::ToolCall { call } => {
-                        emitted_events.push(ServerEvent::ToolStarted(ToolStarted {
+                        emit_event(ServerEvent::ToolStarted(ToolStarted {
                             session_id: session.id.clone(),
                             call: call.clone(),
                         }));
 
                         let result = execute_builtin_tool(&call);
-                        emitted_events.push(ServerEvent::ToolCompleted(ToolCompleted {
+                        emit_event(ServerEvent::ToolCompleted(ToolCompleted {
                             session_id: session.id.clone(),
                             result: result.clone(),
                         }));
                         tool_results.push(result);
                     }
                     ProviderEvent::ToolResult { result } => {
-                        emitted_events.push(ServerEvent::ToolCompleted(ToolCompleted {
+                        emit_event(ServerEvent::ToolCompleted(ToolCompleted {
                             session_id: session.id.clone(),
                             result: result.clone(),
                         }));
@@ -138,11 +161,11 @@ impl AgentRuntime {
             }
 
             if tool_results.is_empty() {
-                emitted_events.push(ServerEvent::Final(FinalMessage {
+                emit_event(ServerEvent::Final(FinalMessage {
                     session_id: session.id.clone(),
                     message: assistant_message,
                 }));
-                return Ok(emitted_events);
+                return Ok(());
             }
 
             for tool_result in tool_results {
