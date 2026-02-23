@@ -76,20 +76,12 @@ Suggested names:
 Run before opening a PR:
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo check --workspace
+cargo +nightly fmt --all --check
+cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings
+cargo build --workspace
 cargo test --workspace
 ```
-
-If using `just`, equivalent targets exist:
-
-```sh
-just fmt
-just lint
-just check
-just test
-```
+Note: if you want a smaller check during development, you can use `cargo check` to make sure compilation succeeds without the full build process.
 
 ## Websocket Contract Expectations (MVP)
 
@@ -132,4 +124,3 @@ rho tui --url ws://<machine-a-host>:8787/ws
 ```
 
 Verify streaming text, tool events, and final response.
-
