@@ -63,23 +63,23 @@ impl std::fmt::Display for ModelKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderRequest {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderRequest<'a> {
     pub model: ModelKind,
-    pub messages: Vec<Message>,
-    pub tools: Vec<ToolDefinition>,
+    pub messages: &'a [Message],
+    pub tools: &'a [ToolDefinition],
 }
 
-impl ProviderRequest {
-    pub fn new(model: ModelKind, messages: Vec<Message>) -> Self {
+impl<'a> ProviderRequest<'a> {
+    pub fn new(model: ModelKind, messages: &'a [Message]) -> Self {
         Self {
             model,
             messages,
-            tools: Vec::new(),
+            tools: &[],
         }
     }
 
-    pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
+    pub fn with_tools(mut self, tools: &'a [ToolDefinition]) -> Self {
         self.tools = tools;
         self
     }
@@ -118,21 +118,23 @@ pub(crate) struct RigChatRequest {
 }
 
 pub(crate) fn to_rig_chat_request(
-    request: ProviderRequest,
+    request: ProviderRequest<'_>,
 ) -> Result<RigChatRequest, ProviderError> {
     let mut system_sections = Vec::new();
     let mut chat_messages = Vec::new();
 
     for message in request.messages {
         match message.role {
-            MessageRole::System => system_sections.push(message.content),
-            MessageRole::User => {
-                chat_messages.push(RigMessage::from(RigUserContent::text(message.content)))
-            }
+            MessageRole::System => system_sections.push(message.content.clone()),
+            MessageRole::User => chat_messages.push(RigMessage::from(RigUserContent::text(
+                message.content.clone(),
+            ))),
             MessageRole::Assistant => {
-                chat_messages.push(to_rig_assistant_message(message.content));
+                chat_messages.push(to_rig_assistant_message(message.content.clone()));
             }
-            MessageRole::Tool => chat_messages.push(to_rig_tool_result_message(message.content)),
+            MessageRole::Tool => {
+                chat_messages.push(to_rig_tool_result_message(message.content.clone()))
+            }
         }
     }
 
@@ -155,11 +157,11 @@ pub(crate) fn to_rig_chat_request(
         preamble,
         tools: request
             .tools
-            .into_iter()
+            .iter()
             .map(|tool| RigToolDefinition {
-                name: tool.name,
-                description: tool.description,
-                parameters: tool.parameters,
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
             })
             .collect(),
     })
@@ -323,7 +325,7 @@ fn is_auth_status(status_code: u16) -> bool {
 pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
 
-    fn stream(&self, request: ProviderRequest) -> ProviderStream;
+    fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream;
 }
 
 #[cfg(test)]
@@ -339,26 +341,23 @@ mod tests {
 
     #[test]
     fn to_rig_chat_request_extracts_preamble_prompt_history_and_tools() {
-        let request = ProviderRequest::new(
-            ModelKind::Gpt52,
-            vec![
-                Message::new(MessageRole::System, "system-a"),
-                Message::new(MessageRole::System, "system-b"),
-                Message::new(MessageRole::User, "first"),
-                Message::new(MessageRole::Assistant, "second"),
-                Message::new(
-                    MessageRole::Tool,
-                    json!({
-                        "call_id": "call-1",
-                        "is_error": false,
-                        "output": "file-content",
-                    })
-                    .to_string(),
-                ),
-                Message::new(MessageRole::User, "final-prompt"),
-            ],
-        )
-        .with_tools(vec![ToolDefinition {
+        let messages = vec![
+            Message::new(MessageRole::System, "system-a"),
+            Message::new(MessageRole::System, "system-b"),
+            Message::new(MessageRole::User, "first"),
+            Message::new(MessageRole::Assistant, "second"),
+            Message::new(
+                MessageRole::Tool,
+                json!({
+                    "call_id": "call-1",
+                    "is_error": false,
+                    "output": "file-content",
+                })
+                .to_string(),
+            ),
+            Message::new(MessageRole::User, "final-prompt"),
+        ];
+        let tools = vec![ToolDefinition {
             name: "read".to_string(),
             description: "read file".to_string(),
             parameters: json!({
@@ -366,7 +365,8 @@ mod tests {
                 "properties": { "path": { "type": "string" } },
                 "required": ["path"],
             }),
-        }]);
+        }];
+        let request = ProviderRequest::new(ModelKind::Gpt52, &messages).with_tools(&tools);
 
         let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
 
@@ -388,10 +388,8 @@ mod tests {
 
     #[test]
     fn to_rig_chat_request_requires_a_non_system_prompt() {
-        let request = ProviderRequest::new(
-            ModelKind::Gpt52,
-            vec![Message::new(MessageRole::System, "only system")],
-        );
+        let messages = vec![Message::new(MessageRole::System, "only system")];
+        let request = ProviderRequest::new(ModelKind::Gpt52, &messages);
 
         let error = to_rig_chat_request(request).expect_err("conversion should fail");
         assert!(matches!(error, ProviderError::Transport(_)));
@@ -399,22 +397,20 @@ mod tests {
 
     #[test]
     fn to_rig_chat_request_preserves_tool_result_call_id() {
-        let request = ProviderRequest::new(
-            ModelKind::Gpt52,
-            vec![
-                Message::new(MessageRole::User, "first"),
-                Message::new(
-                    MessageRole::Tool,
-                    json!({
-                        "call_id": "call-123",
-                        "is_error": false,
-                        "output": "result",
-                    })
-                    .to_string(),
-                ),
-                Message::new(MessageRole::User, "next"),
-            ],
-        );
+        let messages = vec![
+            Message::new(MessageRole::User, "first"),
+            Message::new(
+                MessageRole::Tool,
+                json!({
+                    "call_id": "call-123",
+                    "is_error": false,
+                    "output": "result",
+                })
+                .to_string(),
+            ),
+            Message::new(MessageRole::User, "next"),
+        ];
+        let request = ProviderRequest::new(ModelKind::Gpt52, &messages);
 
         let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
         assert!(matches!(
@@ -431,34 +427,32 @@ mod tests {
 
     #[test]
     fn to_rig_chat_request_preserves_assistant_tool_calls() {
-        let request = ProviderRequest::new(
-            ModelKind::Gpt52,
-            vec![
-                Message::new(MessageRole::User, "first"),
-                Message::new(
-                    MessageRole::Assistant,
-                    encode_assistant_message_content(
-                        "",
-                        &[ToolCall {
-                            id: Some("toolu_123".to_string()),
-                            call_id: "toolu_123".to_string(),
-                            name: "read".to_string(),
-                            input: json!({ "path": "README.md" }),
-                        }],
-                    ),
+        let messages = vec![
+            Message::new(MessageRole::User, "first"),
+            Message::new(
+                MessageRole::Assistant,
+                encode_assistant_message_content(
+                    "",
+                    &[ToolCall {
+                        id: Some("toolu_123".to_string()),
+                        call_id: "toolu_123".to_string(),
+                        name: "read".to_string(),
+                        input: json!({ "path": "README.md" }),
+                    }],
                 ),
-                Message::new(
-                    MessageRole::Tool,
-                    json!({
-                        "call_id": "toolu_123",
-                        "is_error": false,
-                        "output": "ok",
-                    })
-                    .to_string(),
-                ),
-                Message::new(MessageRole::User, "next"),
-            ],
-        );
+            ),
+            Message::new(
+                MessageRole::Tool,
+                json!({
+                    "call_id": "toolu_123",
+                    "is_error": false,
+                    "output": "ok",
+                })
+                .to_string(),
+            ),
+            Message::new(MessageRole::User, "next"),
+        ];
+        let request = ProviderRequest::new(ModelKind::Gpt52, &messages);
 
         let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
         assert!(matches!(
@@ -477,34 +471,32 @@ mod tests {
 
     #[test]
     fn to_rig_chat_request_preserves_distinct_tool_call_id_and_call_id() {
-        let request = ProviderRequest::new(
-            ModelKind::Gpt52,
-            vec![
-                Message::new(MessageRole::User, "first"),
-                Message::new(
-                    MessageRole::Assistant,
-                    encode_assistant_message_content(
-                        "",
-                        &[ToolCall {
-                            id: Some("fc_123".to_string()),
-                            call_id: "call_123".to_string(),
-                            name: "read".to_string(),
-                            input: json!({ "path": "README.md" }),
-                        }],
-                    ),
+        let messages = vec![
+            Message::new(MessageRole::User, "first"),
+            Message::new(
+                MessageRole::Assistant,
+                encode_assistant_message_content(
+                    "",
+                    &[ToolCall {
+                        id: Some("fc_123".to_string()),
+                        call_id: "call_123".to_string(),
+                        name: "read".to_string(),
+                        input: json!({ "path": "README.md" }),
+                    }],
                 ),
-                Message::new(
-                    MessageRole::Tool,
-                    json!({
-                        "call_id": "call_123",
-                        "is_error": false,
-                        "output": "ok",
-                    })
-                    .to_string(),
-                ),
-                Message::new(MessageRole::User, "next"),
-            ],
-        );
+            ),
+            Message::new(
+                MessageRole::Tool,
+                json!({
+                    "call_id": "call_123",
+                    "is_error": false,
+                    "output": "ok",
+                })
+                .to_string(),
+            ),
+            Message::new(MessageRole::User, "next"),
+        ];
+        let request = ProviderRequest::new(ModelKind::Gpt52, &messages);
 
         let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
         assert!(matches!(

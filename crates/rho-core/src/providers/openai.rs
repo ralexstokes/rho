@@ -27,11 +27,12 @@ impl Provider for OpenAiProvider {
         ProviderKind::OpenAi
     }
 
-    fn stream(&self, request: ProviderRequest) -> ProviderStream {
+    fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
+        let rig_request = to_rig_chat_request(request);
         Box::pin(async_stream::try_stream! {
             let api_key = openai_api_key()?;
             let client = openai_client(api_key)?;
-            let rig_request = to_rig_chat_request(request)?;
+            let rig_request = rig_request?;
             let builder = client
                 .completion_model(rig_request.model.clone())
                 .completion_request(rig_request.prompt)

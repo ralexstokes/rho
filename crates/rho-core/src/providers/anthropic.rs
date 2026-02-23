@@ -29,11 +29,12 @@ impl Provider for AnthropicProvider {
         ProviderKind::Anthropic
     }
 
-    fn stream(&self, request: ProviderRequest) -> ProviderStream {
+    fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
+        let rig_request = to_rig_chat_request(request);
         Box::pin(async_stream::try_stream! {
             let api_key = anthropic_api_key()?;
             let client = anthropic_client(api_key)?;
-            let rig_request = to_rig_chat_request(request)?;
+            let rig_request = rig_request?;
 
             let model = client
                 .completion_model(rig_request.model.clone())

@@ -633,7 +633,7 @@ mod tests {
             ProviderKind::OpenAi
         }
 
-        fn stream(&self, _request: ProviderRequest) -> ProviderStream {
+        fn stream(&self, _request: ProviderRequest<'_>) -> ProviderStream {
             let events = self
                 .responses
                 .lock()
@@ -652,7 +652,7 @@ mod tests {
             ProviderKind::OpenAi
         }
 
-        fn stream(&self, _request: ProviderRequest) -> ProviderStream {
+        fn stream(&self, _request: ProviderRequest<'_>) -> ProviderStream {
             Box::pin(futures_util::stream::pending())
         }
     }

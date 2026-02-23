@@ -2,6 +2,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::LazyLock,
 };
 
 use futures_util::StreamExt;
@@ -111,14 +112,13 @@ impl AgentRuntime {
         let builtin_tools = builtin_tool_definitions();
 
         for iteration in 0..=self.max_tool_iterations {
-            let request = ProviderRequest::new(model, session.messages.clone())
-                .with_tools(builtin_tools.clone());
+            let request = ProviderRequest::new(model, session.messages()).with_tools(builtin_tools);
             let mut stream = provider.stream(request);
 
             let mut assistant_message = None;
             let mut assistant_delta_text = String::new();
             let mut assistant_tool_calls = Vec::new();
-            let mut tool_results = Vec::new();
+            let mut tool_messages = Vec::new();
 
             while let Some(next_event) = stream.next().await {
                 match next_event? {
@@ -134,13 +134,13 @@ impl AgentRuntime {
                             session_id: session_id.clone(),
                             call: call.clone(),
                         }));
-                        assistant_tool_calls.push(call.clone());
-
                         let result = execute_builtin_tool(&call);
-                        push_tool_result_event(emit_event, &session_id, result, &mut tool_results);
+                        assistant_tool_calls.push(call);
+
+                        push_tool_result_event(emit_event, &session_id, result, &mut tool_messages);
                     }
                     ProviderEvent::ToolResult { result } => {
-                        push_tool_result_event(emit_event, &session_id, result, &mut tool_results);
+                        push_tool_result_event(emit_event, &session_id, result, &mut tool_messages);
                     }
                     ProviderEvent::Message { message } => {
                         if message.role == MessageRole::Assistant {
@@ -151,19 +151,17 @@ impl AgentRuntime {
                 }
             }
 
-            let assistant_message = assistant_message.unwrap_or_else(|| {
-                Message::new(MessageRole::Assistant, assistant_delta_text.clone())
-            });
+            let assistant_message = assistant_message
+                .unwrap_or_else(|| Message::new(MessageRole::Assistant, assistant_delta_text));
             let assistant_message = Message::new(
                 MessageRole::Assistant,
                 encode_assistant_message_content(assistant_message.content, &assistant_tool_calls),
             );
 
-            if !assistant_message.content.is_empty() {
-                session.messages.push(assistant_message.clone());
-            }
-
-            if tool_results.is_empty() {
+            if tool_messages.is_empty() {
+                if !assistant_message.content.is_empty() {
+                    session.messages.push(assistant_message.clone());
+                }
                 emit_event(ServerEvent::Final(FinalMessage {
                     session_id: session_id.clone(),
                     message: assistant_message,
@@ -171,8 +169,12 @@ impl AgentRuntime {
                 return Ok(());
             }
 
-            for tool_result in tool_results {
-                session.messages.push(tool_result_to_message(&tool_result));
+            if !assistant_message.content.is_empty() {
+                session.messages.push(assistant_message);
+            }
+
+            for tool_message in tool_messages {
+                session.messages.push(tool_message);
             }
 
             if iteration == self.max_tool_iterations {
@@ -212,18 +214,18 @@ fn push_tool_result_event<F>(
     emit_event: &mut F,
     session_id: &str,
     result: ToolResult,
-    tool_results: &mut Vec<ToolResult>,
+    tool_messages: &mut Vec<Message>,
 ) where
     F: FnMut(ServerEvent),
 {
+    tool_messages.push(tool_result_to_message(&result));
     emit_event(ServerEvent::ToolCompleted(ToolCompleted {
         session_id: session_id.to_string(),
-        result: result.clone(),
+        result,
     }));
-    tool_results.push(result);
 }
 
-fn builtin_tool_definitions() -> Vec<ToolDefinition> {
+static BUILTIN_TOOL_DEFINITIONS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
     vec![
         ToolDefinition {
             name: "read".to_string(),
@@ -282,6 +284,10 @@ fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
     ]
+});
+
+fn builtin_tool_definitions() -> &'static [ToolDefinition] {
+    BUILTIN_TOOL_DEFINITIONS.as_slice()
 }
 
 fn execute_builtin_tool(call: &ToolCall) -> ToolResult {
@@ -458,7 +464,7 @@ mod tests {
     use rho_core::{
         message::decode_assistant_message_content,
         providers::{ModelKind, ProviderKind, ProviderRequest, ProviderStream},
-        tool::ToolCall,
+        tool::{ToolCall, ToolDefinition},
     };
     use serde_json::{Value, json};
 
@@ -691,10 +697,35 @@ mod tests {
         });
     }
 
+    #[test]
+    fn run_user_message_borrows_history_and_reuses_builtin_tools() {
+        futures::executor::block_on(async {
+            let runtime = AgentRuntime::new();
+            let mut session = runtime.start_session("session-5");
+            let provider = PointerRecordingProvider::new(vec![vec![Ok(ProviderEvent::Finished)]]);
+
+            runtime
+                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "hello")
+                .await
+                .expect("run should succeed");
+
+            let request_pointers = provider.request_pointers();
+            assert_eq!(request_pointers.len(), 1);
+            assert_eq!(
+                request_pointers[0].message_ptr,
+                session.messages().as_ptr() as usize
+            );
+            assert_eq!(
+                request_pointers[0].tool_ptr,
+                builtin_tool_definitions().as_ptr() as usize
+            );
+        });
+    }
+
     #[derive(Debug, Clone)]
     struct FakeProvider {
         responses: Arc<Mutex<FakeResponseQueue>>,
-        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
     }
 
     impl FakeProvider {
@@ -705,11 +736,26 @@ mod tests {
             }
         }
 
-        fn requests(&self) -> Vec<ProviderRequest> {
+        fn requests(&self) -> Vec<RecordedRequest> {
             self.requests
                 .lock()
                 .expect("requests mutex should be available")
                 .clone()
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordedRequest {
+        messages: Vec<Message>,
+        tools: Vec<ToolDefinition>,
+    }
+
+    impl RecordedRequest {
+        fn from_request(request: ProviderRequest<'_>) -> Self {
+            Self {
+                messages: request.messages.to_vec(),
+                tools: request.tools.to_vec(),
+            }
         }
     }
 
@@ -718,11 +764,64 @@ mod tests {
             ProviderKind::OpenAi
         }
 
-        fn stream(&self, request: ProviderRequest) -> ProviderStream {
+        fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
             self.requests
                 .lock()
                 .expect("requests mutex should be available")
-                .push(request);
+                .push(RecordedRequest::from_request(request));
+
+            let events = self
+                .responses
+                .lock()
+                .expect("responses mutex should be available")
+                .pop_front()
+                .unwrap_or_default();
+
+            Box::pin(futures_util::stream::iter(events))
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct RequestPointers {
+        message_ptr: usize,
+        tool_ptr: usize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct PointerRecordingProvider {
+        responses: Arc<Mutex<FakeResponseQueue>>,
+        request_pointers: Arc<Mutex<Vec<RequestPointers>>>,
+    }
+
+    impl PointerRecordingProvider {
+        fn new(responses: Vec<FakeResponse>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+                request_pointers: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn request_pointers(&self) -> Vec<RequestPointers> {
+            self.request_pointers
+                .lock()
+                .expect("request pointers mutex should be available")
+                .clone()
+        }
+    }
+
+    impl Provider for PointerRecordingProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAi
+        }
+
+        fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
+            self.request_pointers
+                .lock()
+                .expect("request pointers mutex should be available")
+                .push(RequestPointers {
+                    message_ptr: request.messages.as_ptr() as usize,
+                    tool_ptr: request.tools.as_ptr() as usize,
+                });
 
             let events = self
                 .responses
