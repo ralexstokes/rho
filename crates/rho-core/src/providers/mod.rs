@@ -13,11 +13,11 @@ use rig::{
     http_client::Error as RigHttpError,
     streaming::StreamedAssistantContent,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    message::{Message, MessageRole, decode_assistant_message_content},
+    message::{Message, MessageRole, decode_assistant_message_content_owned},
     stream::ProviderEvent,
     tool::{ToolCall, ToolDefinition},
 };
@@ -262,25 +262,28 @@ fn to_rig_tool_result_message(content: String) -> RigMessage {
             } else {
                 payload.call_id
             };
-            let output = serde_json::json!({
-                "is_error": payload.is_error,
-                "output": payload.output,
+            let output = serde_json::to_string(&ToolResultOutputPayload {
+                is_error: payload.is_error,
+                output: payload.output.as_str(),
             })
-            .to_string();
-            (call_id, output)
+            .unwrap_or(payload.output);
+            (call_id, OneOrMany::one(RigToolResultContent::text(output)))
         }
-        Err(_) => ("tool-result".to_string(), content),
+        Err(_) => (
+            "tool-result".to_string(),
+            RigToolResultContent::from_tool_output(content),
+        ),
     };
 
     RigMessage::from(RigUserContent::tool_result_with_call_id(
         call_id.clone(),
         call_id,
-        RigToolResultContent::from_tool_output(output),
+        output,
     ))
 }
 
 fn to_rig_assistant_message(content: String) -> RigMessage {
-    let parsed = decode_assistant_message_content(&content);
+    let parsed = decode_assistant_message_content_owned(content);
     if parsed.tool_calls.is_empty() {
         return RigMessage::from(RigAssistantContent::text(parsed.text));
     }
@@ -314,6 +317,12 @@ struct ToolMessagePayload {
     #[serde(default)]
     is_error: bool,
     output: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolResultOutputPayload<'a> {
+    is_error: bool,
+    output: &'a str,
 }
 
 fn is_auth_status(status_code: u16) -> bool {

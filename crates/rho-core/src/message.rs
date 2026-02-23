@@ -44,31 +44,55 @@ pub fn encode_assistant_message_content(
         return plain_text;
     }
 
-    let payload = AssistantToolCallsPayload {
-        kind: ASSISTANT_TOOL_CALLS_PAYLOAD_KIND.to_string(),
-        text: plain_text.clone(),
-        tool_calls: tool_calls
-            .iter()
-            .map(AssistantToolCallPayload::from)
-            .collect(),
+    let payload = AssistantToolCallsPayloadRef {
+        kind: ASSISTANT_TOOL_CALLS_PAYLOAD_KIND,
+        text: plain_text.as_str(),
+        tool_calls,
     };
 
     serde_json::to_string(&payload).unwrap_or(plain_text)
 }
 
 pub fn decode_assistant_message_content(content: &str) -> ParsedAssistantMessageContent {
+    parse_assistant_message_content(content).unwrap_or_else(|| ParsedAssistantMessageContent {
+        text: content.to_string(),
+        tool_calls: Vec::new(),
+    })
+}
+
+pub fn decode_assistant_message_content_owned(content: String) -> ParsedAssistantMessageContent {
+    parse_assistant_message_content(&content).unwrap_or(ParsedAssistantMessageContent {
+        text: content,
+        tool_calls: Vec::new(),
+    })
+}
+
+fn parse_assistant_message_content(content: &str) -> Option<ParsedAssistantMessageContent> {
+    if !might_be_assistant_tool_calls_payload(content) {
+        return None;
+    }
+
     match serde_json::from_str::<AssistantToolCallsPayload>(content) {
         Ok(payload) if payload.kind == ASSISTANT_TOOL_CALLS_PAYLOAD_KIND => {
-            ParsedAssistantMessageContent {
+            Some(ParsedAssistantMessageContent {
                 text: payload.text,
                 tool_calls: payload.tool_calls.into_iter().map(ToolCall::from).collect(),
-            }
+            })
         }
-        _ => ParsedAssistantMessageContent {
-            text: content.to_string(),
-            tool_calls: Vec::new(),
-        },
+        _ => None,
     }
+}
+
+fn might_be_assistant_tool_calls_payload(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with('{') && trimmed.contains(ASSISTANT_TOOL_CALLS_PAYLOAD_KIND)
+}
+
+#[derive(Debug, Serialize)]
+struct AssistantToolCallsPayloadRef<'a> {
+    kind: &'static str,
+    text: &'a str,
+    tool_calls: &'a [ToolCall],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,17 +112,6 @@ struct AssistantToolCallPayload {
     name: String,
     #[serde(default)]
     input: Value,
-}
-
-impl From<&ToolCall> for AssistantToolCallPayload {
-    fn from(call: &ToolCall) -> Self {
-        Self {
-            id: call.id.clone(),
-            call_id: call.call_id.clone(),
-            name: call.name.clone(),
-            input: call.input.clone(),
-        }
-    }
 }
 
 impl From<AssistantToolCallPayload> for ToolCall {
@@ -143,6 +156,17 @@ mod tests {
     fn assistant_message_content_leaves_plain_text_unchanged() {
         let parsed = decode_assistant_message_content("just text");
         assert_eq!(parsed.text, "just text");
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn assistant_message_content_owned_decode_reuses_plain_text_allocation() {
+        let content = String::from("just text");
+        let ptr = content.as_ptr();
+
+        let parsed = decode_assistant_message_content_owned(content);
+        assert_eq!(parsed.text, "just text");
+        assert_eq!(parsed.text.as_ptr(), ptr);
         assert!(parsed.tool_calls.is_empty());
     }
 
