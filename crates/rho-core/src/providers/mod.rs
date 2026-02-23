@@ -238,7 +238,8 @@ fn to_rig_tool_result_message(content: String) -> RigMessage {
         Err(_) => ("tool-result".to_string(), content),
     };
 
-    RigMessage::from(RigUserContent::tool_result(
+    RigMessage::from(RigUserContent::tool_result_with_call_id(
+        call_id.clone(),
         call_id,
         RigToolResultContent::from_tool_output(output),
     ))
@@ -328,5 +329,37 @@ mod tests {
 
         let error = to_rig_chat_request(request).expect_err("conversion should fail");
         assert!(matches!(error, ProviderError::Transport(_)));
+    }
+
+    #[test]
+    fn to_rig_chat_request_preserves_tool_result_call_id() {
+        let request = ProviderRequest::new(
+            "test-model",
+            vec![
+                Message::new(MessageRole::User, "first"),
+                Message::new(
+                    MessageRole::Tool,
+                    json!({
+                        "call_id": "call-123",
+                        "is_error": false,
+                        "output": "result",
+                    })
+                    .to_string(),
+                ),
+                Message::new(MessageRole::User, "next"),
+            ],
+        );
+
+        let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
+        assert!(matches!(
+            &rig_request.history[1],
+            RigMessage::User { content }
+                if matches!(
+                    content.first_ref(),
+                    RigUserContent::ToolResult(tool_result)
+                        if tool_result.id == "call-123"
+                            && tool_result.call_id.as_deref() == Some("call-123")
+                )
+        ));
     }
 }
