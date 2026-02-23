@@ -665,21 +665,19 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
                 continue;
             }
             let state = tool_states.get(call_id);
-            let spinner_tick = if state.is_some_and(|state| state.running) {
-                app.frame_tick
-            } else {
-                0
-            };
-            let spinner = loader_frame(spinner_tick);
             let tool_name = state
                 .map(|state| state.name.as_str())
                 .or(entry.tool_name.as_deref())
                 .unwrap_or("tool");
-            flow_lines.push(Line::from(vec![
-                Span::styled("tool> ", app.theme.tool_prefix),
-                Span::styled(format!("{spinner} "), app.theme.tool_prefix),
-                Span::styled(tool_name.to_string(), app.theme.body),
-            ]));
+            let mut spans = vec![Span::styled("tool> ", app.theme.tool_prefix)];
+            if state.is_some_and(|state| state.running) {
+                spans.push(Span::styled(
+                    format!("{} ", loader_frame(app.frame_tick)),
+                    app.theme.tool_prefix,
+                ));
+            }
+            spans.push(Span::styled(tool_name.to_string(), app.theme.body));
+            flow_lines.push(Line::from(spans));
             continue;
         }
 
