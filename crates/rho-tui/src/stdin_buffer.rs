@@ -31,7 +31,9 @@ impl StdinBuffer {
                     self.paste_buffer.push_str(&self.input_buffer[..end_index]);
                     self.input_buffer
                         .replace_range(..end_index + BRACKETED_PASTE_END.len(), "");
-                    output.push(StdinBufferChunk::Paste(std::mem::take(&mut self.paste_buffer)));
+                    output.push(StdinBufferChunk::Paste(std::mem::take(
+                        &mut self.paste_buffer,
+                    )));
                     self.paste_mode = false;
                     continue;
                 }
@@ -43,7 +45,9 @@ impl StdinBuffer {
 
             let Some(start_index) = self.input_buffer.find(BRACKETED_PASTE_START) else {
                 if !self.input_buffer.is_empty() {
-                    output.push(StdinBufferChunk::Data(std::mem::take(&mut self.input_buffer)));
+                    output.push(StdinBufferChunk::Data(std::mem::take(
+                        &mut self.input_buffer,
+                    )));
                 }
                 break;
             };

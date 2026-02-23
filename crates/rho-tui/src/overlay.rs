@@ -29,7 +29,9 @@ impl SizeValue {
     fn resolve(self, total: u16) -> u16 {
         match self {
             SizeValue::Absolute(value) => value,
-            SizeValue::Percent(percent) => total.saturating_mul(percent.min(100)).saturating_div(100),
+            SizeValue::Percent(percent) => {
+                total.saturating_mul(percent.min(100)).saturating_div(100)
+            }
         }
     }
 }
@@ -168,10 +170,10 @@ impl OverlayStack {
         if entry.hidden {
             return false;
         }
-        if let Some(min_width) = entry.options.min_terminal_width {
-            if terminal_width < min_width {
-                return false;
-            }
+        if let Some(min_width) = entry.options.min_terminal_width
+            && terminal_width < min_width
+        {
+            return false;
         }
         true
     }
@@ -201,7 +203,10 @@ fn resolve_overlay_rect(area: Rect, lines: &[Line<'_>], options: &OverlayOptions
     width = width.min(available_width).max(1);
 
     let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let mut height = content_height.saturating_add(2).min(available_height).max(1);
+    let mut height = content_height
+        .saturating_add(2)
+        .min(available_height)
+        .max(1);
     if let Some(max_height) = options.max_height {
         height = height.min(max_height.resolve(available_height)).max(1);
     }
@@ -223,7 +228,9 @@ fn resolve_overlay_rect(area: Rect, lines: &[Line<'_>], options: &OverlayOptions
             SizeValue::Absolute(v) => v,
             SizeValue::Percent(percent) => {
                 let max_left = available_width.saturating_sub(width);
-                max_left.saturating_mul(percent.min(100)).saturating_div(100)
+                max_left
+                    .saturating_mul(percent.min(100))
+                    .saturating_div(100)
             }
         }
     } else {

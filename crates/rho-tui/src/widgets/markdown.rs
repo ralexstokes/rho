@@ -16,10 +16,7 @@ pub fn render_markdown(markdown: &str, width: u16, theme: &UiTheme) -> Vec<Line<
         let line = raw_line.trim_end_matches('\r');
         if line.starts_with("```") {
             in_code_block = !in_code_block;
-            lines.push(Line::from(vec![Span::styled(
-                line.to_string(),
-                theme.code,
-            )]));
+            lines.push(Line::from(vec![Span::styled(line.to_string(), theme.code)]));
             continue;
         }
 

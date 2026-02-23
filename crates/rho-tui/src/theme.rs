@@ -35,9 +35,7 @@ impl Default for UiTheme {
             system_prefix: Style::default()
                 .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
-            error_prefix: Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            error_prefix: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             heading: Style::default()
                 .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD),

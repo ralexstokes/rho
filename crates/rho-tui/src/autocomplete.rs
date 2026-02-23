@@ -25,7 +25,12 @@ pub struct Suggestions {
 }
 
 pub trait AutocompleteProvider {
-    fn suggestions(&self, lines: &[String], cursor_line: usize, cursor_col: usize) -> Option<Suggestions>;
+    fn suggestions(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+    ) -> Option<Suggestions>;
     fn force_file_suggestions(
         &self,
         lines: &[String],
@@ -94,9 +99,11 @@ impl CombinedAutocompleteProvider {
         let mut ranked: Vec<(i32, &SlashCommand)> = self
             .commands
             .iter()
-            .filter_map(|command| fuzzy_score(query, command.name.as_str()).map(|score| (score, command)))
+            .filter_map(|command| {
+                fuzzy_score(query, command.name.as_str()).map(|score| (score, command))
+            })
             .collect();
-        ranked.sort_by(|a, b| b.0.cmp(&a.0));
+        ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
         if ranked.is_empty() {
             return None;
@@ -178,11 +185,13 @@ impl CombinedAutocompleteProvider {
             return None;
         }
 
-        items.sort_by(|a, b| match (a.value.ends_with('/'), b.value.ends_with('/')) {
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            _ => a.label.cmp(&b.label),
-        });
+        items.sort_by(
+            |a, b| match (a.value.ends_with('/'), b.value.ends_with('/')) {
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                _ => a.label.cmp(&b.label),
+            },
+        );
 
         Some(Suggestions {
             items,
@@ -192,7 +201,12 @@ impl CombinedAutocompleteProvider {
 }
 
 impl AutocompleteProvider for CombinedAutocompleteProvider {
-    fn suggestions(&self, lines: &[String], cursor_line: usize, cursor_col: usize) -> Option<Suggestions> {
+    fn suggestions(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+    ) -> Option<Suggestions> {
         let before_cursor = Self::cursor_prefix(lines, cursor_line, cursor_col)?;
         if let Some(commands) = self.slash_command_suggestions(before_cursor.as_str()) {
             return Some(commands);
@@ -249,10 +263,10 @@ fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
         }
         if ch == query_chars[query_index] {
             score += 10;
-            if let Some(last) = last_match {
-                if index == last + 1 {
-                    score += 5;
-                }
+            if let Some(last) = last_match
+                && index == last + 1
+            {
+                score += 5;
             }
             if index == 0 {
                 score += 4;

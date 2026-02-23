@@ -18,7 +18,6 @@ impl Key {
     pub fn ctrl(ch: char) -> String {
         format!("ctrl+{}", ch.to_ascii_lowercase())
     }
-
 }
 
 pub fn is_key_release(event: &KeyEvent) -> bool {

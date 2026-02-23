@@ -27,7 +27,9 @@ pub fn detect_capabilities() -> TerminalCapabilities {
     let term_program = std::env::var("TERM_PROGRAM")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+    let term = std::env::var("TERM")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let color_term = std::env::var("COLORTERM")
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -39,7 +41,10 @@ pub fn detect_capabilities() -> TerminalCapabilities {
             hyperlinks: true,
         };
     }
-    if term_program == "ghostty" || term_program == "wezterm" || std::env::var("WEZTERM_PANE").is_ok() {
+    if term_program == "ghostty"
+        || term_program == "wezterm"
+        || std::env::var("WEZTERM_PANE").is_ok()
+    {
         return TerminalCapabilities {
             images: Some(ImageProtocol::Kitty),
             true_color: true,
@@ -65,7 +70,11 @@ pub fn capabilities() -> TerminalCapabilities {
     *CAPABILITIES_CACHE.get_or_init(detect_capabilities)
 }
 
-pub fn image_fallback(mime_type: &str, dimensions: Option<ImageDimensions>, filename: Option<&str>) -> String {
+pub fn image_fallback(
+    mime_type: &str,
+    dimensions: Option<ImageDimensions>,
+    filename: Option<&str>,
+) -> String {
     let mut parts = Vec::new();
     if let Some(filename) = filename {
         parts.push(filename.to_string());
@@ -110,7 +119,9 @@ pub fn get_image_dimensions(base64_data: &str, mime_type: &str) -> Option<ImageD
 }
 
 pub fn get_png_dimensions(base64_data: &str) -> Option<ImageDimensions> {
-    let bytes = base64::engine::general_purpose::STANDARD.decode(base64_data).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_data)
+        .ok()?;
     if bytes.len() < 24 {
         return None;
     }
@@ -124,7 +135,9 @@ pub fn get_png_dimensions(base64_data: &str) -> Option<ImageDimensions> {
 }
 
 pub fn get_gif_dimensions(base64_data: &str) -> Option<ImageDimensions> {
-    let bytes = base64::engine::general_purpose::STANDARD.decode(base64_data).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_data)
+        .ok()?;
     if bytes.len() < 10 {
         return None;
     }
@@ -143,7 +156,7 @@ fn calculate_rows(dimensions: ImageDimensions, columns: u16) -> u16 {
         return 1;
     }
     let scaled_height = dimensions.height_px.saturating_mul(target_width_px) / dimensions.width_px;
-    ((scaled_height + 17) / 18).max(1) as u16
+    scaled_height.div_ceil(18).max(1) as u16
 }
 
 fn encode_kitty(base64_data: &str, columns: u16, rows: u16) -> String {

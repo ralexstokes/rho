@@ -115,13 +115,11 @@ impl SettingsList {
                 Span::styled(item.current_value.clone(), value_style),
             ]));
 
-            if selected {
-                if let Some(description) = &item.description {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("   {description}"),
-                        Style::default().fg(Color::DarkGray),
-                    )]));
-                }
+            if selected && let Some(description) = &item.description {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("   {description}"),
+                    Style::default().fg(Color::DarkGray),
+                )]));
             }
         }
 

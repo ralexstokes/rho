@@ -395,10 +395,10 @@ impl EditorState {
         if self.history_index.is_none() {
             self.history_snapshot = self.text();
             self.history_index = Some(0);
-        } else if let Some(index) = self.history_index {
-            if index + 1 < self.history.len() {
-                self.history_index = Some(index + 1);
-            }
+        } else if let Some(index) = self.history_index
+            && index + 1 < self.history.len()
+        {
+            self.history_index = Some(index + 1);
         }
 
         if let Some(index) = self.history_index {
@@ -480,7 +480,10 @@ impl EditorState {
 
             if line_index == self.cursor_line && line_len > width {
                 let max_start = line_len.saturating_sub(width);
-                start_col = self.cursor_col.saturating_sub(width.saturating_sub(1)).min(max_start);
+                start_col = self
+                    .cursor_col
+                    .saturating_sub(width.saturating_sub(1))
+                    .min(max_start);
             }
 
             let visible: String = line.chars().skip(start_col).take(width).collect();
@@ -488,7 +491,10 @@ impl EditorState {
 
             if line_index == self.cursor_line {
                 cursor_row = line_index - top;
-                cursor_col = self.cursor_col.saturating_sub(start_col).min(width.saturating_sub(1));
+                cursor_col = self
+                    .cursor_col
+                    .saturating_sub(start_col)
+                    .min(width.saturating_sub(1));
             }
         }
 
@@ -526,11 +532,11 @@ impl EditorState {
             cursor_col: self.cursor_col,
         };
 
-        if self
-            .undo_stack
-            .last()
-            .is_some_and(|last| last.lines == snapshot.lines && last.cursor_line == snapshot.cursor_line && last.cursor_col == snapshot.cursor_col)
-        {
+        if self.undo_stack.last().is_some_and(|last| {
+            last.lines == snapshot.lines
+                && last.cursor_line == snapshot.cursor_line
+                && last.cursor_col == snapshot.cursor_col
+        }) {
             return;
         }
         self.undo_stack.push(snapshot);
@@ -544,7 +550,8 @@ impl EditorState {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         for ch in normalized.chars() {
             if ch == '\n' {
-                let split_at = char_to_byte_index(self.lines[self.cursor_line].as_str(), self.cursor_col);
+                let split_at =
+                    char_to_byte_index(self.lines[self.cursor_line].as_str(), self.cursor_col);
                 let tail = self.lines[self.cursor_line].split_off(split_at);
                 self.lines.insert(self.cursor_line + 1, tail);
                 self.cursor_line += 1;
@@ -644,7 +651,10 @@ mod tests {
     #[test]
     fn large_paste_is_markerized_and_expanded_on_submit() {
         let mut editor = EditorState::new();
-        let paste = (0..12).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");
+        let paste = (0..12)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         editor.handle_paste(paste.clone());
 
         let raw = editor.text();

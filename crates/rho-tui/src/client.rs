@@ -1,6 +1,4 @@
-use std::{
-    time::Duration,
-};
+use std::time::Duration;
 
 use crate::{
     autocomplete::{AutocompleteItem, AutocompleteProvider, CombinedAutocompleteProvider},
@@ -25,7 +23,8 @@ use ratatui::{
 use rho_core::{
     Message, MessageRole,
     protocol::{
-        ClientEnvelope, ClientEvent, ErrorEvent, ServerEnvelope, ServerEvent, StartSession, UserMessage,
+        ClientEnvelope, ClientEvent, ErrorEvent, ServerEnvelope, ServerEvent, StartSession,
+        UserMessage,
     },
 };
 use thiserror::Error;
@@ -77,10 +76,7 @@ impl TuiClient {
 
         while !app.should_quit {
             render_state.prepare_draw(&mut terminal, app.estimated_rendered_lines())?;
-            if let Err(err) = terminal
-                .terminal_mut()
-                .draw(|frame| draw_ui(frame, &app))
-            {
+            if let Err(err) = terminal.terminal_mut().draw(|frame| draw_ui(frame, &app)) {
                 let _ = render_state.finish_draw(&mut terminal);
                 return Err(TuiClientError::Io(err));
             }
@@ -142,7 +138,8 @@ type WsWriter = futures_util::stream::SplitSink<
     WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     WsMessage,
 >;
-type WsReader = futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>;
+type WsReader =
+    futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>;
 
 #[derive(Debug)]
 enum NetworkEvent {
@@ -208,7 +205,10 @@ impl RenderState {
         estimated_lines: usize,
     ) -> Result<(), TuiClientError> {
         let width = terminal.width().map_err(TuiClientError::Io)?;
-        if self.previous_width.is_some_and(|previous| previous != width) {
+        if self
+            .previous_width
+            .is_some_and(|previous| previous != width)
+        {
             terminal.clear().map_err(TuiClientError::Io)?;
             self.max_rendered_lines = 0;
         }
@@ -231,7 +231,9 @@ impl RenderState {
 
     fn finish_draw(&self, terminal: &mut ProcessTerminal) -> Result<(), TuiClientError> {
         if self.sync_output {
-            terminal.end_synchronized_output().map_err(TuiClientError::Io)?;
+            terminal
+                .end_synchronized_output()
+                .map_err(TuiClientError::Io)?;
         }
         Ok(())
     }
@@ -280,11 +282,11 @@ impl AppState {
     }
 
     fn append_assistant_delta(&mut self, delta: &str) {
-        if let Some(index) = self.active_assistant_line {
-            if let Some(line) = self.log_lines.get_mut(index) {
-                line.text.push_str(delta);
-                return;
-            }
+        if let Some(index) = self.active_assistant_line
+            && let Some(line) = self.log_lines.get_mut(index)
+        {
+            line.text.push_str(delta);
+            return;
         }
 
         self.log_lines.push(LogLine {
@@ -312,7 +314,9 @@ impl AppState {
         match event {
             NetworkEvent::Server(server_event) => match server_event {
                 ServerEvent::SessionAck(_) => {}
-                ServerEvent::AssistantDelta(delta) => self.append_assistant_delta(delta.delta.as_str()),
+                ServerEvent::AssistantDelta(delta) => {
+                    self.append_assistant_delta(delta.delta.as_str())
+                }
                 ServerEvent::ToolStarted(tool_started) => {
                     self.push_line(LogKind::Tool, format_tool_started(&tool_started.call));
                 }
@@ -445,11 +449,11 @@ impl AppState {
             ..OverlayOptions::default()
         };
 
-        if let Some(id) = self.autocomplete_overlay_id {
-            if self.overlays.update(id, lines.clone()) {
-                let _ = self.overlays.set_hidden(id, false);
-                return;
-            }
+        if let Some(id) = self.autocomplete_overlay_id
+            && self.overlays.update(id, lines.clone())
+        {
+            let _ = self.overlays.set_hidden(id, false);
+            return;
         }
 
         let id = self.overlays.show(lines, options);
@@ -461,7 +465,6 @@ impl AppState {
         let editor = self.editor.lines().len().max(1);
         history + editor + 4
     }
-
 }
 
 async fn run_writer(
@@ -481,7 +484,10 @@ async fn run_reader(
     loop {
         match recv_server_envelope(&mut reader).await {
             Ok(envelope) => {
-                if inbound_tx.send(NetworkEvent::Server(envelope.event)).is_err() {
+                if inbound_tx
+                    .send(NetworkEvent::Server(envelope.event))
+                    .is_err()
+                {
                     return Ok(());
                 }
             }
@@ -657,7 +663,11 @@ fn handle_key_event(
             }
         }
         KeyCode::Enter => {
-            if app.has_autocomplete() && !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+            if app.has_autocomplete()
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+            {
                 app.apply_autocomplete_selection();
             } else if key
                 .modifiers
@@ -703,39 +713,27 @@ fn handle_key_event(
         }
         KeyCode::Home => app.editor.move_home(),
         KeyCode::End => app.editor.move_end(),
-        KeyCode::Char(ch)
-            if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'w' =>
-        {
+        KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'w' => {
             app.editor.delete_word_backward();
             edited = true;
         }
-        KeyCode::Char(ch)
-            if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'u' =>
-        {
+        KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'u' => {
             app.editor.delete_to_line_start();
             edited = true;
         }
-        KeyCode::Char(ch)
-            if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'k' =>
-        {
+        KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'k' => {
             app.editor.delete_to_line_end();
             edited = true;
         }
-        KeyCode::Char(ch)
-            if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'y' =>
-        {
+        KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'y' => {
             app.editor.yank();
             edited = true;
         }
-        KeyCode::Char(ch)
-            if key.modifiers.contains(KeyModifiers::ALT) && ch == 'y' =>
-        {
+        KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::ALT) && ch == 'y' => {
             app.editor.yank_pop();
             edited = true;
         }
-        KeyCode::Char(ch)
-            if key.modifiers.contains(KeyModifiers::CONTROL) && ch == '-' =>
-        {
+        KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::CONTROL) && ch == '-' => {
             app.editor.undo();
             edited = true;
         }
@@ -802,8 +800,12 @@ fn submit_input(
     Ok(())
 }
 
-async fn send_client_event(writer: &mut WsWriter, event: ClientEvent) -> Result<(), TuiClientError> {
-    let text = serde_json::to_string(&ClientEnvelope::new(event)).map_err(TuiClientError::Protocol)?;
+async fn send_client_event(
+    writer: &mut WsWriter,
+    event: ClientEvent,
+) -> Result<(), TuiClientError> {
+    let text =
+        serde_json::to_string(&ClientEnvelope::new(event)).map_err(TuiClientError::Protocol)?;
     writer
         .send(WsMessage::Text(text.into()))
         .await
@@ -843,7 +845,10 @@ async fn recv_server_envelope(reader: &mut WsReader) -> Result<ServerEnvelope, T
             WsMessage::Text(text) => {
                 return serde_json::from_str(text.as_str()).map_err(TuiClientError::Protocol);
             }
-            WsMessage::Binary(_) | WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => {}
+            WsMessage::Binary(_)
+            | WsMessage::Ping(_)
+            | WsMessage::Pong(_)
+            | WsMessage::Frame(_) => {}
             WsMessage::Close(_) => return Err(TuiClientError::Closed),
         }
     }
@@ -924,5 +929,4 @@ mod tests {
             "session_id=session-z code=runtime_error message=boom"
         );
     }
-
 }

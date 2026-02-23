@@ -50,10 +50,10 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
         while remaining.chars().count() > width {
             let mut split_at = width;
             let candidate: String = remaining.chars().take(width).collect();
-            if let Some(space_idx) = candidate.rfind(char::is_whitespace) {
-                if space_idx > 0 {
-                    split_at = candidate[..space_idx].chars().count();
-                }
+            if let Some(space_idx) = candidate.rfind(char::is_whitespace)
+                && space_idx > 0
+            {
+                split_at = candidate[..space_idx].chars().count();
             }
 
             let chunk: String = remaining.chars().take(split_at).collect();

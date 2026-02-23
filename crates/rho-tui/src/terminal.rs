@@ -51,7 +51,6 @@ impl ProcessTerminal {
         self.terminal.backend_mut().write_all(b"\x1b[?2026l")?;
         self.terminal.backend_mut().flush()
     }
-
 }
 
 impl Drop for ProcessTerminal {
