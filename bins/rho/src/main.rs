@@ -2,14 +2,17 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rho_agent::{AgentRuntime, AgentServer, AgentServerError, build_provider};
-use rho_core::{protocol::PROTOCOL_VERSION, providers::ProviderKind};
+use rho_core::{
+    protocol::PROTOCOL_VERSION,
+    providers::{ModelKind, ProviderKind},
+};
 use rho_tui::TuiClient;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_BIND: &str = "127.0.0.1:0";
-const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+const DEFAULT_MODEL: ModelArg = ModelArg::ClaudeSonnet46;
 const DEFAULT_PROVIDER: ProviderArg = ProviderArg::Anthropic;
 
 #[derive(Debug, Parser)]
@@ -27,8 +30,8 @@ struct ServeArgs {
     bind: String,
     #[arg(long, value_enum, default_value_t = DEFAULT_PROVIDER)]
     provider: ProviderArg,
-    #[arg(long, default_value = DEFAULT_MODEL)]
-    model: String,
+    #[arg(long, value_enum, default_value_t = DEFAULT_MODEL)]
+    model: ModelArg,
 }
 
 #[derive(Debug, Subcommand)]
@@ -46,11 +49,28 @@ enum ProviderArg {
     Anthropic,
 }
 
-impl ProviderArg {
-    fn to_provider_kind(self) -> ProviderKind {
-        match self {
+impl From<ProviderArg> for ProviderKind {
+    fn from(value: ProviderArg) -> Self {
+        match value {
             ProviderArg::Openai => ProviderKind::OpenAi,
             ProviderArg::Anthropic => ProviderKind::Anthropic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ModelArg {
+    #[value(name = "gpt-5.2-2025-12-11")]
+    Gpt52,
+    #[value(name = "claude-sonnet-4-6")]
+    ClaudeSonnet46,
+}
+
+impl From<ModelArg> for ModelKind {
+    fn from(value: ModelArg) -> Self {
+        match value {
+            ModelArg::Gpt52 => ModelKind::Gpt52,
+            ModelArg::ClaudeSonnet46 => ModelKind::ClaudeSonnet46,
         }
     }
 }
@@ -80,12 +100,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn build_server(
     provider: ProviderArg,
-    model: String,
+    model: ModelArg,
 ) -> Result<(ProviderKind, AgentServer), AgentServerError> {
     let runtime = AgentRuntime::new();
-    let provider_kind = provider.to_provider_kind();
+    let provider_kind: ProviderKind = provider.into();
+    let model_kind: ModelKind = model.into();
+    if model_kind.provider_kind() != provider_kind {
+        return Err(AgentServerError::UnsupportedModelForProvider {
+            provider: provider_kind,
+            model: model_kind,
+        });
+    }
     let provider_impl = build_provider(provider_kind)?;
-    let server = AgentServer::new(runtime, provider_impl, model);
+    let server = AgentServer::new(runtime, provider_impl, model_kind);
     Ok((provider_kind, server))
 }
 
@@ -185,7 +212,7 @@ mod tests {
             "--provider",
             "openai",
             "--model",
-            "gpt-4o-mini",
+            "gpt-5.2-2025-12-11",
         ]);
 
         let Some(Command::Serve(serve)) = cli.command else {
@@ -193,7 +220,22 @@ mod tests {
         };
         assert_eq!(serve.bind, "0.0.0.0:8787");
         assert_eq!(serve.provider, ProviderArg::Openai);
-        assert_eq!(serve.model, "gpt-4o-mini");
+        assert_eq!(serve.model, ModelArg::Gpt52);
+    }
+
+    #[test]
+    fn build_server_rejects_provider_model_mismatch() {
+        let error = match build_server(ProviderArg::Openai, ModelArg::ClaudeSonnet46) {
+            Ok(_) => panic!("mismatched provider/model should fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            AgentServerError::UnsupportedModelForProvider {
+                provider: ProviderKind::OpenAi,
+                model: ModelKind::ClaudeSonnet46,
+            }
+        ));
     }
 
     #[test]
