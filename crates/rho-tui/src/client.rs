@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use crate::{
     autocomplete::{AutocompleteItem, AutocompleteProvider, CombinedAutocompleteProvider},
@@ -167,6 +167,8 @@ enum LogKind {
 struct LogLine {
     kind: LogKind,
     text: String,
+    tool_name: Option<String>,
+    tool_running: bool,
 }
 
 #[derive(Debug)]
@@ -182,6 +184,8 @@ struct AppState {
     autocomplete_prefix: String,
     overlays: OverlayStack,
     autocomplete_overlay_id: Option<u64>,
+    tool_call_names: HashMap<String, String>,
+    collapse_tool_calls: bool,
     transcript_scroll_up: usize,
     transcript_viewport_height: usize,
     frame_tick: u64,
@@ -262,6 +266,8 @@ impl AppState {
             autocomplete_prefix: String::new(),
             overlays: OverlayStack::new(),
             autocomplete_overlay_id: None,
+            tool_call_names: HashMap::new(),
+            collapse_tool_calls: false,
             transcript_scroll_up: 0,
             transcript_viewport_height: 0,
             frame_tick: 0,
@@ -272,7 +278,21 @@ impl AppState {
     }
 
     fn push_line(&mut self, kind: LogKind, text: String) {
-        self.log_lines.push(LogLine { kind, text });
+        self.log_lines.push(LogLine {
+            kind,
+            text,
+            tool_name: None,
+            tool_running: false,
+        });
+    }
+
+    fn push_tool_line(&mut self, text: String, tool_name: String, tool_running: bool) {
+        self.log_lines.push(LogLine {
+            kind: LogKind::Tool,
+            text,
+            tool_name: Some(tool_name),
+            tool_running,
+        });
     }
 
     fn push_system(&mut self, text: String) {
@@ -301,6 +321,8 @@ impl AppState {
         self.log_lines.push(LogLine {
             kind: LogKind::Assistant,
             text: delta.to_string(),
+            tool_name: None,
+            tool_running: false,
         });
         self.active_assistant_line = self.log_lines.len().checked_sub(1);
     }
@@ -314,6 +336,8 @@ impl AppState {
             self.log_lines.push(LogLine {
                 kind: LogKind::Assistant,
                 text: message,
+                tool_name: None,
+                tool_running: false,
             });
         }
         self.active_assistant_line = None;
@@ -327,10 +351,18 @@ impl AppState {
                     self.append_assistant_delta(delta.delta.as_str())
                 }
                 ServerEvent::ToolStarted(tool_started) => {
-                    self.push_line(LogKind::Tool, format_tool_started(&tool_started.call));
+                    let call = tool_started.call;
+                    self.tool_call_names
+                        .insert(call.call_id.clone(), call.name.clone());
+                    self.push_tool_line(format_tool_started(&call), call.name, true);
                 }
                 ServerEvent::ToolCompleted(tool_completed) => {
-                    self.push_line(LogKind::Tool, format_tool_completed(&tool_completed.result));
+                    let result = tool_completed.result;
+                    let tool_name = self
+                        .tool_call_names
+                        .remove(result.call_id.as_str())
+                        .unwrap_or_else(|| "tool".to_string());
+                    self.push_tool_line(format_tool_completed(&result), tool_name, false);
                 }
                 ServerEvent::Final(final_message) => {
                     self.finalize_assistant(final_message.message.content);
@@ -563,6 +595,22 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
     let mut flow_lines = Vec::new();
 
     for entry in &app.log_lines {
+        if app.collapse_tool_calls && matches!(entry.kind, LogKind::Tool) {
+            let spinner_tick = if entry.tool_running {
+                app.frame_tick
+            } else {
+                0
+            };
+            let spinner = loader_frame(spinner_tick);
+            let tool_name = entry.tool_name.as_deref().unwrap_or("tool");
+            flow_lines.push(Line::from(vec![
+                Span::styled("tool> ", app.theme.tool_prefix),
+                Span::styled(format!("{spinner} "), app.theme.tool_prefix),
+                Span::styled(tool_name.to_string(), app.theme.body),
+            ]));
+            continue;
+        }
+
         let (prefix, prefix_style, markdown_mode) = match entry.kind {
             LogKind::User => ("you> ", app.theme.user_prefix, true),
             LogKind::Assistant => ("assistant> ", app.theme.assistant_prefix, true),
@@ -651,9 +699,14 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
     } else {
         format!("scroll+{}", app.transcript_scroll_up)
     };
+    let tool_state = if app.collapse_tool_calls {
+        "tools=collapsed"
+    } else {
+        "tools=expanded"
+    };
     let footer_text = format!(
-        "url={} session_id={}  enter=send  shift+enter=newline  tab=complete  up/down=scroll  ctrl+p/n=history  ctrl+b/f/a/e=move  {}  esc=quit",
-        app.url, app.session_id, scroll_state
+        "url={} session_id={}  enter=send  shift+enter=newline  tab=complete  up/down=scroll  ctrl+p/n=history  ctrl+b/f/a/e=move  ctrl+t=tools  {}  {}  esc=quit",
+        app.url, app.session_id, tool_state, scroll_state
     );
     let status = Paragraph::new(truncate_to_width(
         footer_text.as_str(),
@@ -727,6 +780,10 @@ fn handle_key_event(
 
     if matches_key(&key, Key::ctrl('c').as_str()) {
         app.should_quit = true;
+        return Ok(());
+    }
+    if matches_key(&key, Key::ctrl('t').as_str()) {
+        app.collapse_tool_calls = !app.collapse_tool_calls;
         return Ok(());
     }
 
@@ -924,6 +981,7 @@ fn submit_input(
 
     if trimmed == "/clear" {
         app.log_lines.clear();
+        app.tool_call_names.clear();
         app.active_assistant_line = None;
         app.push_system("cleared transcript".to_string());
         return Ok(());
