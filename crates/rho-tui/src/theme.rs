@@ -3,7 +3,6 @@ use ratatui::style::{Color, Modifier, Style};
 #[derive(Debug, Clone)]
 pub struct UiTheme {
     pub history_border: Style,
-    pub input_border: Style,
     pub user_prefix: Style,
     pub assistant_prefix: Style,
     pub tool_prefix: Style,
@@ -22,7 +21,6 @@ impl Default for UiTheme {
     fn default() -> Self {
         Self {
             history_border: Style::default().fg(Color::Blue),
-            input_border: Style::default().fg(Color::Magenta),
             user_prefix: Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

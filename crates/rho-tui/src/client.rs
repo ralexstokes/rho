@@ -12,7 +12,9 @@ use crate::{
         TextBlock, loader_frame, render_markdown, section_block, spacer_lines, truncate_to_width,
     },
 };
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use futures_util::{SinkExt, StreamExt};
 use ratatui::{
     Frame,
@@ -76,7 +78,10 @@ impl TuiClient {
 
         while !app.should_quit {
             render_state.prepare_draw(&mut terminal, app.estimated_rendered_lines())?;
-            if let Err(err) = terminal.terminal_mut().draw(|frame| draw_ui(frame, &app)) {
+            if let Err(err) = terminal
+                .terminal_mut()
+                .draw(|frame| draw_ui(frame, &mut app))
+            {
                 let _ = render_state.finish_draw(&mut terminal);
                 return Err(TuiClientError::Io(err));
             }
@@ -177,6 +182,8 @@ struct AppState {
     autocomplete_prefix: String,
     overlays: OverlayStack,
     autocomplete_overlay_id: Option<u64>,
+    transcript_scroll_up: usize,
+    transcript_viewport_height: usize,
     frame_tick: u64,
     should_quit: bool,
 }
@@ -255,6 +262,8 @@ impl AppState {
             autocomplete_prefix: String::new(),
             overlays: OverlayStack::new(),
             autocomplete_overlay_id: None,
+            transcript_scroll_up: 0,
+            transcript_viewport_height: 0,
             frame_tick: 0,
             should_quit: false,
         };
@@ -460,10 +469,32 @@ impl AppState {
         self.autocomplete_overlay_id = Some(id);
     }
 
+    fn scroll_to_bottom(&mut self) {
+        self.transcript_scroll_up = 0;
+    }
+
+    fn scroll_up_lines(&mut self, lines: usize) {
+        if lines == 0 {
+            return;
+        }
+        self.transcript_scroll_up = self.transcript_scroll_up.saturating_add(lines);
+    }
+
+    fn scroll_down_lines(&mut self, lines: usize) {
+        if lines == 0 {
+            return;
+        }
+        self.transcript_scroll_up = self.transcript_scroll_up.saturating_sub(lines);
+    }
+
+    fn page_scroll_amount(&self) -> usize {
+        self.transcript_viewport_height.saturating_sub(1).max(1)
+    }
+
     fn estimated_rendered_lines(&self) -> usize {
         let history = self.log_lines.len();
         let editor = self.editor.lines().len().max(1);
-        history + editor + 4
+        history + editor + 3
     }
 }
 
@@ -520,19 +551,20 @@ fn send_outbound(
         .map_err(|_| TuiClientError::OutboundChannelClosed)
 }
 
-fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
+fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(6),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(frame.area());
 
+    let flow_area = layout[0];
+    let footer_area = layout[1];
+
+    let flow_block = section_block("rho", app.theme.history_border);
+    let flow_inner = flow_block.inner(flow_area);
+    let flow_width = flow_inner.width.max(1);
     let text_block = TextBlock::new(0, 0);
-    let history_width = layout[0].width.saturating_sub(2);
-    let mut history_lines = Vec::new();
+    let mut flow_lines = Vec::new();
 
     for entry in &app.log_lines {
         let (prefix, prefix_style, markdown_mode) = match entry.kind {
@@ -544,7 +576,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
         };
 
         let prefix_width = u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX);
-        let body_width = history_width.saturating_sub(prefix_width).max(1);
+        let body_width = flow_width.saturating_sub(prefix_width).max(1);
         let body_lines = if markdown_mode {
             render_markdown(entry.text.as_str(), body_width, &app.theme)
         } else {
@@ -560,13 +592,13 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
                 spans.push(Span::styled(indent.clone(), prefix_style));
             }
             spans.extend(line.spans);
-            history_lines.push(Line::from(spans));
+            flow_lines.push(Line::from(spans));
         }
     }
 
     if app.active_assistant_line.is_some() {
-        history_lines.extend(spacer_lines(1));
-        history_lines.push(Line::from(vec![
+        flow_lines.extend(spacer_lines(1));
+        flow_lines.push(Line::from(vec![
             Span::styled("assistant> ", app.theme.assistant_prefix),
             Span::styled(
                 format!("{} thinking...", loader_frame(app.frame_tick)),
@@ -575,46 +607,87 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
         ]));
     }
 
-    let viewport_height = usize::from(layout[0].height.saturating_sub(2));
-    let history_scroll = history_lines.len().saturating_sub(viewport_height);
-    let history_scroll = u16::try_from(history_scroll).unwrap_or(u16::MAX);
+    if !flow_lines.is_empty() {
+        flow_lines.extend(spacer_lines(1));
+    }
 
-    let history = Paragraph::new(history_lines)
-        .block(section_block("rho chat", app.theme.history_border))
-        .scroll((history_scroll, 0))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(history, layout[0]);
-
-    let editor_height = usize::from(layout[1].height.saturating_sub(2));
-    let editor_width = usize::from(layout[1].width.saturating_sub(2));
+    let prompt = "you> ";
+    let prompt_width = prompt.chars().count();
+    let prompt_indent = " ".repeat(prompt_width);
+    let editor_width = usize::from(
+        flow_width
+            .saturating_sub(u16::try_from(prompt_width).unwrap_or(1))
+            .max(1),
+    );
+    let editor_height = app.editor.lines().len().max(1);
     let editor_render = app.editor.render(editor_width, editor_height);
-    let input = Paragraph::new(editor_render.lines.join("\n"))
-        .block(section_block("editor", app.theme.input_border))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(input, layout[1]);
+    let editor_start_row = flow_lines.len();
 
+    for (index, line) in editor_render.lines.iter().enumerate() {
+        let prefix = if index == 0 {
+            prompt.to_string()
+        } else {
+            prompt_indent.clone()
+        };
+        flow_lines.push(Line::from(vec![
+            Span::styled(prefix, app.theme.user_prefix),
+            Span::styled(line.clone(), app.theme.body),
+        ]));
+    }
+
+    let cursor_flow_row = editor_start_row.saturating_add(editor_render.cursor_row);
+    let cursor_flow_col = prompt_width.saturating_add(editor_render.cursor_col);
+
+    let viewport_height = usize::from(flow_inner.height);
+    app.transcript_viewport_height = viewport_height;
+    let max_scroll_up = flow_lines.len().saturating_sub(viewport_height);
+    app.transcript_scroll_up = app.transcript_scroll_up.min(max_scroll_up);
+    let scroll_top = max_scroll_up.saturating_sub(app.transcript_scroll_up);
+    let scroll_top = u16::try_from(scroll_top).unwrap_or(u16::MAX);
+
+    let flow = Paragraph::new(flow_lines)
+        .block(flow_block)
+        .scroll((scroll_top, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(flow, flow_area);
+
+    let scroll_state = if app.transcript_scroll_up == 0 {
+        "follow".to_string()
+    } else {
+        format!("scroll+{}", app.transcript_scroll_up)
+    };
     let footer_text = format!(
-        "url={} session_id={}  enter=send  shift+enter=newline  tab=complete  esc=quit",
-        app.url, app.session_id
+        "url={} session_id={}  enter=send  shift+enter=newline  tab=complete  pgup/pgdn=scroll  {}  esc=quit",
+        app.url, app.session_id, scroll_state
     );
     let status = Paragraph::new(truncate_to_width(
         footer_text.as_str(),
-        usize::from(layout[2].width),
+        usize::from(footer_area.width),
     ))
     .style(app.theme.footer);
-    frame.render_widget(status, layout[2]);
+    frame.render_widget(status, footer_area);
 
-    let input_x = layout[1]
-        .x
-        .saturating_add(1)
-        .saturating_add(u16::try_from(editor_render.cursor_col).unwrap_or(u16::MAX));
-    let input_y = layout[1]
+    let cursor_visible = cursor_flow_row >= usize::from(scroll_top)
+        && cursor_flow_row < usize::from(scroll_top).saturating_add(viewport_height);
+    let fallback_x = flow_inner.x;
+    let fallback_y = flow_inner
         .y
-        .saturating_add(1)
-        .saturating_add(u16::try_from(editor_render.cursor_row).unwrap_or(u16::MAX));
+        .saturating_add(flow_inner.height.saturating_sub(1));
+    let mut cursor_x = fallback_x;
+    let mut cursor_y = fallback_y;
+    if flow_inner.width > 0 && flow_inner.height > 0 && cursor_visible {
+        let visible_row = cursor_flow_row.saturating_sub(usize::from(scroll_top));
+        let visible_col = cursor_flow_col.min(usize::from(flow_inner.width.saturating_sub(1)));
+        cursor_x = flow_inner
+            .x
+            .saturating_add(u16::try_from(visible_col).unwrap_or(u16::MAX));
+        cursor_y = flow_inner
+            .y
+            .saturating_add(u16::try_from(visible_row).unwrap_or(u16::MAX));
+    }
 
     app.overlays.render(frame, frame.area());
-    frame.set_cursor_position((input_x, input_y));
+    frame.set_cursor_position((cursor_x, cursor_y));
 }
 
 fn handle_terminal_event(
@@ -626,12 +699,23 @@ fn handle_terminal_event(
         Event::Key(key) => handle_key_event(key, app, outbound_tx),
         Event::Paste(text) => {
             app.editor.handle_paste(text);
+            app.scroll_to_bottom();
             app.refresh_autocomplete(false);
             Ok(())
         }
+        Event::Mouse(mouse) => handle_mouse_event(mouse, app),
         Event::Resize(_, _) => Ok(()),
         _ => Ok(()),
     }
+}
+
+fn handle_mouse_event(mouse: MouseEvent, app: &mut AppState) -> Result<(), TuiClientError> {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll_up_lines(3),
+        MouseEventKind::ScrollDown => app.scroll_down_lines(3),
+        _ => {}
+    }
+    Ok(())
 }
 
 fn handle_key_event(
@@ -683,6 +767,12 @@ fn handle_key_event(
         KeyCode::Tab => {
             app.refresh_autocomplete(true);
         }
+        KeyCode::PageUp => {
+            app.scroll_up_lines(app.page_scroll_amount());
+        }
+        KeyCode::PageDown => {
+            app.scroll_down_lines(app.page_scroll_amount());
+        }
         KeyCode::Backspace => {
             app.editor.backspace();
             edited = true;
@@ -691,28 +781,52 @@ fn handle_key_event(
             app.editor.delete();
             edited = true;
         }
-        KeyCode::Left => app.editor.move_left(),
-        KeyCode::Right => app.editor.move_right(),
+        KeyCode::Left => {
+            app.editor.move_left();
+            app.scroll_to_bottom();
+        }
+        KeyCode::Right => {
+            app.editor.move_right();
+            app.scroll_to_bottom();
+        }
         KeyCode::Up => {
-            if app.has_autocomplete() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.scroll_up_lines(1);
+            } else if app.has_autocomplete() {
                 app.autocomplete_up();
             } else if app.editor.text().contains('\n') {
                 app.editor.move_up();
+                app.scroll_to_bottom();
             } else {
                 app.editor.history_up();
+                app.scroll_to_bottom();
             }
         }
         KeyCode::Down => {
-            if app.has_autocomplete() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.scroll_down_lines(1);
+            } else if app.has_autocomplete() {
                 app.autocomplete_down();
             } else if app.editor.text().contains('\n') {
                 app.editor.move_down();
+                app.scroll_to_bottom();
             } else {
                 app.editor.history_down();
+                app.scroll_to_bottom();
             }
         }
-        KeyCode::Home => app.editor.move_home(),
-        KeyCode::End => app.editor.move_end(),
+        KeyCode::Home => {
+            app.editor.move_home();
+            app.scroll_to_bottom();
+        }
+        KeyCode::End => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.scroll_to_bottom();
+            } else {
+                app.editor.move_end();
+                app.scroll_to_bottom();
+            }
+        }
         KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::CONTROL) && ch == 'w' => {
             app.editor.delete_word_backward();
             edited = true;
@@ -748,6 +862,7 @@ fn handle_key_event(
     }
 
     if edited {
+        app.scroll_to_bottom();
         app.refresh_autocomplete(false);
     }
 
@@ -758,6 +873,7 @@ fn submit_input(
     app: &mut AppState,
     outbound_tx: &mpsc::UnboundedSender<ClientEvent>,
 ) -> Result<(), TuiClientError> {
+    app.scroll_to_bottom();
     let submission = app.editor.submit();
     let line = submission.raw;
     let trimmed = line.trim();
