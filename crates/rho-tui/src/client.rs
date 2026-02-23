@@ -848,7 +848,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
         .scroll((scroll_top, 0));
     frame.render_widget(flow, flow_area);
 
-    let footer_text = format!("url={} session_id={}", app.url, app.session_id);
+    let footer_text = format!("url={} session_id={}  ?=help", app.url, app.session_id);
     let status = Paragraph::new(truncate_to_width(
         footer_text.as_str(),
         usize::from(footer_area.width),
