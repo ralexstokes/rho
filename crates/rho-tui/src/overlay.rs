@@ -131,6 +131,10 @@ impl OverlayStack {
         self.entries.pop().is_some()
     }
 
+    pub fn has(&self, id: u64) -> bool {
+        self.entries.iter().any(|entry| entry.id == id)
+    }
+
     pub fn set_hidden(&mut self, id: u64, hidden: bool) -> bool {
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
             return false;

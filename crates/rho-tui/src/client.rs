@@ -188,6 +188,7 @@ struct AppState {
     autocomplete_prefix: String,
     overlays: OverlayStack,
     autocomplete_overlay_id: Option<u64>,
+    help_overlay_id: Option<u64>,
     tool_call_names: HashMap<String, String>,
     collapse_tool_calls: bool,
     transcript_scroll_up: usize,
@@ -270,6 +271,7 @@ impl AppState {
             autocomplete_prefix: String::new(),
             overlays: OverlayStack::new(),
             autocomplete_overlay_id: None,
+            help_overlay_id: None,
             tool_call_names: HashMap::new(),
             collapse_tool_calls: true,
             transcript_scroll_up: 0,
@@ -413,6 +415,19 @@ impl AppState {
         }
     }
 
+    fn sync_overlay_ids(&mut self) {
+        if let Some(id) = self.autocomplete_overlay_id
+            && !self.overlays.has(id)
+        {
+            self.autocomplete_overlay_id = None;
+        }
+        if let Some(id) = self.help_overlay_id
+            && !self.overlays.has(id)
+        {
+            self.help_overlay_id = None;
+        }
+    }
+
     fn has_autocomplete(&self) -> bool {
         self.autocomplete_list.is_some()
     }
@@ -518,6 +533,75 @@ impl AppState {
 
         let id = self.overlays.show(lines, options);
         self.autocomplete_overlay_id = Some(id);
+    }
+
+    fn scroll_state_label(&self) -> String {
+        if self.transcript_scroll_up == 0 {
+            "follow".to_string()
+        } else {
+            format!("scroll+{}", self.transcript_scroll_up)
+        }
+    }
+
+    fn tool_state_label(&self) -> &'static str {
+        if self.collapse_tool_calls {
+            "tools=collapsed"
+        } else {
+            "tools=expanded"
+        }
+    }
+
+    fn help_overlay_lines(&self) -> Vec<Line<'static>> {
+        vec![
+            Line::from(vec![Span::styled("Keybindings", self.theme.heading)]),
+            Line::from("enter = send"),
+            Line::from("alt+enter = newline"),
+            Line::from("tab = complete"),
+            Line::from("up/down = scroll transcript"),
+            Line::from("ctrl+p/n = history"),
+            Line::from("ctrl+b/f/a/e = move"),
+            Line::from("ctrl+t = toggle tool view"),
+            Line::from("esc = close overlay / quit"),
+            Line::from(""),
+            Line::from(format!("current {}", self.tool_state_label())),
+            Line::from(format!("current {}", self.scroll_state_label())),
+            Line::from("press ? to close"),
+        ]
+    }
+
+    fn toggle_help_overlay(&mut self) {
+        if let Some(id) = self.help_overlay_id.take() {
+            let _ = self.overlays.hide(id);
+            return;
+        }
+
+        let options = OverlayOptions {
+            width: Some(SizeValue::Percent(55)),
+            min_width: Some(42),
+            max_height: Some(SizeValue::Absolute(18)),
+            anchor: OverlayAnchor::Center,
+            margin: OverlayMargin {
+                top: 1,
+                right: 1,
+                bottom: 1,
+                left: 1,
+            },
+            min_terminal_width: Some(40),
+            title: Some("help".to_string()),
+            ..OverlayOptions::default()
+        };
+
+        let id = self.overlays.show(self.help_overlay_lines(), options);
+        self.help_overlay_id = Some(id);
+    }
+
+    fn sync_help_overlay(&mut self) {
+        let Some(id) = self.help_overlay_id else {
+            return;
+        };
+        if !self.overlays.update(id, self.help_overlay_lines()) {
+            self.help_overlay_id = None;
+        }
     }
 
     fn scroll_to_bottom(&mut self) {
@@ -764,20 +848,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
         .scroll((scroll_top, 0));
     frame.render_widget(flow, flow_area);
 
-    let scroll_state = if app.transcript_scroll_up == 0 {
-        "follow".to_string()
-    } else {
-        format!("scroll+{}", app.transcript_scroll_up)
-    };
-    let tool_state = if app.collapse_tool_calls {
-        "tools=collapsed"
-    } else {
-        "tools=expanded"
-    };
-    let footer_text = format!(
-        "url={} session_id={}  enter=send  alt+enter=newline  tab=complete  up/down=scroll  ctrl+p/n=history  ctrl+b/f/a/e=move  ctrl+t=tools  {}  {}  esc=quit",
-        app.url, app.session_id, tool_state, scroll_state
-    );
+    let footer_text = format!("url={} session_id={}", app.url, app.session_id);
     let status = Paragraph::new(truncate_to_width(
         footer_text.as_str(),
         usize::from(footer_area.width),
@@ -804,6 +875,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
             .saturating_add(u16::try_from(visible_row).unwrap_or(u16::MAX));
     }
 
+    app.sync_help_overlay();
     app.overlays.render(frame, frame.area());
     frame.set_cursor_position((cursor_x, cursor_y));
 }
@@ -852,6 +924,14 @@ fn handle_key_event(
         app.should_quit = true;
         return Ok(());
     }
+    if matches!(
+        key.code,
+        KeyCode::Char('?') if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    ) {
+        app.clear_autocomplete();
+        app.toggle_help_overlay();
+        return Ok(());
+    }
     if matches_key(&key, Key::ctrl('t').as_str()) {
         app.collapse_tool_calls = !app.collapse_tool_calls;
         return Ok(());
@@ -863,7 +943,7 @@ fn handle_key_event(
             if app.has_autocomplete() {
                 app.clear_autocomplete();
             } else if app.overlays.hide_topmost() {
-                app.autocomplete_overlay_id = None;
+                app.sync_overlay_ids();
             } else {
                 app.should_quit = true;
             }
