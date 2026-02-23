@@ -3,6 +3,12 @@ use std::{
     time::Duration,
 };
 
+use crate::{
+    theme::UiTheme,
+    widgets::{
+        TextBlock, loader_frame, render_markdown, section_block, spacer_lines, truncate_to_width,
+    },
+};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -13,9 +19,8 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 use rho_core::{
     Message, MessageRole,
@@ -96,7 +101,9 @@ impl TuiClient {
                         }
                     }
                 }
-                _ = tick.tick() => {}
+                _ = tick.tick() => {
+                    app.frame_tick = app.frame_tick.wrapping_add(1);
+                }
             }
         }
 
@@ -158,10 +165,12 @@ struct LogLine {
 struct AppState {
     url: String,
     session_id: String,
+    theme: UiTheme,
     log_lines: Vec<LogLine>,
     active_assistant_line: Option<usize>,
     input: String,
     cursor_chars: usize,
+    frame_tick: u64,
     should_quit: bool,
 }
 
@@ -170,10 +179,12 @@ impl AppState {
         let mut app = Self {
             url,
             session_id,
+            theme: UiTheme::default(),
             log_lines: Vec::new(),
             active_assistant_line: None,
             input: String::new(),
             cursor_chars: 0,
+            frame_tick: 0,
             should_quit: false,
         };
         app.push_system("connected".to_string());
@@ -407,88 +418,75 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
         ])
         .split(frame.area());
 
-    let history_lines: Vec<Line<'_>> = app
-        .log_lines
-        .iter()
-        .map(|entry| match entry.kind {
-            LogKind::User => Line::from(vec![
-                Span::styled(
-                    "you> ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(entry.text.as_str()),
-            ]),
-            LogKind::Assistant => Line::from(vec![
-                Span::styled(
-                    "assistant> ",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(entry.text.as_str()),
-            ]),
-            LogKind::Tool => Line::from(vec![
-                Span::styled(
-                    "tool> ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(entry.text.as_str()),
-            ]),
-            LogKind::System => Line::from(vec![
-                Span::styled(
-                    "system> ",
-                    Style::default()
-                        .fg(Color::Gray)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(entry.text.as_str()),
-            ]),
-            LogKind::Error => Line::from(vec![
-                Span::styled(
-                    "error> ",
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(entry.text.as_str()),
-            ]),
-        })
-        .collect();
+    let text_block = TextBlock::new(0, 0);
+    let history_width = layout[0].width.saturating_sub(2);
+    let mut history_lines = Vec::new();
+
+    for entry in &app.log_lines {
+        let (prefix, prefix_style, markdown_mode) = match entry.kind {
+            LogKind::User => ("you> ", app.theme.user_prefix, true),
+            LogKind::Assistant => ("assistant> ", app.theme.assistant_prefix, true),
+            LogKind::Tool => ("tool> ", app.theme.tool_prefix, false),
+            LogKind::System => ("system> ", app.theme.system_prefix, false),
+            LogKind::Error => ("error> ", app.theme.error_prefix, false),
+        };
+
+        let prefix_width = u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX);
+        let body_width = history_width.saturating_sub(prefix_width).max(1);
+        let body_lines = if markdown_mode {
+            render_markdown(entry.text.as_str(), body_width, &app.theme)
+        } else {
+            text_block.render_lines(entry.text.as_str(), body_width)
+        };
+
+        let indent = " ".repeat(prefix.chars().count());
+        for (index, line) in body_lines.into_iter().enumerate() {
+            let mut spans = Vec::new();
+            if index == 0 {
+                spans.push(Span::styled(prefix.to_string(), prefix_style));
+            } else {
+                spans.push(Span::styled(indent.clone(), prefix_style));
+            }
+            spans.extend(line.spans);
+            history_lines.push(Line::from(spans));
+        }
+    }
+
+    if app.active_assistant_line.is_some() {
+        history_lines.extend(spacer_lines(1));
+        history_lines.push(Line::from(vec![
+            Span::styled("assistant> ", app.theme.assistant_prefix),
+            Span::styled(
+                format!("{} thinking...", loader_frame(app.frame_tick)),
+                app.theme.loader,
+            ),
+        ]));
+    }
 
     let viewport_height = usize::from(layout[0].height.saturating_sub(2));
     let history_scroll = history_lines.len().saturating_sub(viewport_height);
     let history_scroll = u16::try_from(history_scroll).unwrap_or(u16::MAX);
 
     let history = Paragraph::new(history_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("rho chat")
-                .border_style(Style::default().fg(Color::Blue)),
-        )
+        .block(section_block("rho chat", app.theme.history_border))
         .scroll((history_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(history, layout[0]);
 
     let input_width = usize::from(layout[1].width.saturating_sub(2));
     let (input_display, cursor_col) = app.render_input(input_width);
-    let input = Paragraph::new(input_display).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("input")
-            .border_style(Style::default().fg(Color::Magenta)),
-    );
+    let input = Paragraph::new(input_display).block(section_block("input", app.theme.input_border));
     frame.render_widget(input, layout[1]);
 
-    let status = Paragraph::new(format!(
+    let footer_text = format!(
         "url={} session_id={}  enter=send  /cancel  esc=quit",
         app.url, app.session_id
+    );
+    let status = Paragraph::new(truncate_to_width(
+        footer_text.as_str(),
+        usize::from(layout[2].width),
     ))
-    .style(Style::default().fg(Color::DarkGray));
+    .style(app.theme.footer);
     frame.render_widget(status, layout[2]);
 
     let input_x = layout[1]
@@ -760,10 +758,12 @@ mod tests {
         let app = AppState {
             url: "ws://localhost:8787/ws".to_string(),
             session_id: "session-1".to_string(),
+            theme: UiTheme::default(),
             log_lines: Vec::new(),
             active_assistant_line: None,
             input: "abcdefghij".to_string(),
             cursor_chars: 9,
+            frame_tick: 0,
             should_quit: false,
         };
 
