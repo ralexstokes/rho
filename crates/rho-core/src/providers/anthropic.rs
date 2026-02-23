@@ -8,7 +8,9 @@ use serde_json::{Value, json};
 
 use crate::{
     message::{Message, MessageRole},
-    providers::{Provider, ProviderError, ProviderKind, ProviderRequest, ProviderStream},
+    providers::{
+        Provider, ProviderError, ProviderKind, ProviderRequest, ProviderStream, validate_api_key,
+    },
     stream::ProviderEvent,
     tool::ToolCall,
 };
@@ -141,10 +143,7 @@ impl Provider for AnthropicProvider {
                         Err(ProviderError::Transport(message))?;
                     }
                     AnthropicChunk::MessageStop => {
-                        let message = Message::new(MessageRole::Assistant, aggregate_text);
-                        yield ProviderEvent::Message { message };
-                        yield ProviderEvent::Finished;
-                        return;
+                        break;
                     }
                     AnthropicChunk::MessageStart
                     | AnthropicChunk::MessageDelta
@@ -161,15 +160,10 @@ impl Provider for AnthropicProvider {
 }
 
 fn anthropic_api_key() -> Result<String, ProviderError> {
-    validate_api_key(std::env::var(ANTHROPIC_API_KEY_ENV).ok())
-}
-
-fn validate_api_key(api_key: Option<String>) -> Result<String, ProviderError> {
-    let api_key = api_key.ok_or(ProviderError::MissingApiKey(ANTHROPIC_API_KEY_ENV))?;
-    if api_key.trim().is_empty() {
-        return Err(ProviderError::InvalidApiKey(ANTHROPIC_API_KEY_ENV));
-    }
-    Ok(api_key)
+    validate_api_key(
+        ANTHROPIC_API_KEY_ENV,
+        std::env::var(ANTHROPIC_API_KEY_ENV).ok(),
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -338,7 +332,8 @@ mod tests {
 
     #[test]
     fn validate_api_key_rejects_missing_value() {
-        let error = validate_api_key(None).expect_err("missing API key should fail");
+        let error =
+            validate_api_key(ANTHROPIC_API_KEY_ENV, None).expect_err("missing API key should fail");
         assert!(matches!(
             error,
             ProviderError::MissingApiKey(ANTHROPIC_API_KEY_ENV)
@@ -347,8 +342,8 @@ mod tests {
 
     #[test]
     fn validate_api_key_rejects_blank_value() {
-        let error =
-            validate_api_key(Some("   ".to_string())).expect_err("blank API key should fail");
+        let error = validate_api_key(ANTHROPIC_API_KEY_ENV, Some("   ".to_string()))
+            .expect_err("blank API key should fail");
         assert!(matches!(
             error,
             ProviderError::InvalidApiKey(ANTHROPIC_API_KEY_ENV)
