@@ -1,5 +1,6 @@
-use clap::{Parser, Subcommand};
-use rho_agent::AgentRuntime;
+use clap::{Parser, Subcommand, ValueEnum};
+use rho_agent::{AgentRuntime, AgentServer, build_provider};
+use rho_core::providers::ProviderKind;
 use rho_tui::TuiClient;
 
 #[derive(Debug, Parser)]
@@ -14,8 +15,8 @@ enum Command {
     Serve {
         #[arg(long)]
         bind: String,
-        #[arg(long)]
-        provider: String,
+        #[arg(long, value_enum)]
+        provider: ProviderArg,
         #[arg(long)]
         model: String,
     },
@@ -25,7 +26,30 @@ enum Command {
     },
 }
 
-fn main() {
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ProviderArg {
+    Openai,
+    Anthropic,
+}
+
+impl ProviderArg {
+    fn to_provider_kind(self) -> ProviderKind {
+        match self {
+            ProviderArg::Openai => ProviderKind::OpenAi,
+            ProviderArg::Anthropic => ProviderKind::Anthropic,
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -35,14 +59,20 @@ fn main() {
             model,
         } => {
             let runtime = AgentRuntime::new();
+            let provider_kind = provider.to_provider_kind();
+            let provider_impl = build_provider(provider_kind)?;
+            let server = AgentServer::new(runtime.clone(), provider_impl, model);
             println!(
-                "serve scaffold: bind={bind} provider={provider} model={model} protocol_version={}",
+                "rho serve listening on {bind} with provider={provider_kind:?} protocol_version={}",
                 runtime.protocol_version()
             );
+            server.serve(bind).await?;
         }
         Command::Tui { url } => {
             let client = TuiClient::new(url);
-            println!("tui scaffold: url={}", client.url());
+            client.run().await?;
         }
     }
+
+    Ok(())
 }
