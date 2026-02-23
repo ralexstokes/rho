@@ -6,6 +6,7 @@ use std::{
 use crate::{
     autocomplete::{AutocompleteItem, AutocompleteProvider, CombinedAutocompleteProvider},
     editor::EditorState,
+    overlay::{OverlayAnchor, OverlayMargin, OverlayOptions, OverlayStack, SizeValue},
     select_list::SelectList,
     theme::UiTheme,
     widgets::{
@@ -175,6 +176,8 @@ struct AppState {
     autocomplete_provider: CombinedAutocompleteProvider,
     autocomplete_list: Option<SelectList>,
     autocomplete_prefix: String,
+    overlays: OverlayStack,
+    autocomplete_overlay_id: Option<u64>,
     frame_tick: u64,
     should_quit: bool,
 }
@@ -193,6 +196,8 @@ impl AppState {
             ),
             autocomplete_list: None,
             autocomplete_prefix: String::new(),
+            overlays: OverlayStack::new(),
+            autocomplete_overlay_id: None,
             frame_tick: 0,
             should_quit: false,
         };
@@ -284,6 +289,9 @@ impl AppState {
     fn clear_autocomplete(&mut self) {
         self.autocomplete_list = None;
         self.autocomplete_prefix.clear();
+        if let Some(id) = self.autocomplete_overlay_id.take() {
+            let _ = self.overlays.hide(id);
+        }
     }
 
     fn has_autocomplete(&self) -> bool {
@@ -315,18 +323,21 @@ impl AppState {
 
         self.autocomplete_prefix = suggestions.prefix;
         self.autocomplete_list = Some(SelectList::new(suggestions.items, 6));
+        self.sync_autocomplete_overlay();
     }
 
     fn autocomplete_up(&mut self) {
         if let Some(list) = &mut self.autocomplete_list {
             list.move_up();
         }
+        self.sync_autocomplete_overlay();
     }
 
     fn autocomplete_down(&mut self) {
         if let Some(list) = &mut self.autocomplete_list {
             list.move_down();
         }
+        self.sync_autocomplete_overlay();
     }
 
     fn apply_autocomplete_selection(&mut self) -> bool {
@@ -350,6 +361,44 @@ impl AppState {
         self.editor
             .replace_prefix_before_cursor(prefix_chars, replacement.as_str());
         self.clear_autocomplete();
+    }
+
+    fn sync_autocomplete_overlay(&mut self) {
+        let Some(list) = &self.autocomplete_list else {
+            if let Some(id) = self.autocomplete_overlay_id.take() {
+                let _ = self.overlays.hide(id);
+            }
+            return;
+        };
+
+        let lines = list.render_lines(56);
+        let options = OverlayOptions {
+            width: Some(SizeValue::Percent(55)),
+            min_width: Some(28),
+            max_height: Some(SizeValue::Absolute(8)),
+            anchor: OverlayAnchor::BottomLeft,
+            offset_x: 1,
+            offset_y: -8,
+            margin: OverlayMargin {
+                top: 1,
+                right: 1,
+                bottom: 2,
+                left: 1,
+            },
+            min_terminal_width: Some(48),
+            title: Some("completions".to_string()),
+            ..OverlayOptions::default()
+        };
+
+        if let Some(id) = self.autocomplete_overlay_id {
+            if self.overlays.update(id, lines.clone()) {
+                let _ = self.overlays.set_hidden(id, false);
+                return;
+            }
+        }
+
+        let id = self.overlays.show(lines, options);
+        self.autocomplete_overlay_id = Some(id);
     }
 
 }
@@ -405,13 +454,11 @@ fn send_outbound(
 }
 
 fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
-    let autocomplete_height = if app.has_autocomplete() { 5 } else { 0 };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(6),
-            Constraint::Length(autocomplete_height),
             Constraint::Length(1),
         ])
         .split(frame.area());
@@ -483,21 +530,12 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
         "url={} session_id={}  enter=send  shift+enter=newline  tab=complete  esc=quit",
         app.url, app.session_id
     );
-    if let Some(list) = &app.autocomplete_list {
-        let completion_width = usize::from(layout[2].width.saturating_sub(2));
-        let completion_lines: Vec<Line<'_>> = list.render_lines(completion_width);
-        let completions = Paragraph::new(completion_lines)
-            .block(section_block("completions", app.theme.input_border))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(completions, layout[2]);
-    }
-
     let status = Paragraph::new(truncate_to_width(
         footer_text.as_str(),
-        usize::from(layout[3].width),
+        usize::from(layout[2].width),
     ))
     .style(app.theme.footer);
-    frame.render_widget(status, layout[3]);
+    frame.render_widget(status, layout[2]);
 
     let input_x = layout[1]
         .x
@@ -508,6 +546,8 @@ fn draw_ui(frame: &mut Frame<'_>, app: &AppState) {
         .saturating_add(1)
         .saturating_add(u16::try_from(editor_render.cursor_row).unwrap_or(u16::MAX));
     frame.set_cursor_position((input_x, input_y));
+
+    app.overlays.render(frame, frame.area());
 }
 
 fn handle_terminal_event(
@@ -546,6 +586,8 @@ fn handle_key_event(
         KeyCode::Esc => {
             if app.has_autocomplete() {
                 app.clear_autocomplete();
+            } else if app.overlays.hide_topmost() {
+                app.autocomplete_overlay_id = None;
             } else {
                 app.should_quit = true;
             }
