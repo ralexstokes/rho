@@ -5,9 +5,12 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
+base64 = "0.22.1"
+crossterm = { version = "0.28.1", features = ["event-stream"] }
 futures-util.workspace = true
+ratatui = "0.29.0"
 rho-core = { path = "../rho-core" }
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { version = "1.48.0", features = ["io-std", "io-util", "rt-multi-thread", "time"] }
+tokio = { version = "1.48.0", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
