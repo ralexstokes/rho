@@ -433,6 +433,10 @@ impl EditorState {
         EditorSubmit { raw, expanded }
     }
 
+    pub fn is_multiline(&self) -> bool {
+        self.lines.len() > 1
+    }
+
     pub fn lines(&self) -> &[String] {
         &self.lines
     }

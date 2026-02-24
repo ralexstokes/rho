@@ -98,29 +98,3 @@ fn anthropic_client(api_key: String) -> Result<anthropic::Client, ProviderError>
         .build()
         .map_err(|error| map_rig_http_error(ANTHROPIC_API_KEY_ENV, error))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::providers::validate_api_key;
-
-    #[test]
-    fn validate_api_key_rejects_missing_value() {
-        let error =
-            validate_api_key(ANTHROPIC_API_KEY_ENV, None).expect_err("missing API key should fail");
-        assert!(matches!(
-            error,
-            ProviderError::MissingApiKey(ANTHROPIC_API_KEY_ENV)
-        ));
-    }
-
-    #[test]
-    fn validate_api_key_rejects_blank_value() {
-        let error = validate_api_key(ANTHROPIC_API_KEY_ENV, Some("   ".to_string()))
-            .expect_err("blank API key should fail");
-        assert!(matches!(
-            error,
-            ProviderError::InvalidApiKey(ANTHROPIC_API_KEY_ENV)
-        ));
-    }
-}

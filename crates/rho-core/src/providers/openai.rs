@@ -97,29 +97,3 @@ fn openai_client(api_key: String) -> Result<openai::Client, ProviderError> {
         .build()
         .map_err(|error| map_rig_http_error(OPENAI_API_KEY_ENV, error))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::providers::validate_api_key;
-
-    #[test]
-    fn validate_api_key_rejects_missing_value() {
-        let error =
-            validate_api_key(OPENAI_API_KEY_ENV, None).expect_err("missing API key should fail");
-        assert!(matches!(
-            error,
-            ProviderError::MissingApiKey(OPENAI_API_KEY_ENV)
-        ));
-    }
-
-    #[test]
-    fn validate_api_key_rejects_blank_value() {
-        let error = validate_api_key(OPENAI_API_KEY_ENV, Some("   ".to_string()))
-            .expect_err("blank API key should fail");
-        assert!(matches!(
-            error,
-            ProviderError::InvalidApiKey(OPENAI_API_KEY_ENV)
-        ));
-    }
-}

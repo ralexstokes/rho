@@ -182,7 +182,7 @@ impl AgentRuntime {
             }
         }
 
-        Err(max_tool_iterations_error(self.max_tool_iterations))
+        unreachable!("completion loop covers all iterations via 0..=max_tool_iterations")
     }
 }
 
@@ -456,7 +456,6 @@ fn tool_error(call_id: &str, output: impl Into<String>) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
         sync::{Arc, Mutex},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -464,14 +463,12 @@ mod tests {
     use rho_core::{
         message::decode_assistant_message_content,
         providers::{ModelKind, ProviderKind, ProviderRequest, ProviderStream},
-        tool::{ToolCall, ToolDefinition},
+        tool::ToolCall,
     };
     use serde_json::{Value, json};
 
     use super::*;
-
-    type FakeResponse = Vec<Result<ProviderEvent, ProviderError>>;
-    type FakeResponseQueue = VecDeque<FakeResponse>;
+    use crate::test_helpers::{FakeProvider, FakeResponse, FakeResponseQueue};
 
     #[test]
     fn run_user_message_without_tool_calls_emits_final() {
@@ -720,65 +717,6 @@ mod tests {
                 builtin_tool_definitions().as_ptr() as usize
             );
         });
-    }
-
-    #[derive(Debug, Clone)]
-    struct FakeProvider {
-        responses: Arc<Mutex<FakeResponseQueue>>,
-        requests: Arc<Mutex<Vec<RecordedRequest>>>,
-    }
-
-    impl FakeProvider {
-        fn new(responses: Vec<FakeResponse>) -> Self {
-            Self {
-                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
-                requests: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn requests(&self) -> Vec<RecordedRequest> {
-            self.requests
-                .lock()
-                .expect("requests mutex should be available")
-                .clone()
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    struct RecordedRequest {
-        messages: Vec<Message>,
-        tools: Vec<ToolDefinition>,
-    }
-
-    impl RecordedRequest {
-        fn from_request(request: ProviderRequest<'_>) -> Self {
-            Self {
-                messages: request.messages.to_vec(),
-                tools: request.tools.to_vec(),
-            }
-        }
-    }
-
-    impl Provider for FakeProvider {
-        fn kind(&self) -> ProviderKind {
-            ProviderKind::OpenAi
-        }
-
-        fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
-            self.requests
-                .lock()
-                .expect("requests mutex should be available")
-                .push(RecordedRequest::from_request(request));
-
-            let events = self
-                .responses
-                .lock()
-                .expect("responses mutex should be available")
-                .pop_front()
-                .unwrap_or_default();
-
-            Box::pin(futures_util::stream::iter(events))
-        }
     }
 
     #[derive(Debug, Clone, Copy)]

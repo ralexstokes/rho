@@ -480,6 +480,19 @@ mod tests {
     }
 
     #[test]
+    fn validate_api_key_rejects_missing_value() {
+        let error = validate_api_key("TEST_KEY", None).expect_err("missing API key should fail");
+        assert!(matches!(error, ProviderError::MissingApiKey("TEST_KEY")));
+    }
+
+    #[test]
+    fn validate_api_key_rejects_blank_value() {
+        let error = validate_api_key("TEST_KEY", Some("   ".to_string()))
+            .expect_err("blank API key should fail");
+        assert!(matches!(error, ProviderError::InvalidApiKey("TEST_KEY")));
+    }
+
+    #[test]
     fn to_rig_chat_request_preserves_distinct_tool_call_id_and_call_id() {
         let messages = vec![
             Message::new(MessageRole::User, "first"),
