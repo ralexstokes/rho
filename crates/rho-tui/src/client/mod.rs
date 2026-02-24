@@ -11,13 +11,14 @@ use rho_core::protocol::{ClientEvent, StartSession};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Error as WsError};
+use tracing::{Instrument, info, info_span, trace, warn};
 
 use crate::terminal::ProcessTerminal;
 
 use self::{
     app::AppState,
     input::handle_terminal_event,
-    network::{run_reader, run_writer, send_outbound, wait_for_session_ack},
+    network::{network_event_name, run_reader, run_writer, send_outbound, wait_for_session_ack},
     render::{RenderState, draw_ui},
 };
 
@@ -36,79 +37,94 @@ impl TuiClient {
     }
 
     pub async fn run(&self) -> Result<(), TuiClientError> {
-        let (socket, _) = connect_async(self.url.as_str())
-            .await
-            .map_err(TuiClientError::Connect)?;
-        let (writer, reader) = socket.split();
+        async {
+            info!("connecting TUI websocket");
+            let (socket, _) = connect_async(self.url.as_str())
+                .await
+                .map_err(TuiClientError::Connect)?;
+            info!("websocket connected");
+            let (writer, reader) = socket.split();
 
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+            let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+            let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
 
-        tokio::spawn(run_writer(writer, outbound_rx));
-        tokio::spawn(run_reader(reader, inbound_tx));
+            tokio::spawn(run_writer(writer, outbound_rx));
+            tokio::spawn(run_reader(reader, inbound_tx));
 
-        send_outbound(
-            &outbound_tx,
-            ClientEvent::StartSession(StartSession { session_id: None }),
-        )?;
+            send_outbound(
+                &outbound_tx,
+                ClientEvent::StartSession(StartSession { session_id: None }),
+            )?;
 
-        let session_id = wait_for_session_ack(&mut inbound_rx).await?;
-        let mut app = AppState::new(self.url.clone(), session_id);
+            let session_id = wait_for_session_ack(&mut inbound_rx).await?;
+            info!(session_id = %session_id, "session initialized");
+            let mut app = AppState::new(self.url.clone(), session_id);
 
-        let mut terminal = ProcessTerminal::start().map_err(TuiClientError::Io)?;
-        let mut events = EventStream::new();
-        let mut tick = tokio::time::interval(Duration::from_millis(33));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut render_state = RenderState::from_env();
-        let mut needs_redraw = true;
+            let mut terminal = ProcessTerminal::start().map_err(TuiClientError::Io)?;
+            let mut events = EventStream::new();
+            let mut tick = tokio::time::interval(Duration::from_millis(33));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut render_state = RenderState::from_env();
+            let mut needs_redraw = true;
 
-        while !app.should_quit {
-            if needs_redraw {
-                render_state.prepare_draw(&mut terminal, app.estimated_rendered_lines())?;
-                if let Err(err) = terminal
-                    .terminal_mut()
-                    .draw(|frame| draw_ui(frame, &mut app))
-                {
-                    let _ = render_state.finish_draw(&mut terminal);
-                    return Err(TuiClientError::Io(err));
+            while !app.should_quit {
+                if needs_redraw {
+                    render_state.prepare_draw(&mut terminal, app.estimated_rendered_lines())?;
+                    if let Err(err) = terminal
+                        .terminal_mut()
+                        .draw(|frame| draw_ui(frame, &mut app))
+                    {
+                        let _ = render_state.finish_draw(&mut terminal);
+                        warn!(%err, "terminal draw failed");
+                        return Err(TuiClientError::Io(err));
+                    }
+                    render_state.finish_draw(&mut terminal)?;
                 }
-                render_state.finish_draw(&mut terminal)?;
-            }
 
-            tokio::select! {
-                maybe_inbound = inbound_rx.recv() => {
-                    match maybe_inbound {
-                        Some(event) => {
-                            needs_redraw = app.handle_network_event(event);
-                        }
-                        None => {
-                            app.push_system("connection closed".to_string());
-                            app.should_quit = true;
-                            needs_redraw = true;
+                tokio::select! {
+                    maybe_inbound = inbound_rx.recv() => {
+                        match maybe_inbound {
+                            Some(event) => {
+                                trace!(event = network_event_name(&event), "processing inbound network event");
+                                needs_redraw = app.handle_network_event(event);
+                            }
+                            None => {
+                                warn!("inbound channel closed");
+                                app.push_system("connection closed".to_string());
+                                app.should_quit = true;
+                                needs_redraw = true;
+                            }
                         }
                     }
-                }
-                maybe_event = events.next() => {
-                    match maybe_event {
-                        Some(Ok(event)) => {
-                            needs_redraw = handle_terminal_event(event, &mut app, &outbound_tx)?;
-                        }
-                        Some(Err(err)) => return Err(TuiClientError::Io(err)),
-                        None => {
-                            app.should_quit = true;
-                            needs_redraw = true;
+                    maybe_event = events.next() => {
+                        match maybe_event {
+                            Some(Ok(event)) => {
+                                needs_redraw = handle_terminal_event(event, &mut app, &outbound_tx)?;
+                            }
+                            Some(Err(err)) => {
+                                warn!(%err, "terminal event stream failed");
+                                return Err(TuiClientError::Io(err));
+                            }
+                            None => {
+                                info!("terminal event stream ended");
+                                app.should_quit = true;
+                                needs_redraw = true;
+                            }
                         }
                     }
-                }
-                _ = tick.tick(), if app.should_animate() => {
-                    app.frame_tick = app.frame_tick.wrapping_add(1);
-                    needs_redraw = true;
+                    _ = tick.tick(), if app.should_animate() => {
+                        app.frame_tick = app.frame_tick.wrapping_add(1);
+                        needs_redraw = true;
+                    }
                 }
             }
+
+            drop(outbound_tx);
+            info!("tui loop exited");
+            Ok(())
         }
-
-        drop(outbound_tx);
-        Ok(())
+        .instrument(info_span!("tui.run", url = %self.url))
+        .await
     }
 }
 

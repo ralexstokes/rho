@@ -14,3 +14,4 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { version = "1.49.0", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tracing.workspace = true

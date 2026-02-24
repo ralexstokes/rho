@@ -26,6 +26,7 @@ use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
 };
+use tracing::{Instrument, debug, info, info_span, trace, warn};
 use uuid::Uuid;
 
 use crate::{AgentRuntime, AgentSession};
@@ -37,6 +38,11 @@ pub struct AgentServer {
 
 impl AgentServer {
     pub fn new(runtime: AgentRuntime, provider: Arc<dyn Provider>, model: ModelKind) -> Self {
+        info!(
+            provider = ?provider.kind(),
+            model = %model,
+            "initializing agent server"
+        );
         let state = AppState {
             runtime,
             provider,
@@ -48,6 +54,7 @@ impl AgentServer {
 
     pub async fn serve(self, bind: impl AsRef<str>) -> Result<(), AgentServerError> {
         let bind_text = bind.as_ref().to_string();
+        info!(bind = %bind_text, "starting websocket server");
         let bind_addr = bind_text.parse::<SocketAddr>().map_err(|error| {
             AgentServerError::InvalidBindAddress {
                 bind: bind_text,
@@ -61,6 +68,8 @@ impl AgentServer {
     }
 
     pub async fn serve_with_listener(self, listener: TcpListener) -> Result<(), AgentServerError> {
+        let local_addr = listener.local_addr().ok();
+        info!(listen_addr = ?local_addr, "serving websocket listener");
         let router = Router::new()
             .route("/ws", get(ws_handler))
             .with_state(self.state);
@@ -92,6 +101,7 @@ pub enum AgentServerError {
 }
 
 pub fn build_provider(kind: ProviderKind) -> Result<Arc<dyn Provider>, AgentServerError> {
+    info!(provider = ?kind, "building provider");
     match kind {
         ProviderKind::OpenAi => Ok(Arc::new(OpenAiProvider::new())),
         ProviderKind::Anthropic => Ok(Arc::new(AnthropicProvider::new())),
@@ -124,52 +134,81 @@ impl SessionState {
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_websocket(socket, state))
+    let connection_id = Uuid::new_v4();
+    info!(%connection_id, "accepted websocket upgrade");
+    ws.on_upgrade(move |socket| handle_websocket(socket, state, connection_id))
 }
 
-async fn handle_websocket(stream: WebSocket, state: AppState) {
-    let (mut sink, mut source) = stream.split();
-    let (outbound_sender, mut outbound_receiver) = mpsc::unbounded_channel::<ServerEnvelope>();
+async fn handle_websocket(stream: WebSocket, state: AppState, connection_id: Uuid) {
+    async move {
+        info!("websocket connection established");
+        let (mut sink, mut source) = stream.split();
+        let (outbound_sender, mut outbound_receiver) = mpsc::unbounded_channel::<ServerEnvelope>();
 
-    let writer_task = tokio::spawn(async move {
-        while let Some(envelope) = outbound_receiver.recv().await {
-            let payload = match serde_json::to_string(&envelope) {
-                Ok(payload) => payload,
-                Err(_) => break,
-            };
+        let writer_task = tokio::spawn(async move {
+            while let Some(envelope) = outbound_receiver.recv().await {
+                let payload = match serde_json::to_string(&envelope) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        warn!(%error, "failed to serialize outbound server envelope");
+                        break;
+                    }
+                };
 
-            if sink.send(Message::Text(payload.into())).await.is_err() {
-                break;
+                if sink.send(Message::Text(payload.into())).await.is_err() {
+                    debug!("websocket sink closed while sending outbound envelope");
+                    break;
+                }
+            }
+            debug!("writer task completed");
+        });
+
+        while let Some(next_message) = source.next().await {
+            match next_message {
+                Ok(Message::Text(text)) => {
+                    trace!(
+                        payload_chars = text.chars().count(),
+                        "received websocket text frame"
+                    );
+                    handle_text_message(&state, &outbound_sender, text.as_str()).await;
+                }
+                Ok(Message::Binary(_)) => {
+                    warn!("received unsupported websocket binary frame");
+                    send_error(
+                        &outbound_sender,
+                        None,
+                        "invalid_message",
+                        "binary websocket frames are not supported",
+                    )
+                }
+                Ok(Message::Ping(_) | Message::Pong(_)) => {
+                    trace!("received websocket heartbeat frame");
+                }
+                Ok(Message::Close(_)) => {
+                    info!("received websocket close frame");
+                    break;
+                }
+                Err(error) => {
+                    warn!(%error, "failed to receive websocket frame");
+                    send_error(
+                        &outbound_sender,
+                        None,
+                        "websocket_receive_error",
+                        format!("failed to receive websocket frame: {error}"),
+                    );
+                    break;
+                }
             }
         }
-    });
 
-    while let Some(next_message) = source.next().await {
-        match next_message {
-            Ok(Message::Text(text)) => {
-                handle_text_message(&state, &outbound_sender, text.as_str()).await;
-            }
-            Ok(Message::Binary(_)) => send_error(
-                &outbound_sender,
-                None,
-                "invalid_message",
-                "binary websocket frames are not supported",
-            ),
-            Ok(Message::Ping(_) | Message::Pong(_)) => {}
-            Ok(Message::Close(_)) => break,
-            Err(error) => {
-                send_error(
-                    &outbound_sender,
-                    None,
-                    "websocket_receive_error",
-                    format!("failed to receive websocket frame: {error}"),
-                );
-                break;
-            }
-        }
+        writer_task.abort();
+        info!("websocket connection closed");
     }
-
-    writer_task.abort();
+    .instrument(info_span!(
+        "server.websocket_connection",
+        connection_id = %connection_id
+    ))
+    .await;
 }
 
 async fn handle_text_message(
@@ -177,9 +216,14 @@ async fn handle_text_message(
     outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
     text: &str,
 ) {
+    trace!(
+        payload_chars = text.chars().count(),
+        "parsing client envelope"
+    );
     let envelope: ClientEnvelope = match serde_json::from_str(text) {
         Ok(envelope) => envelope,
         Err(error) => {
+            warn!(%error, "invalid client envelope JSON");
             send_error(
                 outbound_sender,
                 None,
@@ -190,7 +234,17 @@ async fn handle_text_message(
         }
     };
 
+    debug!(
+        version = envelope.version,
+        event = client_event_name(&envelope.event),
+        "received client event envelope"
+    );
     if envelope.version != PROTOCOL_VERSION {
+        warn!(
+            received_version = envelope.version,
+            expected_version = PROTOCOL_VERSION,
+            "client protocol version mismatch"
+        );
         send_error(
             outbound_sender,
             None,
@@ -211,14 +265,17 @@ async fn handle_client_event(
     outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
     event: ClientEvent,
 ) {
+    debug!(event = client_event_name(&event), "handling client event");
     match event {
         ClientEvent::StartSession(start_session) => {
             let mut sessions = state.sessions.lock().await;
             let session_id = start_session
                 .session_id
                 .unwrap_or_else(|| allocate_session_id(&sessions));
+            let session_count_before = sessions.len();
 
             if !is_valid_session_id(&session_id) {
+                warn!(session_id = %session_id, "rejected invalid session id");
                 send_error(
                     outbound_sender,
                     Some(session_id),
@@ -229,6 +286,7 @@ async fn handle_client_event(
             }
 
             if sessions.contains_key(&session_id) {
+                warn!(session_id = %session_id, "session already exists");
                 send_error(
                     outbound_sender,
                     Some(session_id),
@@ -242,6 +300,12 @@ async fn handle_client_event(
                 session_id.clone(),
                 SessionState::new(state.runtime.start_session(session_id.clone())),
             );
+            info!(
+                session_id = %session_id,
+                session_count_before,
+                session_count_after = sessions.len(),
+                "session started"
+            );
             send_event(
                 outbound_sender,
                 ServerEvent::SessionAck(SessionAck { session_id }),
@@ -249,6 +313,10 @@ async fn handle_client_event(
         }
         ClientEvent::UserMessage(user_message) => {
             if user_message.message.role != MessageRole::User {
+                warn!(
+                    role = ?user_message.message.role,
+                    "rejected user_message with non-user role"
+                );
                 send_error(
                     outbound_sender,
                     Some(user_message.session_id),
@@ -260,6 +328,7 @@ async fn handle_client_event(
 
             let session_id = user_message.session_id;
             if !is_valid_session_id(&session_id) {
+                warn!(session_id = %session_id, "rejected invalid session id");
                 send_error(
                     outbound_sender,
                     Some(session_id),
@@ -269,6 +338,7 @@ async fn handle_client_event(
                 return;
             }
             let user_content = user_message.message.content;
+            let user_chars = user_content.chars().count();
             let mut sessions = state.sessions.lock().await;
 
             let Some(session_state) =
@@ -280,6 +350,7 @@ async fn handle_client_event(
             if let Some(handle) = &session_state.in_flight
                 && !handle.is_finished()
             {
+                warn!(session_id = %session_id, "session already has in-flight request");
                 send_error(
                     outbound_sender,
                     Some(session_id),
@@ -299,40 +370,62 @@ async fn handle_client_event(
             let sessions = Arc::clone(&state.sessions);
             let cleanup_session_id = session_id.clone();
 
-            let task = tokio::spawn(async move {
-                let run_result = {
-                    let mut session_guard = session.lock().await;
-                    runtime
-                        .run_user_message_streaming(
-                            &mut session_guard,
-                            provider.as_ref(),
-                            model,
-                            user_content,
-                            |event| send_event(&outbound_sender, event),
-                        )
-                        .await
-                };
+            info!(
+                session_id = %session_id,
+                model = %model,
+                provider = ?provider.kind(),
+                user_chars,
+                "starting session request task"
+            );
 
-                if let Err(error) = run_result {
-                    send_error(
-                        &outbound_sender,
-                        Some(cleanup_session_id.clone()),
-                        "runtime_error",
-                        error.to_string(),
-                    );
-                }
+            let task = tokio::spawn(
+                async move {
+                    let run_result = {
+                        let mut session_guard = session.lock().await;
+                        runtime
+                            .run_user_message_streaming(
+                                &mut session_guard,
+                                provider.as_ref(),
+                                model,
+                                user_content,
+                                |event| send_event(&outbound_sender, event),
+                            )
+                            .await
+                    };
 
-                let mut sessions_guard = sessions.lock().await;
-                if let Some(session_state) = sessions_guard.get_mut(&cleanup_session_id) {
-                    session_state.in_flight = None;
+                    if let Err(error) = run_result {
+                        warn!(
+                            session_id = %cleanup_session_id,
+                            %error,
+                            "runtime request task failed"
+                        );
+                        send_error(
+                            &outbound_sender,
+                            Some(cleanup_session_id.clone()),
+                            "runtime_error",
+                            error.to_string(),
+                        );
+                    } else {
+                        info!(session_id = %cleanup_session_id, "runtime request task completed");
+                    }
+
+                    let mut sessions_guard = sessions.lock().await;
+                    if let Some(session_state) = sessions_guard.get_mut(&cleanup_session_id) {
+                        session_state.in_flight = None;
+                    }
                 }
-            });
+                .instrument(info_span!(
+                    "server.session_request",
+                    session_id = %session_id
+                )),
+            );
 
             session_state.in_flight = Some(task);
         }
         ClientEvent::Cancel(cancel_request) => {
             let session_id = cancel_request.session_id;
             if !is_valid_session_id(&session_id) {
+                warn!(session_id = %session_id, "rejected invalid session id");
                 send_error(
                     outbound_sender,
                     Some(session_id),
@@ -351,6 +444,7 @@ async fn handle_client_event(
 
             if let Some(task) = session_state.in_flight.take() {
                 task.abort();
+                info!(session_id = %session_id, "cancelled in-flight request");
                 send_error(
                     outbound_sender,
                     Some(session_id),
@@ -358,6 +452,7 @@ async fn handle_client_event(
                     "in-flight request cancelled",
                 );
             } else {
+                warn!(session_id = %session_id, "no in-flight request to cancel");
                 send_error(
                     outbound_sender,
                     Some(session_id),
@@ -377,6 +472,7 @@ fn get_session_state_mut<'a>(
     if let Some(session_state) = sessions.get_mut(session_id) {
         Some(session_state)
     } else {
+        warn!(session_id = %session_id, "session not found");
         send_error(
             outbound_sender,
             Some(session_id.to_string()),
@@ -401,7 +497,14 @@ fn is_valid_session_id(session_id: &str) -> bool {
 }
 
 fn send_event(outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>, event: ServerEvent) {
-    let _ = outbound_sender.send(ServerEnvelope::new(event));
+    let event_name = server_event_name(&event);
+    trace!(event = event_name, "sending server event");
+    if outbound_sender.send(ServerEnvelope::new(event)).is_err() {
+        debug!(
+            event = event_name,
+            "outbound channel closed; dropping server event"
+        );
+    }
 }
 
 fn send_error(
@@ -410,14 +513,41 @@ fn send_error(
     code: impl Into<String>,
     message: impl Into<String>,
 ) {
+    let code = code.into();
+    let message = message.into();
+    warn!(
+        session_id = ?session_id,
+        code = %code,
+        message_chars = message.chars().count(),
+        "sending error event"
+    );
     send_event(
         outbound_sender,
         ServerEvent::Error(ErrorEvent {
             session_id,
-            code: code.into(),
-            message: message.into(),
+            code,
+            message,
         }),
     );
+}
+
+fn client_event_name(event: &ClientEvent) -> &'static str {
+    match event {
+        ClientEvent::StartSession(_) => "start_session",
+        ClientEvent::UserMessage(_) => "user_message",
+        ClientEvent::Cancel(_) => "cancel",
+    }
+}
+
+fn server_event_name(event: &ServerEvent) -> &'static str {
+    match event {
+        ServerEvent::SessionAck(_) => "session_ack",
+        ServerEvent::AssistantDelta(_) => "assistant_delta",
+        ServerEvent::ToolStarted(_) => "tool_started",
+        ServerEvent::ToolCompleted(_) => "tool_completed",
+        ServerEvent::Final(_) => "final",
+        ServerEvent::Error(_) => "error",
+    }
 }
 
 #[cfg(test)]

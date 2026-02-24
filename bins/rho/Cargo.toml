@@ -10,5 +10,5 @@ rho-agent = { path = "../../crates/rho-agent" }
 rho-core = { path = "../../crates/rho-core" }
 rho-tui = { path = "../../crates/rho-tui" }
 tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread"] }
-tracing = "0.1.41"
+tracing.workspace = true
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }

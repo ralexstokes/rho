@@ -18,6 +18,7 @@ use rho_core::{
 };
 use serde_json::{Value, json};
 use thiserror::Error;
+use tracing::{Instrument, debug, info, info_span, trace, warn};
 
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 8;
 
@@ -76,6 +77,11 @@ impl AgentRuntime {
             emitted_events.push(event);
         })
         .await?;
+        info!(
+            session_id = %session.id,
+            event_count = emitted_events.len(),
+            "completed user message run"
+        );
         Ok(emitted_events)
     }
 
@@ -91,11 +97,40 @@ impl AgentRuntime {
         F: FnMut(ServerEvent),
     {
         let user_content = user_content.into();
-        session
-            .messages
-            .push(Message::new(MessageRole::User, user_content));
-        self.run_completion_loop(session, provider, model, &mut emit_event)
-            .await
+        let user_chars = user_content.chars().count();
+        let session_id = session.id.clone();
+        let run_span = info_span!(
+            "runtime.user_message",
+            session_id = %session_id,
+            model = %model,
+            provider = ?provider.kind(),
+            user_chars,
+            prior_messages = session.messages.len(),
+        );
+
+        async {
+            info!("starting user message handling");
+            session
+                .messages
+                .push(Message::new(MessageRole::User, user_content));
+            let run_result = self
+                .run_completion_loop(session, provider, model, &mut emit_event)
+                .await;
+            match &run_result {
+                Ok(()) => info!(
+                    total_messages = session.messages.len(),
+                    "user message handling completed"
+                ),
+                Err(error) => warn!(
+                    %error,
+                    total_messages = session.messages.len(),
+                    "user message handling failed"
+                ),
+            }
+            run_result
+        }
+        .instrument(run_span)
+        .await
     }
 
     async fn run_completion_loop<F>(
@@ -108,81 +143,165 @@ impl AgentRuntime {
     where
         F: FnMut(ServerEvent),
     {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum IterationState {
+            Continue,
+            Finished,
+        }
+
         let session_id = session.id.clone();
         let builtin_tools = builtin_tool_definitions();
+        info!(
+            session_id = %session_id,
+            model = %model,
+            tool_count = builtin_tools.len(),
+            max_tool_iterations = self.max_tool_iterations,
+            "starting completion loop"
+        );
 
         for iteration in 0..=self.max_tool_iterations {
-            let request = ProviderRequest::new(model, session.messages()).with_tools(builtin_tools);
-            let mut stream = provider.stream(request);
+            let iteration_result = async {
+                let request =
+                    ProviderRequest::new(model, session.messages()).with_tools(builtin_tools);
+                let mut stream = provider.stream(request);
 
-            let mut assistant_message = None;
-            let mut assistant_delta_text = String::new();
-            let mut assistant_tool_calls = Vec::new();
-            let mut tool_messages = Vec::new();
+                let mut assistant_message = None;
+                let mut assistant_delta_text = String::new();
+                let mut assistant_tool_calls = Vec::new();
+                let mut tool_messages = Vec::new();
 
-            while let Some(next_event) = stream.next().await {
-                match next_event? {
-                    ProviderEvent::AssistantDelta { delta } => {
-                        assistant_delta_text.push_str(&delta);
-                        emit_event(ServerEvent::AssistantDelta(AssistantDelta {
-                            session_id: session_id.clone(),
-                            delta,
-                        }));
-                    }
-                    ProviderEvent::ToolCall { call } => {
-                        emit_event(ServerEvent::ToolStarted(ToolStarted {
-                            session_id: session_id.clone(),
-                            call: call.clone(),
-                        }));
-                        let result = execute_builtin_tool(&call);
-                        assistant_tool_calls.push(call);
+                debug!(
+                    request_messages = session.messages.len(),
+                    "provider stream started"
+                );
 
-                        push_tool_result_event(emit_event, &session_id, result, &mut tool_messages);
-                    }
-                    ProviderEvent::ToolResult { result } => {
-                        push_tool_result_event(emit_event, &session_id, result, &mut tool_messages);
-                    }
-                    ProviderEvent::Message { message } => {
-                        if message.role == MessageRole::Assistant {
-                            assistant_message = Some(message);
+                while let Some(next_event) = stream.next().await {
+                    let provider_event = match next_event {
+                        Ok(event) => event,
+                        Err(error) => {
+                            warn!(%error, "provider stream yielded error");
+                            return Err(AgentError::Provider(error));
+                        }
+                    };
+
+                    match provider_event {
+                        ProviderEvent::AssistantDelta { delta } => {
+                            trace!(
+                                delta_chars = delta.chars().count(),
+                                "assistant delta received"
+                            );
+                            assistant_delta_text.push_str(&delta);
+                            emit_event(ServerEvent::AssistantDelta(AssistantDelta {
+                                session_id: session_id.clone(),
+                                delta,
+                            }));
+                        }
+                        ProviderEvent::ToolCall { call } => {
+                            info!(
+                                call_id = %call.call_id,
+                                tool_name = %call.name,
+                                "provider requested tool call"
+                            );
+                            emit_event(ServerEvent::ToolStarted(ToolStarted {
+                                session_id: session_id.clone(),
+                                call: call.clone(),
+                            }));
+                            let result = execute_builtin_tool(&call);
+                            assistant_tool_calls.push(call);
+
+                            push_tool_result_event(
+                                emit_event,
+                                &session_id,
+                                result,
+                                &mut tool_messages,
+                            );
+                        }
+                        ProviderEvent::ToolResult { result } => {
+                            info!(
+                                call_id = %result.call_id,
+                                is_error = result.is_error,
+                                "provider emitted tool result"
+                            );
+                            push_tool_result_event(
+                                emit_event,
+                                &session_id,
+                                result,
+                                &mut tool_messages,
+                            );
+                        }
+                        ProviderEvent::Message { message } => {
+                            debug!(role = ?message.role, "provider emitted full message");
+                            if message.role == MessageRole::Assistant {
+                                assistant_message = Some(message);
+                            }
+                        }
+                        ProviderEvent::Finished => {
+                            debug!("provider stream finished");
+                            break;
                         }
                     }
-                    ProviderEvent::Finished => break,
                 }
-            }
 
-            let assistant_message = assistant_message
-                .unwrap_or_else(|| Message::new(MessageRole::Assistant, assistant_delta_text));
-            let assistant_message = Message::new(
-                MessageRole::Assistant,
-                encode_assistant_message_content(assistant_message.content, &assistant_tool_calls),
-            );
+                let assistant_message = assistant_message
+                    .unwrap_or_else(|| Message::new(MessageRole::Assistant, assistant_delta_text));
+                let assistant_message = Message::new(
+                    MessageRole::Assistant,
+                    encode_assistant_message_content(
+                        assistant_message.content,
+                        &assistant_tool_calls,
+                    ),
+                );
 
-            if tool_messages.is_empty() {
+                if tool_messages.is_empty() {
+                    if !assistant_message.content.is_empty() {
+                        session.messages.push(assistant_message.clone());
+                    }
+                    info!(
+                        final_content_chars = assistant_message.content.chars().count(),
+                        "completion loop reached final response"
+                    );
+                    emit_event(ServerEvent::Final(FinalMessage {
+                        session_id: session_id.clone(),
+                        message: assistant_message,
+                    }));
+                    return Ok(IterationState::Finished);
+                }
+
                 if !assistant_message.content.is_empty() {
-                    session.messages.push(assistant_message.clone());
+                    session.messages.push(assistant_message);
                 }
-                emit_event(ServerEvent::Final(FinalMessage {
-                    session_id: session_id.clone(),
-                    message: assistant_message,
-                }));
+
+                for tool_message in tool_messages {
+                    session.messages.push(tool_message);
+                }
+
+                info!(
+                    session_messages = session.messages.len(),
+                    "tool outputs appended; continuing completion loop"
+                );
+
+                if iteration == self.max_tool_iterations {
+                    warn!("maximum tool iterations reached");
+                    return Err(max_tool_iterations_error(self.max_tool_iterations));
+                }
+
+                Ok(IterationState::Continue)
+            }
+            .instrument(info_span!(
+                "runtime.completion_iteration",
+                session_id = %session_id,
+                iteration,
+                max_tool_iterations = self.max_tool_iterations,
+            ))
+            .await?;
+
+            if matches!(iteration_result, IterationState::Finished) {
                 return Ok(());
-            }
-
-            if !assistant_message.content.is_empty() {
-                session.messages.push(assistant_message);
-            }
-
-            for tool_message in tool_messages {
-                session.messages.push(tool_message);
-            }
-
-            if iteration == self.max_tool_iterations {
-                return Err(max_tool_iterations_error(self.max_tool_iterations));
             }
         }
 
-        unreachable!("completion loop covers all iterations via 0..=max_tool_iterations")
+        warn!("completion loop exited after iteration bound");
+        Err(max_tool_iterations_error(self.max_tool_iterations))
     }
 }
 
@@ -218,6 +337,22 @@ fn push_tool_result_event<F>(
 ) where
     F: FnMut(ServerEvent),
 {
+    if result.is_error {
+        warn!(
+            session_id = %session_id,
+            call_id = %result.call_id,
+            output_chars = result.output.chars().count(),
+            "tool call completed with error"
+        );
+    } else {
+        info!(
+            session_id = %session_id,
+            call_id = %result.call_id,
+            output_chars = result.output.chars().count(),
+            "tool call completed"
+        );
+    }
+
     tool_messages.push(tool_result_to_message(&result));
     emit_event(ServerEvent::ToolCompleted(ToolCompleted {
         session_id: session_id.to_string(),
@@ -291,18 +426,39 @@ fn builtin_tool_definitions() -> &'static [ToolDefinition] {
 }
 
 fn execute_builtin_tool(call: &ToolCall) -> ToolResult {
-    match call.name.as_str() {
-        "read" => read_tool(call),
-        "write" => write_tool(call),
-        "bash" => bash_tool(call),
-        _ => tool_error(
-            &call.call_id,
-            format!(
-                "unknown tool `{}`; expected one of: read, write, bash",
-                call.name
+    let span = info_span!(
+        "runtime.execute_builtin_tool",
+        call_id = %call.call_id,
+        tool_name = %call.name,
+    );
+    span.in_scope(|| {
+        let result = match call.name.as_str() {
+            "read" => read_tool(call),
+            "write" => write_tool(call),
+            "bash" => bash_tool(call),
+            _ => tool_error(
+                &call.call_id,
+                format!(
+                    "unknown tool `{}`; expected one of: read, write, bash",
+                    call.name
+                ),
             ),
-        ),
-    }
+        };
+
+        if result.is_error {
+            warn!(
+                output_chars = result.output.chars().count(),
+                "builtin tool returned error"
+            );
+        } else {
+            info!(
+                output_chars = result.output.chars().count(),
+                "builtin tool succeeded"
+            );
+        }
+
+        result
+    })
 }
 
 fn read_tool(call: &ToolCall) -> ToolResult {
@@ -311,9 +467,16 @@ fn read_tool(call: &ToolCall) -> ToolResult {
         Err(message) => return tool_error(&call.call_id, message),
     };
 
+    debug!(path = %path, "reading file");
     match fs::read(Path::new(&path)) {
-        Ok(bytes) => tool_ok(&call.call_id, String::from_utf8_lossy(&bytes).to_string()),
-        Err(error) => tool_error(&call.call_id, format!("read failed for `{path}`: {error}")),
+        Ok(bytes) => {
+            info!(path = %path, byte_count = bytes.len(), "read tool completed");
+            tool_ok(&call.call_id, String::from_utf8_lossy(&bytes).to_string())
+        }
+        Err(error) => {
+            warn!(path = %path, %error, "read tool failed");
+            tool_error(&call.call_id, format!("read failed for `{path}`: {error}"))
+        }
     }
 }
 
@@ -328,11 +491,21 @@ fn write_tool(call: &ToolCall) -> ToolResult {
         Err(message) => return tool_error(&call.call_id, message),
     };
 
+    debug!(
+        path = %path,
+        content_bytes = content.len(),
+        "writing file"
+    );
     let path_buf = PathBuf::from(&path);
     if let Some(parent) = path_buf.parent()
         && !parent.as_os_str().is_empty()
         && let Err(error) = fs::create_dir_all(parent)
     {
+        warn!(
+            parent = %parent.display(),
+            %error,
+            "write tool failed to create parent directory"
+        );
         return tool_error(
             &call.call_id,
             format!(
@@ -343,9 +516,15 @@ fn write_tool(call: &ToolCall) -> ToolResult {
     }
 
     if let Err(error) = fs::write(&path_buf, content.as_bytes()) {
+        warn!(path = %path_buf.display(), %error, "write tool failed");
         return tool_error(&call.call_id, format!("write failed for `{path}`: {error}"));
     }
 
+    info!(
+        path = %path_buf.display(),
+        content_bytes = content.len(),
+        "write tool completed"
+    );
     tool_ok(
         &call.call_id,
         format!("wrote {} bytes to {}", content.len(), path_buf.display()),
@@ -363,6 +542,11 @@ fn bash_tool(call: &ToolCall) -> ToolResult {
         Err(message) => return tool_error(&call.call_id, message),
     };
 
+    debug!(
+        command_chars = command.chars().count(),
+        has_cwd = cwd.is_some(),
+        "executing bash tool"
+    );
     let mut command_builder = Command::new("bash");
     command_builder.arg("-lc").arg(&command);
 
@@ -373,6 +557,7 @@ fn bash_tool(call: &ToolCall) -> ToolResult {
     let output = match command_builder.output() {
         Ok(output) => output,
         Err(error) => {
+            warn!(%error, "bash tool failed to start process");
             return tool_error(&call.call_id, format!("bash execution failed: {error}"));
         }
     };
@@ -384,6 +569,12 @@ fn bash_tool(call: &ToolCall) -> ToolResult {
     })
     .to_string();
 
+    info!(
+        exit_code = ?output.status.code(),
+        stdout_bytes = output.stdout.len(),
+        stderr_bytes = output.stderr.len(),
+        "bash tool process completed"
+    );
     if output.status.success() {
         tool_ok(&call.call_id, payload)
     } else {

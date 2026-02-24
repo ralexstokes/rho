@@ -8,7 +8,7 @@ use rho_core::{
 };
 use rho_tui::TuiClient;
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{Instrument, debug, error, info, info_span};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_BIND: &str = "127.0.0.1:0";
@@ -88,14 +88,24 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let mode = match &cli.command {
+        Some(Command::Serve(_)) => "serve",
+        Some(Command::Tui { .. }) => "tui",
+        None => "local",
+    };
+    debug!(mode, "parsed CLI arguments");
 
-    match cli.command {
-        Some(Command::Serve(serve)) => run_serve(serve).await?,
-        Some(Command::Tui { url }) => TuiClient::new(url).run().await?,
-        None => run_local(cli.local).await?,
+    async {
+        match cli.command {
+            Some(Command::Serve(serve)) => run_serve(serve).await?,
+            Some(Command::Tui { url }) => TuiClient::new(url).run().await?,
+            None => run_local(cli.local).await?,
+        }
+
+        Ok(())
     }
-
-    Ok(())
+    .instrument(info_span!("rho.run", mode))
+    .await
 }
 
 fn build_server(
@@ -139,15 +149,25 @@ async fn run_serve(serve: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         provider,
         model,
     } = serve;
-    let (provider_kind, server) = build_server(provider, model)?;
-    info!(
+    let span = info_span!(
+        "rho.serve",
         bind = %bind,
-        provider = ?provider_kind,
-        protocol_version = PROTOCOL_VERSION,
-        "rho serve listening"
+        provider = ?provider,
+        model = ?model
     );
-    server.serve(bind).await?;
-    Ok(())
+    async move {
+        let (provider_kind, server) = build_server(provider, model)?;
+        info!(
+            bind = %bind,
+            provider = ?provider_kind,
+            protocol_version = PROTOCOL_VERSION,
+            "rho serve listening"
+        );
+        server.serve(bind).await?;
+        Ok(())
+    }
+    .instrument(span)
+    .await
 }
 
 async fn run_local(local: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -156,37 +176,47 @@ async fn run_local(local: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         provider,
         model,
     } = local;
-    let bind_addr = parse_bind_address(&bind)?;
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .map_err(AgentServerError::Bind)?;
-    let listen_addr = listener.local_addr().map_err(AgentServerError::Bind)?;
-    let connect_addr = websocket_client_addr(listen_addr);
-    let url = format!("ws://{connect_addr}/ws");
-
-    let (provider_kind, server) = build_server(provider, model)?;
-    info!(
-        listen_addr = %listen_addr,
-        provider = ?provider_kind,
-        protocol_version = PROTOCOL_VERSION,
-        tui_url = %url,
-        "rho running local mode"
+    let span = info_span!(
+        "rho.local",
+        bind = %bind,
+        provider = ?provider,
+        model = ?model
     );
+    async move {
+        let bind_addr = parse_bind_address(&bind)?;
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .map_err(AgentServerError::Bind)?;
+        let listen_addr = listener.local_addr().map_err(AgentServerError::Bind)?;
+        let connect_addr = websocket_client_addr(listen_addr);
+        let url = format!("ws://{connect_addr}/ws");
 
-    let server_task = tokio::spawn(server.serve_with_listener(listener));
-    let tui_result = TuiClient::new(url).run().await;
+        let (provider_kind, server) = build_server(provider, model)?;
+        info!(
+            listen_addr = %listen_addr,
+            provider = ?provider_kind,
+            protocol_version = PROTOCOL_VERSION,
+            tui_url = %url,
+            "rho running local mode"
+        );
 
-    server_task.abort();
-    let server_result = server_task.await;
+        let server_task = tokio::spawn(server.serve_with_listener(listener));
+        let tui_result = TuiClient::new(url).run().await;
 
-    tui_result?;
+        server_task.abort();
+        let server_result = server_task.await;
 
-    match server_result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(Box::new(error)),
-        Err(join_error) if join_error.is_cancelled() => Ok(()),
-        Err(join_error) => Err(Box::new(join_error)),
+        tui_result?;
+
+        match server_result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(Box::new(error) as Box<dyn std::error::Error>),
+            Err(join_error) if join_error.is_cancelled() => Ok(()),
+            Err(join_error) => Err(Box::new(join_error) as Box<dyn std::error::Error>),
+        }
     }
+    .instrument(span)
+    .await
 }
 
 #[cfg(test)]
