@@ -12,7 +12,7 @@ use rho_core::{
     protocol::{
         AssistantDelta, FinalMessage, PROTOCOL_VERSION, ServerEvent, ToolCompleted, ToolStarted,
     },
-    providers::{ModelKind, Provider, ProviderError, ProviderRequest},
+    providers::{ModelKind, Provider, ProviderError, ProviderRequest, ProviderStream},
     stream::ProviderEvent,
     tool::{ToolCall, ToolDefinition, ToolResult},
 };
@@ -90,23 +90,55 @@ impl AgentRuntime {
     where
         F: FnMut(ServerEvent),
     {
+        self.run_user_message_streaming_with_observer(
+            session,
+            provider,
+            model,
+            user_content,
+            &mut emit_event,
+            |_| {},
+        )
+        .await
+    }
+
+    pub async fn run_user_message_streaming_with_observer<F, O>(
+        &self,
+        session: &mut AgentSession,
+        provider: &dyn Provider,
+        model: ModelKind,
+        user_content: impl Into<String>,
+        mut emit_event: F,
+        mut observe_provider_stream: O,
+    ) -> Result<(), AgentError>
+    where
+        F: FnMut(ServerEvent),
+        O: FnMut(&ProviderStream),
+    {
         let user_content = user_content.into();
         session
             .messages
             .push(Message::new(MessageRole::User, user_content));
-        self.run_completion_loop(session, provider, model, &mut emit_event)
-            .await
+        self.run_completion_loop(
+            session,
+            provider,
+            model,
+            &mut emit_event,
+            &mut observe_provider_stream,
+        )
+        .await
     }
 
-    async fn run_completion_loop<F>(
+    async fn run_completion_loop<F, O>(
         &self,
         session: &mut AgentSession,
         provider: &dyn Provider,
         model: ModelKind,
         emit_event: &mut F,
+        observe_provider_stream: &mut O,
     ) -> Result<(), AgentError>
     where
         F: FnMut(ServerEvent),
+        O: FnMut(&ProviderStream),
     {
         let session_id = session.id.clone();
         let builtin_tools = builtin_tool_definitions();
@@ -114,6 +146,7 @@ impl AgentRuntime {
         for iteration in 0..=self.max_tool_iterations {
             let request = ProviderRequest::new(model, session.messages()).with_tools(builtin_tools);
             let mut stream = provider.stream(request);
+            observe_provider_stream(&stream);
 
             let mut assistant_message = None;
             let mut assistant_delta_text = String::new();
@@ -768,7 +801,7 @@ mod tests {
                 .pop_front()
                 .unwrap_or_default();
 
-            Box::pin(futures_util::stream::iter(events))
+            ProviderStream::from_stream(futures_util::stream::iter(events))
         }
     }
 

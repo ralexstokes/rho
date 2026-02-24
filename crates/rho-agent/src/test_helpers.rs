@@ -64,7 +64,7 @@ impl Provider for FakeProvider {
             .pop_front()
             .unwrap_or_default();
 
-        Box::pin(futures_util::stream::iter(events))
+        ProviderStream::from_stream(futures_util::stream::iter(events))
     }
 }
 
@@ -77,6 +77,6 @@ impl Provider for PendingProvider {
     }
 
     fn stream(&self, _request: ProviderRequest<'_>) -> ProviderStream {
-        Box::pin(futures_util::stream::pending())
+        ProviderStream::from_stream(futures_util::stream::pending())
     }
 }

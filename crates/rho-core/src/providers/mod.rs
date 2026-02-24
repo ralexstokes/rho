@@ -1,4 +1,8 @@
-use std::pin::Pin;
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use futures_core::Stream;
 use rig::{
@@ -27,7 +31,90 @@ pub mod openai;
 
 const DEFAULT_TOOL_RESULT_CALL_ID: &str = "tool-result";
 
-pub type ProviderStream = Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderError>> + Send>>;
+pub type ProviderEventStream =
+    Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderError>> + Send>>;
+
+#[derive(Clone)]
+pub struct ProviderCancelHandle {
+    cancel: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl ProviderCancelHandle {
+    pub fn new<F>(cancel: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        Self {
+            cancel: Arc::new(cancel),
+        }
+    }
+
+    pub fn cancel(&self) {
+        (self.cancel)();
+    }
+}
+
+pub struct ProviderStream {
+    inner: ProviderEventStream,
+    cancel_handle: Option<ProviderCancelHandle>,
+}
+
+impl ProviderStream {
+    pub fn new(inner: ProviderEventStream) -> Self {
+        Self {
+            inner,
+            cancel_handle: None,
+        }
+    }
+
+    pub fn from_stream<S>(stream: S) -> Self
+    where
+        S: Stream<Item = Result<ProviderEvent, ProviderError>> + Send + 'static,
+    {
+        Self::new(Box::pin(stream))
+    }
+
+    pub fn with_cancel_handle(
+        inner: ProviderEventStream,
+        cancel_handle: ProviderCancelHandle,
+    ) -> Self {
+        Self {
+            inner,
+            cancel_handle: Some(cancel_handle),
+        }
+    }
+
+    pub fn with_cancel_handle_from_stream<S>(stream: S, cancel_handle: ProviderCancelHandle) -> Self
+    where
+        S: Stream<Item = Result<ProviderEvent, ProviderError>> + Send + 'static,
+    {
+        Self::with_cancel_handle(Box::pin(stream), cancel_handle)
+    }
+
+    pub fn cancel_handle(&self) -> Option<ProviderCancelHandle> {
+        self.cancel_handle.clone()
+    }
+
+    pub fn cancel(&self) {
+        if let Some(cancel_handle) = &self.cancel_handle {
+            cancel_handle.cancel();
+        }
+    }
+}
+
+impl Stream for ProviderStream {
+    type Item = Result<ProviderEvent, ProviderError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+impl From<ProviderEventStream> for ProviderStream {
+    fn from(inner: ProviderEventStream) -> Self {
+        Self::new(inner)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

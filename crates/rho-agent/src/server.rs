@@ -1,4 +1,11 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use axum::{
     Router,
@@ -17,7 +24,8 @@ use rho_core::{
         SessionAck,
     },
     providers::{
-        ModelKind, Provider, ProviderKind, anthropic::AnthropicProvider, openai::OpenAiProvider,
+        ModelKind, Provider, ProviderKind, ProviderStream, anthropic::AnthropicProvider,
+        openai::OpenAiProvider,
     },
 };
 use thiserror::Error;
@@ -111,16 +119,87 @@ struct AppState {
 
 struct SessionState {
     session: Arc<Mutex<AgentSession>>,
-    in_flight: Option<JoinHandle<()>>,
+    request_generation: u64,
+    in_flight: Option<InFlightRequest>,
 }
 
 impl SessionState {
     fn new(session: AgentSession) -> Self {
         Self {
             session: Arc::new(Mutex::new(session)),
+            request_generation: 0,
             in_flight: None,
         }
     }
+
+    fn next_generation(&mut self) -> u64 {
+        self.request_generation = self.request_generation.wrapping_add(1);
+        self.request_generation
+    }
+
+    fn invalidate_generation(&mut self) {
+        self.request_generation = self.request_generation.wrapping_add(1);
+    }
+}
+
+struct InFlightRequest {
+    generation: u64,
+    task: JoinHandle<()>,
+    cancel: RequestCancellation,
+}
+
+#[derive(Clone, Default)]
+struct RequestCancellation {
+    cancelled: Arc<AtomicBool>,
+    provider_cancel: Arc<std::sync::Mutex<Option<rho_core::providers::ProviderCancelHandle>>>,
+}
+
+impl RequestCancellation {
+    fn register_provider_stream(&self, stream: &ProviderStream) {
+        let Some(cancel_handle) = stream.cancel_handle() else {
+            return;
+        };
+
+        if self.cancelled.load(Ordering::SeqCst) {
+            cancel_handle.cancel();
+            return;
+        }
+
+        let mut provider_cancel = self
+            .provider_cancel
+            .lock()
+            .expect("provider cancel mutex should be available");
+        if self.cancelled.load(Ordering::SeqCst) {
+            drop(provider_cancel);
+            cancel_handle.cancel();
+            return;
+        }
+        *provider_cancel = Some(cancel_handle);
+    }
+
+    fn cancel_provider(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Some(cancel_handle) = self
+            .provider_cancel
+            .lock()
+            .expect("provider cancel mutex should be available")
+            .as_ref()
+        {
+            cancel_handle.cancel();
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventScope {
+    session_id: String,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct OutboundEnvelope {
+    envelope: ServerEnvelope,
+    scope: Option<EventScope>,
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -129,11 +208,19 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 
 async fn handle_websocket(stream: WebSocket, state: AppState) {
     let (mut sink, mut source) = stream.split();
-    let (outbound_sender, mut outbound_receiver) = mpsc::unbounded_channel::<ServerEnvelope>();
+    let (outbound_sender, mut outbound_receiver) = mpsc::unbounded_channel::<OutboundEnvelope>();
+    let sessions = Arc::clone(&state.sessions);
 
     let writer_task = tokio::spawn(async move {
-        while let Some(envelope) = outbound_receiver.recv().await {
-            let payload = match serde_json::to_string(&envelope) {
+        while let Some(outbound) = outbound_receiver.recv().await {
+            if let Some(scope) = outbound.scope.as_ref() {
+                let sessions_guard = sessions.lock().await;
+                if !is_scope_current(&sessions_guard, scope) {
+                    continue;
+                }
+            }
+
+            let payload = match serde_json::to_string(&outbound.envelope) {
                 Ok(payload) => payload,
                 Err(_) => break,
             };
@@ -174,7 +261,7 @@ async fn handle_websocket(stream: WebSocket, state: AppState) {
 
 async fn handle_text_message(
     state: &AppState,
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+    outbound_sender: &mpsc::UnboundedSender<OutboundEnvelope>,
     text: &str,
 ) {
     let envelope: ClientEnvelope = match serde_json::from_str(text) {
@@ -208,7 +295,7 @@ async fn handle_text_message(
 
 async fn handle_client_event(
     state: &AppState,
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+    outbound_sender: &mpsc::UnboundedSender<OutboundEnvelope>,
     event: ClientEvent,
 ) {
     match event {
@@ -277,8 +364,8 @@ async fn handle_client_event(
                 return;
             };
 
-            if let Some(handle) = &session_state.in_flight
-                && !handle.is_finished()
+            if let Some(in_flight) = &session_state.in_flight
+                && !in_flight.task.is_finished()
             {
                 send_error(
                     outbound_sender,
@@ -290,6 +377,8 @@ async fn handle_client_event(
             }
 
             session_state.in_flight = None;
+            let request_generation = session_state.next_generation();
+            let request_cancellation = RequestCancellation::default();
 
             let runtime = state.runtime.clone();
             let model = state.model;
@@ -298,24 +387,35 @@ async fn handle_client_event(
             let outbound_sender = outbound_sender.clone();
             let sessions = Arc::clone(&state.sessions);
             let cleanup_session_id = session_id.clone();
+            let task_cancellation = request_cancellation.clone();
 
             let task = tokio::spawn(async move {
+                let request_scope = EventScope {
+                    session_id: cleanup_session_id.clone(),
+                    generation: request_generation,
+                };
                 let run_result = {
                     let mut session_guard = session.lock().await;
                     runtime
-                        .run_user_message_streaming(
+                        .run_user_message_streaming_with_observer(
                             &mut session_guard,
                             provider.as_ref(),
                             model,
                             user_content,
-                            |event| send_event(&outbound_sender, event),
+                            |event| {
+                                send_scoped_event(&outbound_sender, request_scope.clone(), event)
+                            },
+                            |provider_stream| {
+                                task_cancellation.register_provider_stream(provider_stream);
+                            },
                         )
                         .await
                 };
 
                 if let Err(error) = run_result {
-                    send_error(
+                    send_scoped_error(
                         &outbound_sender,
+                        request_scope.clone(),
                         Some(cleanup_session_id.clone()),
                         "runtime_error",
                         error.to_string(),
@@ -323,12 +423,21 @@ async fn handle_client_event(
                 }
 
                 let mut sessions_guard = sessions.lock().await;
-                if let Some(session_state) = sessions_guard.get_mut(&cleanup_session_id) {
+                if let Some(session_state) = sessions_guard.get_mut(&cleanup_session_id)
+                    && session_state
+                        .in_flight
+                        .as_ref()
+                        .is_some_and(|in_flight| in_flight.generation == request_generation)
+                {
                     session_state.in_flight = None;
                 }
             });
 
-            session_state.in_flight = Some(task);
+            session_state.in_flight = Some(InFlightRequest {
+                generation: request_generation,
+                task,
+                cancel: request_cancellation,
+            });
         }
         ClientEvent::Cancel(cancel_request) => {
             let session_id = cancel_request.session_id;
@@ -349,14 +458,25 @@ async fn handle_client_event(
                 return;
             };
 
-            if let Some(task) = session_state.in_flight.take() {
-                task.abort();
-                send_error(
-                    outbound_sender,
-                    Some(session_id),
-                    "cancelled",
-                    "in-flight request cancelled",
-                );
+            if let Some(in_flight) = session_state.in_flight.take() {
+                if in_flight.task.is_finished() {
+                    send_error(
+                        outbound_sender,
+                        Some(session_id),
+                        "request_not_in_flight",
+                        "session has no in-flight request to cancel",
+                    );
+                } else {
+                    in_flight.cancel.cancel_provider();
+                    in_flight.task.abort();
+                    session_state.invalidate_generation();
+                    send_error(
+                        outbound_sender,
+                        Some(session_id),
+                        "cancelled",
+                        "in-flight request cancelled",
+                    );
+                }
             } else {
                 send_error(
                     outbound_sender,
@@ -371,7 +491,7 @@ async fn handle_client_event(
 
 fn get_session_state_mut<'a>(
     sessions: &'a mut HashMap<String, SessionState>,
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+    outbound_sender: &mpsc::UnboundedSender<OutboundEnvelope>,
     session_id: &str,
 ) -> Option<&'a mut SessionState> {
     if let Some(session_state) = sessions.get_mut(session_id) {
@@ -400,12 +520,32 @@ fn is_valid_session_id(session_id: &str) -> bool {
     Uuid::try_parse(session_id).is_ok()
 }
 
-fn send_event(outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>, event: ServerEvent) {
-    let _ = outbound_sender.send(ServerEnvelope::new(event));
+fn is_scope_current(sessions: &HashMap<String, SessionState>, scope: &EventScope) -> bool {
+    sessions
+        .get(scope.session_id.as_str())
+        .is_some_and(|session_state| session_state.request_generation == scope.generation)
+}
+
+fn send_event(outbound_sender: &mpsc::UnboundedSender<OutboundEnvelope>, event: ServerEvent) {
+    let _ = outbound_sender.send(OutboundEnvelope {
+        envelope: ServerEnvelope::new(event),
+        scope: None,
+    });
+}
+
+fn send_scoped_event(
+    outbound_sender: &mpsc::UnboundedSender<OutboundEnvelope>,
+    scope: EventScope,
+    event: ServerEvent,
+) {
+    let _ = outbound_sender.send(OutboundEnvelope {
+        envelope: ServerEnvelope::new(event),
+        scope: Some(scope),
+    });
 }
 
 fn send_error(
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+    outbound_sender: &mpsc::UnboundedSender<OutboundEnvelope>,
     session_id: Option<String>,
     code: impl Into<String>,
     message: impl Into<String>,
@@ -420,9 +560,33 @@ fn send_error(
     );
 }
 
+fn send_scoped_error(
+    outbound_sender: &mpsc::UnboundedSender<OutboundEnvelope>,
+    scope: EventScope,
+    session_id: Option<String>,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) {
+    send_scoped_event(
+        outbound_sender,
+        scope,
+        ServerEvent::Error(ErrorEvent {
+            session_id,
+            code: code.into(),
+            message: message.into(),
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
 
     use rho_core::{Message, providers::ModelKind, stream::ProviderEvent};
     use tokio::sync::mpsc;
@@ -444,7 +608,7 @@ mod tests {
         .await;
 
         let envelope = rx.recv().await.expect("expected outbound envelope");
-        let session_id = match envelope.event {
+        let session_id = match outbound_event(envelope) {
             ServerEvent::SessionAck(SessionAck { session_id }) => session_id,
             _ => panic!("expected session ack"),
         };
@@ -468,7 +632,7 @@ mod tests {
 
         let envelope = rx.recv().await.expect("expected outbound envelope");
         assert!(matches!(
-            envelope.event,
+            outbound_event(envelope),
             ServerEvent::Error(ErrorEvent { code, .. }) if code == "invalid_session_id"
         ));
         assert!(state.sessions.lock().await.is_empty());
@@ -492,7 +656,7 @@ mod tests {
 
         let envelope = rx.recv().await.expect("expected outbound envelope");
         assert!(matches!(
-            envelope.event,
+            outbound_event(envelope),
             ServerEvent::Error(ErrorEvent { code, .. }) if code == "session_not_found"
         ));
     }
@@ -542,12 +706,12 @@ mod tests {
             .expect("missing second response");
 
         assert!(matches!(
-            first.event,
+            outbound_event(first),
             ServerEvent::AssistantDelta(_)
                 | ServerEvent::ToolStarted(_)
                 | ServerEvent::ToolCompleted(_)
         ));
-        assert!(matches!(second.event, ServerEvent::Final(_)));
+        assert!(matches!(outbound_event(second), ServerEvent::Final(_)));
     }
 
     #[tokio::test]
@@ -589,11 +753,100 @@ mod tests {
                 .expect("timed out waiting for cancel response")
                 .expect("missing cancel response");
 
-            if let ServerEvent::Error(error) = envelope.event {
+            if let ServerEvent::Error(error) = outbound_event(envelope) {
                 assert_eq!(error.code, "cancelled");
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn cancel_invokes_provider_cancel_handle() {
+        let stream_started = Arc::new(AtomicBool::new(false));
+        let stream_cancelled = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(CancellablePendingProvider {
+            stream_started: Arc::clone(&stream_started),
+            stream_cancelled: Arc::clone(&stream_cancelled),
+        });
+        let state = test_state(provider);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session_id = "00000000-0000-4000-8000-00000000000c".to_string();
+
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::StartSession(rho_core::protocol::StartSession {
+                session_id: Some(session_id.clone()),
+            }),
+        )
+        .await;
+        let _ = rx.recv().await;
+
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::UserMessage(rho_core::protocol::UserMessage {
+                session_id: session_id.clone(),
+                message: Message::new(MessageRole::User, "hello"),
+            }),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !stream_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider stream should start");
+
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::Cancel(rho_core::protocol::CancelRequest { session_id }),
+        )
+        .await;
+
+        assert!(
+            stream_cancelled.load(Ordering::SeqCst),
+            "cancel should invoke provider stream cancel handle"
+        );
+    }
+
+    #[test]
+    fn scope_matching_requires_current_session_generation() {
+        let session = AgentRuntime::new().start_session("session-1");
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "session-1".to_string(),
+            SessionState {
+                session: Arc::new(Mutex::new(session)),
+                request_generation: 7,
+                in_flight: None,
+            },
+        );
+
+        assert!(is_scope_current(
+            &sessions,
+            &EventScope {
+                session_id: "session-1".to_string(),
+                generation: 7,
+            }
+        ));
+        assert!(!is_scope_current(
+            &sessions,
+            &EventScope {
+                session_id: "session-1".to_string(),
+                generation: 6,
+            }
+        ));
+        assert!(!is_scope_current(
+            &sessions,
+            &EventScope {
+                session_id: "session-missing".to_string(),
+                generation: 7,
+            }
+        ));
     }
 
     fn test_state(provider: Arc<dyn Provider>) -> AppState {
@@ -602,6 +855,34 @@ mod tests {
             provider,
             model: ModelKind::Gpt52,
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn outbound_event(outbound: OutboundEnvelope) -> ServerEvent {
+        outbound.envelope.event
+    }
+
+    #[derive(Clone)]
+    struct CancellablePendingProvider {
+        stream_started: Arc<AtomicBool>,
+        stream_cancelled: Arc<AtomicBool>,
+    }
+
+    impl Provider for CancellablePendingProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAi
+        }
+
+        fn stream(&self, _request: rho_core::providers::ProviderRequest<'_>) -> ProviderStream {
+            self.stream_started.store(true, Ordering::SeqCst);
+            let stream_cancelled = Arc::clone(&self.stream_cancelled);
+            let cancel_handle = rho_core::providers::ProviderCancelHandle::new(move || {
+                stream_cancelled.store(true, Ordering::SeqCst);
+            });
+            ProviderStream::with_cancel_handle_from_stream(
+                futures_util::stream::pending(),
+                cancel_handle,
+            )
         }
     }
 }

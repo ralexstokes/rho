@@ -2080,6 +2080,7 @@ name = "rho-core"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "rig-core",

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 futures-core.workspace = true
+futures-channel = "0.3.32"
 futures-util.workspace = true
 rig.workspace = true
 serde.workspace = true

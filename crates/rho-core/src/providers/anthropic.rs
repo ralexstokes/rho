@@ -1,6 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use futures_util::StreamExt;
+use futures_channel::oneshot;
+use futures_util::{FutureExt, StreamExt};
 use rig::{
     client::completion::CompletionClient, completion::CompletionModel, providers::anthropic,
 };
@@ -8,8 +9,8 @@ use rig::{
 use crate::{
     Message, MessageRole,
     providers::{
-        Provider, ProviderError, ProviderKind, ProviderRequest, ProviderStream,
-        apply_common_request_options, map_rig_completion_error, map_rig_http_error,
+        Provider, ProviderCancelHandle, ProviderError, ProviderKind, ProviderRequest,
+        ProviderStream, apply_common_request_options, map_rig_completion_error, map_rig_http_error,
         map_streamed_assistant_chunk, rig_choice_text, to_rig_chat_request, validate_api_key,
     },
     stream::ProviderEvent,
@@ -52,7 +53,19 @@ impl Provider for AnthropicProvider {
     fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
         let rig_request = to_rig_chat_request(request);
         let client = self.client();
-        Box::pin(async_stream::try_stream! {
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let cancel_tx = Arc::new(Mutex::new(Some(cancel_tx)));
+        let cancel_handle = ProviderCancelHandle::new(move || {
+            if let Some(cancel_tx) = cancel_tx
+                .lock()
+                .expect("cancel sender mutex should be available")
+                .take()
+            {
+                let _ = cancel_tx.send(());
+            }
+        });
+
+        let stream = async_stream::try_stream! {
             let client = client?;
             let rig_request = rig_request?;
 
@@ -69,8 +82,20 @@ impl Provider for AnthropicProvider {
                 .stream()
                 .await
                 .map_err(|error| map_rig_completion_error(ANTHROPIC_API_KEY_ENV, error))?;
+            let mut cancel_rx = cancel_rx.fuse();
+            let mut cancelled = false;
 
-            while let Some(next_chunk) = stream.next().await {
+            loop {
+                let next_chunk = futures_util::select! {
+                    _ = cancel_rx => {
+                        cancelled = true;
+                        stream.cancel();
+                        None
+                    }
+                    next_chunk = stream.next().fuse() => next_chunk,
+                };
+
+                let Some(next_chunk) = next_chunk else { break };
                 let chunk = next_chunk
                     .map_err(|error| map_rig_completion_error(ANTHROPIC_API_KEY_ENV, error))?;
                 if let Some(event) = map_streamed_assistant_chunk(chunk) {
@@ -78,10 +103,14 @@ impl Provider for AnthropicProvider {
                 }
             }
 
-            let message = Message::new(MessageRole::Assistant, rig_choice_text(&stream.choice));
-            yield ProviderEvent::Message { message };
-            yield ProviderEvent::Finished;
-        })
+            if !cancelled {
+                let message = Message::new(MessageRole::Assistant, rig_choice_text(&stream.choice));
+                yield ProviderEvent::Message { message };
+                yield ProviderEvent::Finished;
+            }
+        };
+
+        ProviderStream::with_cancel_handle(Box::pin(stream), cancel_handle)
     }
 }
 
