@@ -13,7 +13,7 @@ use rig::{
     http_client::Error as RigHttpError,
     streaming::StreamedAssistantContent,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -24,6 +24,8 @@ use crate::{
 
 pub mod anthropic;
 pub mod openai;
+
+const DEFAULT_TOOL_RESULT_CALL_ID: &str = "tool-result";
 
 pub type ProviderStream = Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderError>> + Send>>;
 
@@ -130,11 +132,9 @@ pub(crate) fn to_rig_chat_request(
                 message.content.clone(),
             ))),
             MessageRole::Assistant => {
-                chat_messages.push(to_rig_assistant_message(message.content.clone()));
+                chat_messages.push(to_rig_assistant_message(&message.content));
             }
-            MessageRole::Tool => {
-                chat_messages.push(to_rig_tool_result_message(message.content.clone()))
-            }
+            MessageRole::Tool => chat_messages.push(to_rig_tool_result_message(&message.content)),
         }
     }
 
@@ -256,22 +256,18 @@ where
     }
 }
 
-fn to_rig_tool_result_message(content: String) -> RigMessage {
-    let (call_id, output) = match serde_json::from_str::<ToolMessagePayload>(&content) {
+fn to_rig_tool_result_message(content: &str) -> RigMessage {
+    let (call_id, output) = match serde_json::from_str::<ToolMessagePayload>(content) {
         Ok(payload) => {
-            let call_id = if payload.call_id.trim().is_empty() {
-                "tool-result".to_string()
-            } else {
-                payload.call_id
-            };
-            let output = serde_json::json!({
-                "is_error": payload.is_error,
-                "output": payload.output,
+            let call_id = normalize_tool_result_call_id(payload.call_id);
+            let output = serde_json::to_string(&RigToolMessagePayload {
+                is_error: payload.is_error,
+                output: payload.output.as_str(),
             })
-            .to_string();
+            .unwrap_or_else(|_| content.to_string());
             (call_id, output)
         }
-        Err(_) => ("tool-result".to_string(), content),
+        Err(_) => (DEFAULT_TOOL_RESULT_CALL_ID.to_string(), content.to_string()),
     };
 
     RigMessage::from(RigUserContent::tool_result_with_call_id(
@@ -281,8 +277,8 @@ fn to_rig_tool_result_message(content: String) -> RigMessage {
     ))
 }
 
-fn to_rig_assistant_message(content: String) -> RigMessage {
-    let parsed = decode_assistant_message_content(&content);
+fn to_rig_assistant_message(content: &str) -> RigMessage {
+    let parsed = decode_assistant_message_content(content);
     if parsed.tool_calls.is_empty() {
         return RigMessage::from(RigAssistantContent::text(parsed.text));
     }
@@ -316,6 +312,20 @@ struct ToolMessagePayload {
     #[serde(default)]
     is_error: bool,
     output: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RigToolMessagePayload<'a> {
+    is_error: bool,
+    output: &'a str,
+}
+
+fn normalize_tool_result_call_id(call_id: String) -> String {
+    if call_id.trim().is_empty() {
+        DEFAULT_TOOL_RESULT_CALL_ID.to_string()
+    } else {
+        call_id
+    }
 }
 
 fn is_auth_status(status_code: u16) -> bool {

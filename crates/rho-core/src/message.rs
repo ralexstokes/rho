@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::tool::ToolCall;
 
@@ -44,30 +43,28 @@ pub fn encode_assistant_message_content(
         return plain_text;
     }
 
-    let payload = AssistantToolCallsPayload {
-        kind: ASSISTANT_TOOL_CALLS_PAYLOAD_KIND.to_string(),
-        text: plain_text.clone(),
-        tool_calls: tool_calls
-            .iter()
-            .map(AssistantToolCallPayload::from)
-            .collect(),
+    let payload = AssistantToolCallsPayloadRef {
+        kind: ASSISTANT_TOOL_CALLS_PAYLOAD_KIND,
+        text: plain_text.as_str(),
+        tool_calls,
     };
 
     serde_json::to_string(&payload).unwrap_or(plain_text)
 }
 
 pub fn decode_assistant_message_content(content: &str) -> ParsedAssistantMessageContent {
+    if !looks_like_json_object(content) {
+        return parsed_plain_text_content(content);
+    }
+
     match serde_json::from_str::<AssistantToolCallsPayload>(content) {
         Ok(payload) if payload.kind == ASSISTANT_TOOL_CALLS_PAYLOAD_KIND => {
             ParsedAssistantMessageContent {
                 text: payload.text,
-                tool_calls: payload.tool_calls.into_iter().map(ToolCall::from).collect(),
+                tool_calls: payload.tool_calls,
             }
         }
-        _ => ParsedAssistantMessageContent {
-            text: content.to_string(),
-            tool_calls: Vec::new(),
-        },
+        _ => parsed_plain_text_content(content),
     }
 }
 
@@ -77,39 +74,25 @@ struct AssistantToolCallsPayload {
     #[serde(default)]
     text: String,
     #[serde(default)]
-    tool_calls: Vec<AssistantToolCallPayload>,
+    tool_calls: Vec<ToolCall>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AssistantToolCallPayload {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
-    call_id: String,
-    name: String,
-    #[serde(default)]
-    input: Value,
+#[derive(Debug, Serialize)]
+struct AssistantToolCallsPayloadRef<'a> {
+    kind: &'static str,
+    text: &'a str,
+    tool_calls: &'a [ToolCall],
 }
 
-impl From<&ToolCall> for AssistantToolCallPayload {
-    fn from(call: &ToolCall) -> Self {
-        Self {
-            id: call.id.clone(),
-            call_id: call.call_id.clone(),
-            name: call.name.clone(),
-            input: call.input.clone(),
-        }
+fn parsed_plain_text_content(content: &str) -> ParsedAssistantMessageContent {
+    ParsedAssistantMessageContent {
+        text: content.to_string(),
+        tool_calls: Vec::new(),
     }
 }
 
-impl From<AssistantToolCallPayload> for ToolCall {
-    fn from(call: AssistantToolCallPayload) -> Self {
-        Self {
-            id: call.id,
-            call_id: call.call_id,
-            name: call.name,
-            input: call.input,
-        }
-    }
+fn looks_like_json_object(content: &str) -> bool {
+    content.trim_start().starts_with('{')
 }
 
 #[cfg(test)]

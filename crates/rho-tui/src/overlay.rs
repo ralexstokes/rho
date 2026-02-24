@@ -80,9 +80,33 @@ impl Default for OverlayOptions {
 #[derive(Debug, Clone)]
 struct OverlayEntry {
     id: u64,
-    lines: Vec<Line<'static>>,
+    paragraph: Paragraph<'static>,
+    content_width: u16,
+    content_height: u16,
     options: OverlayOptions,
     hidden: bool,
+}
+
+impl OverlayEntry {
+    fn new(id: u64, lines: Vec<Line<'static>>, options: OverlayOptions) -> Self {
+        let (paragraph, content_width, content_height) = build_overlay_paragraph(lines, &options);
+        Self {
+            id,
+            paragraph,
+            content_width,
+            content_height,
+            options,
+            hidden: false,
+        }
+    }
+
+    fn set_lines(&mut self, lines: Vec<Line<'static>>) {
+        let (paragraph, content_width, content_height) =
+            build_overlay_paragraph(lines, &self.options);
+        self.paragraph = paragraph;
+        self.content_width = content_width;
+        self.content_height = content_height;
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -102,12 +126,7 @@ impl OverlayStack {
     pub fn show(&mut self, lines: Vec<Line<'static>>, options: OverlayOptions) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
-        self.entries.push(OverlayEntry {
-            id,
-            lines,
-            options,
-            hidden: false,
-        });
+        self.entries.push(OverlayEntry::new(id, lines, options));
         id
     }
 
@@ -115,7 +134,7 @@ impl OverlayStack {
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
             return false;
         };
-        entry.lines = lines;
+        entry.set_lines(lines);
         true
     }
 
@@ -156,17 +175,18 @@ impl OverlayStack {
                 continue;
             }
 
-            let rect = resolve_overlay_rect(area, entry.lines.as_slice(), &entry.options);
+            let rect = resolve_overlay_rect_from_content(
+                area,
+                entry.content_width,
+                entry.content_height,
+                &entry.options,
+            );
             if rect.width == 0 || rect.height == 0 {
                 continue;
             }
 
-            let title = entry.options.title.as_deref().unwrap_or("overlay");
-            let widget = Paragraph::new(entry.lines.clone())
-                .block(Block::default().borders(Borders::ALL).title(title))
-                .wrap(Wrap { trim: false });
             frame.render_widget(Clear, rect);
-            frame.render_widget(widget, rect);
+            frame.render_widget(&entry.paragraph, rect);
         }
     }
 
@@ -183,7 +203,28 @@ impl OverlayStack {
     }
 }
 
-fn resolve_overlay_rect(area: Rect, lines: &[Line<'_>], options: &OverlayOptions) -> Rect {
+fn build_overlay_paragraph(
+    lines: Vec<Line<'static>>,
+    options: &OverlayOptions,
+) -> (Paragraph<'static>, u16, u16) {
+    let content_width = max_content_width(&lines);
+    let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let title = options
+        .title
+        .clone()
+        .unwrap_or_else(|| "overlay".to_string());
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    (paragraph, content_width, content_height)
+}
+
+fn resolve_overlay_rect_from_content(
+    area: Rect,
+    content_width: u16,
+    content_height: u16,
+    options: &OverlayOptions,
+) -> Rect {
     let margin = options.margin;
     let available_width = area
         .width
@@ -196,7 +237,6 @@ fn resolve_overlay_rect(area: Rect, lines: &[Line<'_>], options: &OverlayOptions
         .saturating_sub(margin.bottom)
         .max(1);
 
-    let content_width = max_content_width(lines);
     let mut width = options
         .width
         .map(|value| value.resolve(available_width))
@@ -206,7 +246,6 @@ fn resolve_overlay_rect(area: Rect, lines: &[Line<'_>], options: &OverlayOptions
     }
     width = width.min(available_width).max(1);
 
-    let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let mut height = content_height
         .saturating_add(2)
         .min(available_height)
@@ -260,12 +299,10 @@ fn resolve_overlay_rect(area: Rect, lines: &[Line<'_>], options: &OverlayOptions
 fn max_content_width(lines: &[Line<'_>]) -> u16 {
     let mut max_width = 1u16;
     for line in lines {
-        let width = line
-            .to_string()
-            .chars()
-            .count()
-            .try_into()
-            .unwrap_or(u16::MAX);
+        let width = u16::try_from(line.spans.iter().fold(0usize, |sum, span| {
+            sum.saturating_add(span.content.chars().count())
+        }))
+        .unwrap_or(u16::MAX);
         max_width = max_width.max(width);
     }
     max_width
@@ -324,7 +361,13 @@ mod tests {
             width: Some(SizeValue::Absolute(30)),
             ..OverlayOptions::default()
         };
-        let rect = resolve_overlay_rect(Rect::new(0, 0, 80, 24), &[Line::from("x")], &options);
+        let lines = [Line::from("x")];
+        let rect = resolve_overlay_rect_from_content(
+            Rect::new(0, 0, 80, 24),
+            max_content_width(&lines),
+            u16::try_from(lines.len()).unwrap_or(u16::MAX),
+            &options,
+        );
         assert!(rect.x + rect.width <= 80);
         assert!(rect.y + rect.height <= 24);
     }
