@@ -134,7 +134,7 @@ impl AgentRuntime {
                             session_id: session_id.clone(),
                             call: call.clone(),
                         }));
-                        let result = execute_builtin_tool(&call);
+                        let result = execute_builtin_tool(call.clone()).await;
                         assistant_tool_calls.push(call);
 
                         push_tool_result_event(emit_event, &session_id, result, &mut tool_messages);
@@ -290,7 +290,18 @@ fn builtin_tool_definitions() -> &'static [ToolDefinition] {
     BUILTIN_TOOL_DEFINITIONS.as_slice()
 }
 
-fn execute_builtin_tool(call: &ToolCall) -> ToolResult {
+async fn execute_builtin_tool(call: ToolCall) -> ToolResult {
+    match tokio::task::spawn_blocking(move || execute_builtin_tool_blocking(&call)).await {
+        Ok(result) => result,
+        Err(join_error) => ToolResult {
+            call_id: String::new(),
+            output: format!("tool execution panicked: {join_error}"),
+            is_error: true,
+        },
+    }
+}
+
+fn execute_builtin_tool_blocking(call: &ToolCall) -> ToolResult {
     match call.name.as_str() {
         "read" => read_tool(call),
         "write" => write_tool(call),
@@ -523,9 +534,8 @@ mod tests {
         });
     }
 
-    #[test]
-    fn run_user_message_executes_read_tool_and_continues() {
-        futures::executor::block_on(async {
+    #[tokio::test]
+    async fn run_user_message_executes_read_tool_and_continues() {
             let runtime = AgentRuntime::new();
             let mut session = runtime.start_session("session-2");
             let file_path = temp_file_path("read");
@@ -608,12 +618,10 @@ mod tests {
             );
 
             let _ = fs::remove_file(file_path);
-        });
     }
 
-    #[test]
-    fn tool_failures_surface_as_structured_tool_results() {
-        futures::executor::block_on(async {
+    #[tokio::test]
+    async fn tool_failures_surface_as_structured_tool_results() {
             let runtime = AgentRuntime::new();
             let mut session = runtime.start_session("session-3");
             let provider = FakeProvider::new(vec![
@@ -656,12 +664,10 @@ mod tests {
             assert!(events
                 .iter()
                 .any(|event| matches!(event, ServerEvent::Final(final_message) if final_message.message.content == "tool failed")));
-        });
     }
 
-    #[test]
-    fn run_user_message_enforces_tool_iteration_limit() {
-        futures::executor::block_on(async {
+    #[tokio::test]
+    async fn run_user_message_enforces_tool_iteration_limit() {
             let runtime = AgentRuntime::with_max_tool_iterations(1);
             let mut session = runtime.start_session("session-4");
             let provider = FakeProvider::new(vec![
@@ -694,7 +700,6 @@ mod tests {
                 .await
                 .expect_err("run should fail once the limit is exceeded");
             assert!(matches!(error, AgentError::MaxToolIterationsExceeded(1)));
-        });
     }
 
     #[test]
@@ -832,6 +837,28 @@ mod tests {
 
             Box::pin(futures_util::stream::iter(events))
         }
+    }
+
+    #[tokio::test]
+    async fn blocking_tool_does_not_stall_async_runtime() {
+        let blocking_handle = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            42
+        });
+
+        let async_handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            "done"
+        });
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), async_handle)
+            .await
+            .expect("async task should complete within timeout")
+            .expect("async task should not panic");
+        assert_eq!(result, "done");
+
+        let blocking_result = blocking_handle.await.expect("blocking task should finish");
+        assert_eq!(blocking_result, 42);
     }
 
     fn temp_file_path(label: &str) -> PathBuf {
