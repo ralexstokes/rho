@@ -112,6 +112,7 @@ struct AppState {
 struct SessionState {
     session: Arc<Mutex<AgentSession>>,
     in_flight: Option<JoinHandle<()>>,
+    cancel_epoch: u64,
 }
 
 impl SessionState {
@@ -119,7 +120,34 @@ impl SessionState {
         Self {
             session: Arc::new(Mutex::new(session)),
             in_flight: None,
+            cancel_epoch: 0,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventGate {
+    session_id: String,
+    cancel_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct QueuedServerEnvelope {
+    envelope: ServerEnvelope,
+    gate: Option<EventGate>,
+}
+
+impl QueuedServerEnvelope {
+    fn new(event: ServerEvent) -> Self {
+        Self {
+            envelope: ServerEnvelope::new(event),
+            gate: None,
+        }
+    }
+
+    fn with_gate(mut self, gate: EventGate) -> Self {
+        self.gate = Some(gate);
+        self
     }
 }
 
@@ -129,11 +157,17 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 
 async fn handle_websocket(stream: WebSocket, state: AppState) {
     let (mut sink, mut source) = stream.split();
-    let (outbound_sender, mut outbound_receiver) = mpsc::unbounded_channel::<ServerEnvelope>();
+    let (outbound_sender, mut outbound_receiver) =
+        mpsc::unbounded_channel::<QueuedServerEnvelope>();
+    let sessions = Arc::clone(&state.sessions);
 
     let writer_task = tokio::spawn(async move {
-        while let Some(envelope) = outbound_receiver.recv().await {
-            let payload = match serde_json::to_string(&envelope) {
+        while let Some(queued) = outbound_receiver.recv().await {
+            if !should_forward_event(&sessions, queued.gate.as_ref()).await {
+                continue;
+            }
+
+            let payload = match serde_json::to_string(&queued.envelope) {
                 Ok(payload) => payload,
                 Err(_) => break,
             };
@@ -174,7 +208,7 @@ async fn handle_websocket(stream: WebSocket, state: AppState) {
 
 async fn handle_text_message(
     state: &AppState,
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+    outbound_sender: &mpsc::UnboundedSender<QueuedServerEnvelope>,
     text: &str,
 ) {
     let envelope: ClientEnvelope = match serde_json::from_str(text) {
@@ -208,7 +242,7 @@ async fn handle_text_message(
 
 async fn handle_client_event(
     state: &AppState,
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+    outbound_sender: &mpsc::UnboundedSender<QueuedServerEnvelope>,
     event: ClientEvent,
 ) {
     match event {
@@ -295,6 +329,7 @@ async fn handle_client_event(
             let model = state.model;
             let provider = Arc::clone(&state.provider);
             let session = Arc::clone(&session_state.session);
+            let cancel_epoch = session_state.cancel_epoch;
             let outbound_sender = outbound_sender.clone();
             let sessions = Arc::clone(&state.sessions);
             let cleanup_session_id = session_id.clone();
@@ -308,15 +343,23 @@ async fn handle_client_event(
                             provider.as_ref(),
                             model,
                             user_content,
-                            |event| send_event(&outbound_sender, event),
+                            |event| {
+                                send_event_for_request(
+                                    &outbound_sender,
+                                    cleanup_session_id.as_str(),
+                                    cancel_epoch,
+                                    event,
+                                )
+                            },
                         )
                         .await
                 };
 
                 if let Err(error) = run_result {
-                    send_error(
+                    send_error_for_request(
                         &outbound_sender,
-                        Some(cleanup_session_id.clone()),
+                        cleanup_session_id.as_str(),
+                        cancel_epoch,
                         "runtime_error",
                         error.to_string(),
                     );
@@ -350,6 +393,7 @@ async fn handle_client_event(
             };
 
             if let Some(task) = session_state.in_flight.take() {
+                session_state.cancel_epoch = session_state.cancel_epoch.wrapping_add(1);
                 task.abort();
                 send_error(
                     outbound_sender,
@@ -371,7 +415,7 @@ async fn handle_client_event(
 
 fn get_session_state_mut<'a>(
     sessions: &'a mut HashMap<String, SessionState>,
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+    outbound_sender: &mpsc::UnboundedSender<QueuedServerEnvelope>,
     session_id: &str,
 ) -> Option<&'a mut SessionState> {
     if let Some(session_state) = sessions.get_mut(session_id) {
@@ -400,12 +444,38 @@ fn is_valid_session_id(session_id: &str) -> bool {
     Uuid::try_parse(session_id).is_ok()
 }
 
-fn send_event(outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>, event: ServerEvent) {
-    let _ = outbound_sender.send(ServerEnvelope::new(event));
+async fn should_forward_event(
+    sessions: &Arc<Mutex<HashMap<String, SessionState>>>,
+    gate: Option<&EventGate>,
+) -> bool {
+    let Some(gate) = gate else {
+        return true;
+    };
+
+    let sessions = sessions.lock().await;
+    sessions
+        .get(&gate.session_id)
+        .is_some_and(|session_state| session_state.cancel_epoch == gate.cancel_epoch)
+}
+
+fn send_event(outbound_sender: &mpsc::UnboundedSender<QueuedServerEnvelope>, event: ServerEvent) {
+    let _ = outbound_sender.send(QueuedServerEnvelope::new(event));
+}
+
+fn send_event_for_request(
+    outbound_sender: &mpsc::UnboundedSender<QueuedServerEnvelope>,
+    session_id: &str,
+    cancel_epoch: u64,
+    event: ServerEvent,
+) {
+    let _ = outbound_sender.send(QueuedServerEnvelope::new(event).with_gate(EventGate {
+        session_id: session_id.to_string(),
+        cancel_epoch,
+    }));
 }
 
 fn send_error(
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+    outbound_sender: &mpsc::UnboundedSender<QueuedServerEnvelope>,
     session_id: Option<String>,
     code: impl Into<String>,
     message: impl Into<String>,
@@ -414,6 +484,25 @@ fn send_error(
         outbound_sender,
         ServerEvent::Error(ErrorEvent {
             session_id,
+            code: code.into(),
+            message: message.into(),
+        }),
+    );
+}
+
+fn send_error_for_request(
+    outbound_sender: &mpsc::UnboundedSender<QueuedServerEnvelope>,
+    session_id: &str,
+    cancel_epoch: u64,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) {
+    send_event_for_request(
+        outbound_sender,
+        session_id,
+        cancel_epoch,
+        ServerEvent::Error(ErrorEvent {
+            session_id: Some(session_id.to_string()),
             code: code.into(),
             message: message.into(),
         }),
@@ -444,7 +533,7 @@ mod tests {
         .await;
 
         let envelope = rx.recv().await.expect("expected outbound envelope");
-        let session_id = match envelope.event {
+        let session_id = match envelope.envelope.event {
             ServerEvent::SessionAck(SessionAck { session_id }) => session_id,
             _ => panic!("expected session ack"),
         };
@@ -468,7 +557,7 @@ mod tests {
 
         let envelope = rx.recv().await.expect("expected outbound envelope");
         assert!(matches!(
-            envelope.event,
+            envelope.envelope.event,
             ServerEvent::Error(ErrorEvent { code, .. }) if code == "invalid_session_id"
         ));
         assert!(state.sessions.lock().await.is_empty());
@@ -492,7 +581,7 @@ mod tests {
 
         let envelope = rx.recv().await.expect("expected outbound envelope");
         assert!(matches!(
-            envelope.event,
+            envelope.envelope.event,
             ServerEvent::Error(ErrorEvent { code, .. }) if code == "session_not_found"
         ));
     }
@@ -542,12 +631,12 @@ mod tests {
             .expect("missing second response");
 
         assert!(matches!(
-            first.event,
+            first.envelope.event,
             ServerEvent::AssistantDelta(_)
                 | ServerEvent::ToolStarted(_)
                 | ServerEvent::ToolCompleted(_)
         ));
-        assert!(matches!(second.event, ServerEvent::Final(_)));
+        assert!(matches!(second.envelope.event, ServerEvent::Final(_)));
     }
 
     #[tokio::test]
@@ -589,11 +678,95 @@ mod tests {
                 .expect("timed out waiting for cancel response")
                 .expect("missing cancel response");
 
-            if let ServerEvent::Error(error) = envelope.event {
+            if let ServerEvent::Error(error) = envelope.envelope.event {
                 assert_eq!(error.code, "cancelled");
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn cancel_in_flight_request_increments_cancel_epoch() {
+        let state = test_state(Arc::new(PendingProvider));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session_id = "00000000-0000-4000-8000-00000000000c".to_string();
+
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::StartSession(rho_core::protocol::StartSession {
+                session_id: Some(session_id.clone()),
+            }),
+        )
+        .await;
+        let _ = rx.recv().await;
+
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::UserMessage(rho_core::protocol::UserMessage {
+                session_id: session_id.clone(),
+                message: Message::new(MessageRole::User, "hello"),
+            }),
+        )
+        .await;
+
+        {
+            let sessions = state.sessions.lock().await;
+            let session_state = sessions
+                .get(&session_id)
+                .expect("session should exist after start_session");
+            assert_eq!(session_state.cancel_epoch, 0);
+        }
+
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::Cancel(rho_core::protocol::CancelRequest {
+                session_id: session_id.clone(),
+            }),
+        )
+        .await;
+
+        {
+            let sessions = state.sessions.lock().await;
+            let session_state = sessions
+                .get(&session_id)
+                .expect("session should exist after cancel");
+            assert_eq!(session_state.cancel_epoch, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_gated_events_are_not_forwarded_after_cancel() {
+        let state = test_state(Arc::new(FakeProvider::new(vec![])));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session_id = "00000000-0000-4000-8000-00000000000d".to_string();
+
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::StartSession(rho_core::protocol::StartSession {
+                session_id: Some(session_id.clone()),
+            }),
+        )
+        .await;
+        let _ = rx.recv().await;
+
+        let gate = EventGate {
+            session_id: session_id.clone(),
+            cancel_epoch: 0,
+        };
+        assert!(should_forward_event(&state.sessions, Some(&gate)).await);
+
+        {
+            let mut sessions = state.sessions.lock().await;
+            let session_state = sessions.get_mut(&session_id).expect("session should exist");
+            session_state.cancel_epoch = 1;
+        }
+
+        assert!(!should_forward_event(&state.sessions, Some(&gate)).await);
+        assert!(should_forward_event(&state.sessions, None).await);
     }
 
     fn test_state(provider: Arc<dyn Provider>) -> AppState {
