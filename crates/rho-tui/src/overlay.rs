@@ -87,6 +87,28 @@ struct OverlayEntry {
     hidden: bool,
 }
 
+impl OverlayEntry {
+    fn new(id: u64, lines: Vec<Line<'static>>, options: OverlayOptions) -> Self {
+        let (paragraph, content_width, content_height) = build_overlay_paragraph(lines, &options);
+        Self {
+            id,
+            paragraph,
+            content_width,
+            content_height,
+            options,
+            hidden: false,
+        }
+    }
+
+    fn set_lines(&mut self, lines: Vec<Line<'static>>) {
+        let (paragraph, content_width, content_height) =
+            build_overlay_paragraph(lines, &self.options);
+        self.paragraph = paragraph;
+        self.content_width = content_width;
+        self.content_height = content_height;
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct OverlayStack {
     entries: Vec<OverlayEntry>,
@@ -104,15 +126,7 @@ impl OverlayStack {
     pub fn show(&mut self, lines: Vec<Line<'static>>, options: OverlayOptions) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
-        let (paragraph, content_width, content_height) = build_overlay_paragraph(lines, &options);
-        self.entries.push(OverlayEntry {
-            id,
-            paragraph,
-            content_width,
-            content_height,
-            options,
-            hidden: false,
-        });
+        self.entries.push(OverlayEntry::new(id, lines, options));
         id
     }
 
@@ -120,11 +134,7 @@ impl OverlayStack {
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
             return false;
         };
-        let (paragraph, content_width, content_height) =
-            build_overlay_paragraph(lines, &entry.options);
-        entry.paragraph = paragraph;
-        entry.content_width = content_width;
-        entry.content_height = content_height;
+        entry.set_lines(lines);
         true
     }
 

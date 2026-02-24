@@ -25,6 +25,8 @@ use crate::{
 pub mod anthropic;
 pub mod openai;
 
+const DEFAULT_TOOL_RESULT_CALL_ID: &str = "tool-result";
+
 pub type ProviderStream = Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderError>> + Send>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,11 +259,7 @@ where
 fn to_rig_tool_result_message(content: &str) -> RigMessage {
     let (call_id, output) = match serde_json::from_str::<ToolMessagePayload>(content) {
         Ok(payload) => {
-            let call_id = if payload.call_id.trim().is_empty() {
-                "tool-result".to_string()
-            } else {
-                payload.call_id
-            };
+            let call_id = normalize_tool_result_call_id(payload.call_id);
             let output = serde_json::to_string(&RigToolMessagePayload {
                 is_error: payload.is_error,
                 output: payload.output.as_str(),
@@ -269,7 +267,7 @@ fn to_rig_tool_result_message(content: &str) -> RigMessage {
             .unwrap_or_else(|_| content.to_string());
             (call_id, output)
         }
-        Err(_) => ("tool-result".to_string(), content.to_string()),
+        Err(_) => (DEFAULT_TOOL_RESULT_CALL_ID.to_string(), content.to_string()),
     };
 
     RigMessage::from(RigUserContent::tool_result_with_call_id(
@@ -320,6 +318,14 @@ struct ToolMessagePayload {
 struct RigToolMessagePayload<'a> {
     is_error: bool,
     output: &'a str,
+}
+
+fn normalize_tool_result_call_id(call_id: String) -> String {
+    if call_id.trim().is_empty() {
+        DEFAULT_TOOL_RESULT_CALL_ID.to_string()
+    } else {
+        call_id
+    }
 }
 
 fn is_auth_status(status_code: u16) -> bool {

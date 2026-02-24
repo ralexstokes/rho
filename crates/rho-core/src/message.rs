@@ -54,10 +54,7 @@ pub fn encode_assistant_message_content(
 
 pub fn decode_assistant_message_content(content: &str) -> ParsedAssistantMessageContent {
     if !looks_like_json_object(content) {
-        return ParsedAssistantMessageContent {
-            text: content.to_string(),
-            tool_calls: Vec::new(),
-        };
+        return parsed_plain_text_content(content);
     }
 
     match serde_json::from_str::<AssistantToolCallsPayload>(content) {
@@ -67,10 +64,7 @@ pub fn decode_assistant_message_content(content: &str) -> ParsedAssistantMessage
                 tool_calls: payload.tool_calls,
             }
         }
-        _ => ParsedAssistantMessageContent {
-            text: content.to_string(),
-            tool_calls: Vec::new(),
-        },
+        _ => parsed_plain_text_content(content),
     }
 }
 
@@ -90,10 +84,15 @@ struct AssistantToolCallsPayloadRef<'a> {
     tool_calls: &'a [ToolCall],
 }
 
+fn parsed_plain_text_content(content: &str) -> ParsedAssistantMessageContent {
+    ParsedAssistantMessageContent {
+        text: content.to_string(),
+        tool_calls: Vec::new(),
+    }
+}
+
 fn looks_like_json_object(content: &str) -> bool {
-    content
-        .trim_start_matches(char::is_whitespace)
-        .starts_with('{')
+    content.trim_start().starts_with('{')
 }
 
 #[cfg(test)]
