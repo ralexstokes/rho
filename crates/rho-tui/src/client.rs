@@ -39,6 +39,9 @@ use tokio_tungstenite::{
     tungstenite::{Error as WsError, Message as WsMessage},
 };
 
+const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 32;
+const WS_INBOUND_CHANNEL_CAPACITY: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiClient {
     url: String,
@@ -59,8 +62,8 @@ impl TuiClient {
             .map_err(TuiClientError::Connect)?;
         let (writer, reader) = socket.split();
 
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let (outbound_tx, outbound_rx) = mpsc::channel(WS_OUTBOUND_CHANNEL_CAPACITY);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(WS_INBOUND_CHANNEL_CAPACITY);
 
         tokio::spawn(run_writer(writer, outbound_rx));
         tokio::spawn(run_reader(reader, inbound_tx));
@@ -148,6 +151,8 @@ pub enum TuiClientError {
     SessionInitialization(String),
     #[error("outbound channel is closed")]
     OutboundChannelClosed,
+    #[error("outbound channel is saturated")]
+    OutboundChannelBackpressure,
 }
 
 type WsWriter = futures_util::stream::SplitSink<
@@ -725,7 +730,7 @@ impl AppState {
 
 async fn run_writer(
     mut writer: WsWriter,
-    mut outbound_rx: mpsc::UnboundedReceiver<ClientEvent>,
+    mut outbound_rx: mpsc::Receiver<ClientEvent>,
 ) -> Result<(), TuiClientError> {
     while let Some(event) = outbound_rx.recv().await {
         send_client_event(&mut writer, event).await?;
@@ -735,32 +740,39 @@ async fn run_writer(
 
 async fn run_reader(
     mut reader: WsReader,
-    inbound_tx: mpsc::UnboundedSender<NetworkEvent>,
+    inbound_tx: mpsc::Sender<NetworkEvent>,
 ) -> Result<(), TuiClientError> {
     loop {
         match recv_server_envelope(&mut reader).await {
             Ok(envelope) => {
                 if inbound_tx
                     .send(NetworkEvent::Server(envelope.event))
+                    .await
                     .is_err()
                 {
                     return Ok(());
                 }
             }
             Err(TuiClientError::Closed) => {
-                let _ = inbound_tx.send(NetworkEvent::Closed);
+                let _ = inbound_tx.send(NetworkEvent::Closed).await;
                 return Ok(());
             }
             Err(TuiClientError::Receive(err)) => {
-                let _ = inbound_tx.send(NetworkEvent::ReceiveError(err.to_string()));
+                let _ = inbound_tx
+                    .send(NetworkEvent::ReceiveError(err.to_string()))
+                    .await;
                 return Ok(());
             }
             Err(TuiClientError::Protocol(err)) => {
-                let _ = inbound_tx.send(NetworkEvent::ProtocolError(err.to_string()));
+                let _ = inbound_tx
+                    .send(NetworkEvent::ProtocolError(err.to_string()))
+                    .await;
                 return Ok(());
             }
             Err(other) => {
-                let _ = inbound_tx.send(NetworkEvent::ReceiveError(other.to_string()));
+                let _ = inbound_tx
+                    .send(NetworkEvent::ReceiveError(other.to_string()))
+                    .await;
                 return Ok(());
             }
         }
@@ -768,12 +780,13 @@ async fn run_reader(
 }
 
 fn send_outbound(
-    outbound_tx: &mpsc::UnboundedSender<ClientEvent>,
+    outbound_tx: &mpsc::Sender<ClientEvent>,
     event: ClientEvent,
 ) -> Result<(), TuiClientError> {
-    outbound_tx
-        .send(event)
-        .map_err(|_| TuiClientError::OutboundChannelClosed)
+    outbound_tx.try_send(event).map_err(|error| match error {
+        mpsc::error::TrySendError::Closed(_) => TuiClientError::OutboundChannelClosed,
+        mpsc::error::TrySendError::Full(_) => TuiClientError::OutboundChannelBackpressure,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -984,7 +997,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
 fn handle_terminal_event(
     event: Event,
     app: &mut AppState,
-    outbound_tx: &mpsc::UnboundedSender<ClientEvent>,
+    outbound_tx: &mpsc::Sender<ClientEvent>,
 ) -> Result<bool, TuiClientError> {
     match event {
         Event::Key(key) => handle_key_event(key, app, outbound_tx),
@@ -1017,7 +1030,7 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut AppState) -> Result<bool, Tui
 fn handle_key_event(
     key: KeyEvent,
     app: &mut AppState,
-    outbound_tx: &mpsc::UnboundedSender<ClientEvent>,
+    outbound_tx: &mpsc::Sender<ClientEvent>,
 ) -> Result<bool, TuiClientError> {
     if is_key_release(&key) {
         return Ok(false);
@@ -1229,7 +1242,7 @@ fn handle_key_event(
 
 fn submit_input(
     app: &mut AppState,
-    outbound_tx: &mpsc::UnboundedSender<ClientEvent>,
+    outbound_tx: &mpsc::Sender<ClientEvent>,
 ) -> Result<(), TuiClientError> {
     app.scroll_to_bottom();
     let submission = app.editor.submit();
@@ -1291,7 +1304,7 @@ async fn send_client_event(
 }
 
 async fn wait_for_session_ack(
-    inbound_rx: &mut mpsc::UnboundedReceiver<NetworkEvent>,
+    inbound_rx: &mut mpsc::Receiver<NetworkEvent>,
 ) -> Result<String, TuiClientError> {
     while let Some(network_event) = inbound_rx.recv().await {
         match network_event {
@@ -1469,12 +1482,35 @@ mod tests {
             "session-1".to_string(),
         );
         app.editor.insert_text("hello");
-        let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel();
+        let (outbound_tx, _outbound_rx) = mpsc::channel(WS_OUTBOUND_CHANNEL_CAPACITY);
 
         submit_input(&mut app, &outbound_tx).expect("submit should succeed");
 
         assert!(app.awaiting_assistant);
         assert!(app.active_assistant_line.is_none());
+    }
+
+    #[test]
+    fn send_outbound_returns_backpressure_error_when_channel_is_full() {
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+
+        send_outbound(
+            &outbound_tx,
+            ClientEvent::Cancel(rho_core::protocol::CancelRequest {
+                session_id: "session-1".to_string(),
+            }),
+        )
+        .expect("first send should succeed");
+
+        let error = send_outbound(
+            &outbound_tx,
+            ClientEvent::Cancel(rho_core::protocol::CancelRequest {
+                session_id: "session-1".to_string(),
+            }),
+        )
+        .expect_err("second send should fail when the queue is full");
+
+        assert!(matches!(error, TuiClientError::OutboundChannelBackpressure));
     }
 
     #[test]

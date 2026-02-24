@@ -28,7 +28,9 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::{AgentRuntime, AgentSession};
+use crate::{AgentError, AgentRuntime, AgentSession};
+
+const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 
 #[derive(Clone)]
 pub struct AgentServer {
@@ -129,7 +131,8 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 
 async fn handle_websocket(stream: WebSocket, state: AppState) {
     let (mut sink, mut source) = stream.split();
-    let (outbound_sender, mut outbound_receiver) = mpsc::unbounded_channel::<ServerEnvelope>();
+    let (outbound_sender, mut outbound_receiver) =
+        mpsc::channel::<ServerEnvelope>(WS_OUTBOUND_CHANNEL_CAPACITY);
 
     let writer_task = tokio::spawn(async move {
         while let Some(envelope) = outbound_receiver.recv().await {
@@ -149,21 +152,25 @@ async fn handle_websocket(stream: WebSocket, state: AppState) {
             Ok(Message::Text(text)) => {
                 handle_text_message(&state, &outbound_sender, text.as_str()).await;
             }
-            Ok(Message::Binary(_)) => send_error(
-                &outbound_sender,
-                None,
-                "invalid_message",
-                "binary websocket frames are not supported",
-            ),
+            Ok(Message::Binary(_)) => {
+                let _ = send_error(
+                    &outbound_sender,
+                    None,
+                    "invalid_message",
+                    "binary websocket frames are not supported",
+                )
+                .await;
+            }
             Ok(Message::Ping(_) | Message::Pong(_)) => {}
             Ok(Message::Close(_)) => break,
             Err(error) => {
-                send_error(
+                let _ = send_error(
                     &outbound_sender,
                     None,
                     "websocket_receive_error",
                     format!("failed to receive websocket frame: {error}"),
-                );
+                )
+                .await;
                 break;
             }
         }
@@ -174,24 +181,25 @@ async fn handle_websocket(stream: WebSocket, state: AppState) {
 
 async fn handle_text_message(
     state: &AppState,
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+    outbound_sender: &mpsc::Sender<ServerEnvelope>,
     text: &str,
 ) {
     let envelope: ClientEnvelope = match serde_json::from_str(text) {
         Ok(envelope) => envelope,
         Err(error) => {
-            send_error(
+            let _ = send_error(
                 outbound_sender,
                 None,
                 "invalid_json",
                 format!("invalid client envelope JSON: {error}"),
-            );
+            )
+            .await;
             return;
         }
     };
 
     if envelope.version != PROTOCOL_VERSION {
-        send_error(
+        let _ = send_error(
             outbound_sender,
             None,
             "invalid_protocol_version",
@@ -199,7 +207,8 @@ async fn handle_text_message(
                 "unsupported protocol version {}; expected {}",
                 envelope.version, PROTOCOL_VERSION
             ),
-        );
+        )
+        .await;
         return;
     }
 
@@ -208,7 +217,7 @@ async fn handle_text_message(
 
 async fn handle_client_event(
     state: &AppState,
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+    outbound_sender: &mpsc::Sender<ServerEnvelope>,
     event: ClientEvent,
 ) {
     match event {
@@ -219,22 +228,24 @@ async fn handle_client_event(
                 .unwrap_or_else(|| allocate_session_id(&sessions));
 
             if !is_valid_session_id(&session_id) {
-                send_error(
+                let _ = send_error(
                     outbound_sender,
                     Some(session_id),
                     "invalid_session_id",
                     "session_id must be a UUID",
-                );
+                )
+                .await;
                 return;
             }
 
             if sessions.contains_key(&session_id) {
-                send_error(
+                let _ = send_error(
                     outbound_sender,
                     Some(session_id),
                     "session_exists",
                     "session already exists",
-                );
+                )
+                .await;
                 return;
             }
 
@@ -242,50 +253,59 @@ async fn handle_client_event(
                 session_id.clone(),
                 SessionState::new(state.runtime.start_session(session_id.clone())),
             );
-            send_event(
+            let _ = send_event(
                 outbound_sender,
                 ServerEvent::SessionAck(SessionAck { session_id }),
-            );
+            )
+            .await;
         }
         ClientEvent::UserMessage(user_message) => {
             if user_message.message.role != MessageRole::User {
-                send_error(
+                let _ = send_error(
                     outbound_sender,
                     Some(user_message.session_id),
                     "invalid_message_role",
                     "user_message payload must contain a message with role `user`",
-                );
+                )
+                .await;
                 return;
             }
 
             let session_id = user_message.session_id;
             if !is_valid_session_id(&session_id) {
-                send_error(
+                let _ = send_error(
                     outbound_sender,
                     Some(session_id),
                     "invalid_session_id",
                     "session_id must be a UUID",
-                );
+                )
+                .await;
                 return;
             }
             let user_content = user_message.message.content;
             let mut sessions = state.sessions.lock().await;
 
-            let Some(session_state) =
-                get_session_state_mut(&mut sessions, outbound_sender, &session_id)
-            else {
+            let Some(session_state) = sessions.get_mut(&session_id) else {
+                let _ = send_error(
+                    outbound_sender,
+                    Some(session_id.clone()),
+                    "session_not_found",
+                    "session was not found",
+                )
+                .await;
                 return;
             };
 
             if let Some(handle) = &session_state.in_flight
                 && !handle.is_finished()
             {
-                send_error(
+                let _ = send_error(
                     outbound_sender,
                     Some(session_id),
                     "request_in_flight",
                     "session already has an in-flight request",
-                );
+                )
+                .await;
                 return;
             }
 
@@ -308,18 +328,28 @@ async fn handle_client_event(
                             provider.as_ref(),
                             model,
                             user_content,
-                            |event| send_event(&outbound_sender, event),
+                            |event| {
+                                let outbound_sender = outbound_sender.clone();
+                                async move {
+                                    send_event(&outbound_sender, event)
+                                        .await
+                                        .map_err(|_| AgentError::EventSinkClosed)
+                                }
+                            },
                         )
                         .await
                 };
 
-                if let Err(error) = run_result {
-                    send_error(
+                if let Err(error) = run_result
+                    && !matches!(error, AgentError::EventSinkClosed)
+                {
+                    let _ = send_error(
                         &outbound_sender,
                         Some(cleanup_session_id.clone()),
                         "runtime_error",
                         error.to_string(),
-                    );
+                    )
+                    .await;
                 }
 
                 let mut sessions_guard = sessions.lock().await;
@@ -333,57 +363,47 @@ async fn handle_client_event(
         ClientEvent::Cancel(cancel_request) => {
             let session_id = cancel_request.session_id;
             if !is_valid_session_id(&session_id) {
-                send_error(
+                let _ = send_error(
                     outbound_sender,
                     Some(session_id),
                     "invalid_session_id",
                     "session_id must be a UUID",
-                );
+                )
+                .await;
                 return;
             }
             let mut sessions = state.sessions.lock().await;
 
-            let Some(session_state) =
-                get_session_state_mut(&mut sessions, outbound_sender, &session_id)
-            else {
+            let Some(session_state) = sessions.get_mut(&session_id) else {
+                let _ = send_error(
+                    outbound_sender,
+                    Some(session_id.clone()),
+                    "session_not_found",
+                    "session was not found",
+                )
+                .await;
                 return;
             };
 
             if let Some(task) = session_state.in_flight.take() {
                 task.abort();
-                send_error(
+                let _ = send_error(
                     outbound_sender,
                     Some(session_id),
                     "cancelled",
                     "in-flight request cancelled",
-                );
+                )
+                .await;
             } else {
-                send_error(
+                let _ = send_error(
                     outbound_sender,
                     Some(session_id),
                     "request_not_in_flight",
                     "session has no in-flight request to cancel",
-                );
+                )
+                .await;
             }
         }
-    }
-}
-
-fn get_session_state_mut<'a>(
-    sessions: &'a mut HashMap<String, SessionState>,
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
-    session_id: &str,
-) -> Option<&'a mut SessionState> {
-    if let Some(session_state) = sessions.get_mut(session_id) {
-        Some(session_state)
-    } else {
-        send_error(
-            outbound_sender,
-            Some(session_id.to_string()),
-            "session_not_found",
-            "session was not found",
-        );
-        None
     }
 }
 
@@ -400,16 +420,19 @@ fn is_valid_session_id(session_id: &str) -> bool {
     Uuid::try_parse(session_id).is_ok()
 }
 
-fn send_event(outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>, event: ServerEvent) {
-    let _ = outbound_sender.send(ServerEnvelope::new(event));
+async fn send_event(
+    outbound_sender: &mpsc::Sender<ServerEnvelope>,
+    event: ServerEvent,
+) -> Result<(), mpsc::error::SendError<ServerEnvelope>> {
+    outbound_sender.send(ServerEnvelope::new(event)).await
 }
 
-fn send_error(
-    outbound_sender: &mpsc::UnboundedSender<ServerEnvelope>,
+async fn send_error(
+    outbound_sender: &mpsc::Sender<ServerEnvelope>,
     session_id: Option<String>,
     code: impl Into<String>,
     message: impl Into<String>,
-) {
+) -> Result<(), mpsc::error::SendError<ServerEnvelope>> {
     send_event(
         outbound_sender,
         ServerEvent::Error(ErrorEvent {
@@ -417,7 +440,8 @@ fn send_error(
             code: code.into(),
             message: message.into(),
         }),
-    );
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -440,11 +464,12 @@ mod tests {
 
     type FakeResponse = Vec<Result<ProviderEvent, ProviderError>>;
     type FakeResponseQueue = VecDeque<FakeResponse>;
+    const TEST_OUTBOUND_CHANNEL_CAPACITY: usize = 32;
 
     #[tokio::test]
     async fn start_session_emits_session_ack() {
         let state = test_state(Arc::new(FakeProvider::new(vec![])));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(TEST_OUTBOUND_CHANNEL_CAPACITY);
 
         handle_client_event(
             &state,
@@ -465,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn start_session_with_invalid_id_emits_error() {
         let state = test_state(Arc::new(FakeProvider::new(vec![])));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(TEST_OUTBOUND_CHANNEL_CAPACITY);
 
         handle_client_event(
             &state,
@@ -487,7 +512,7 @@ mod tests {
     #[tokio::test]
     async fn user_message_for_unknown_session_emits_error() {
         let state = test_state(Arc::new(FakeProvider::new(vec![])));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(TEST_OUTBOUND_CHANNEL_CAPACITY);
         let missing_session_id = "00000000-0000-4000-8000-0000000000ff".to_string();
 
         handle_client_event(
@@ -519,7 +544,7 @@ mod tests {
             Ok(ProviderEvent::Finished),
         ]]));
         let state = test_state(provider);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(TEST_OUTBOUND_CHANNEL_CAPACITY);
         let session_id = "00000000-0000-4000-8000-00000000000a".to_string();
 
         handle_client_event(
@@ -563,7 +588,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_in_flight_request_emits_cancelled_error() {
         let state = test_state(Arc::new(PendingProvider));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(TEST_OUTBOUND_CHANNEL_CAPACITY);
         let session_id = "00000000-0000-4000-8000-00000000000b".to_string();
 
         handle_client_event(
@@ -604,6 +629,39 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn send_event_waits_for_capacity_when_buffer_is_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(ServerEnvelope::new(ServerEvent::SessionAck(SessionAck {
+            session_id: "00000000-0000-4000-8000-0000000000cc".to_string(),
+        })))
+        .await
+        .expect("initial send should succeed");
+
+        let send_future = send_event(
+            &tx,
+            ServerEvent::Error(ErrorEvent {
+                session_id: None,
+                code: "backpressure".to_string(),
+                message: "queue is full".to_string(),
+            }),
+        );
+        tokio::pin!(send_future);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut send_future)
+                .await
+                .is_err()
+        );
+
+        let _ = rx.recv().await;
+
+        tokio::time::timeout(Duration::from_secs(1), &mut send_future)
+            .await
+            .expect("send should complete once capacity is available")
+            .expect("channel should remain open");
     }
 
     fn test_state(provider: Arc<dyn Provider>) -> AppState {

@@ -1,5 +1,6 @@
 use std::{
     fs,
+    future::{Future, ready},
     path::{Path, PathBuf},
     process::Command,
     sync::LazyLock,
@@ -74,12 +75,13 @@ impl AgentRuntime {
         let mut emitted_events = Vec::new();
         self.run_user_message_streaming(session, provider, model, user_content, |event| {
             emitted_events.push(event);
+            ready(Ok::<(), AgentError>(()))
         })
         .await?;
         Ok(emitted_events)
     }
 
-    pub async fn run_user_message_streaming<F>(
+    pub async fn run_user_message_streaming<F, Fut>(
         &self,
         session: &mut AgentSession,
         provider: &dyn Provider,
@@ -88,7 +90,8 @@ impl AgentRuntime {
         mut emit_event: F,
     ) -> Result<(), AgentError>
     where
-        F: FnMut(ServerEvent),
+        F: FnMut(ServerEvent) -> Fut,
+        Fut: Future<Output = Result<(), AgentError>>,
     {
         let user_content = user_content.into();
         session
@@ -98,7 +101,7 @@ impl AgentRuntime {
             .await
     }
 
-    async fn run_completion_loop<F>(
+    async fn run_completion_loop<F, Fut>(
         &self,
         session: &mut AgentSession,
         provider: &dyn Provider,
@@ -106,7 +109,8 @@ impl AgentRuntime {
         emit_event: &mut F,
     ) -> Result<(), AgentError>
     where
-        F: FnMut(ServerEvent),
+        F: FnMut(ServerEvent) -> Fut,
+        Fut: Future<Output = Result<(), AgentError>>,
     {
         let session_id = session.id.clone();
         let builtin_tools = builtin_tool_definitions();
@@ -127,20 +131,24 @@ impl AgentRuntime {
                         emit_event(ServerEvent::AssistantDelta(AssistantDelta {
                             session_id: session_id.clone(),
                             delta,
-                        }));
+                        }))
+                        .await?;
                     }
                     ProviderEvent::ToolCall { call } => {
                         emit_event(ServerEvent::ToolStarted(ToolStarted {
                             session_id: session_id.clone(),
                             call: call.clone(),
-                        }));
+                        }))
+                        .await?;
                         let result = execute_builtin_tool(&call);
                         assistant_tool_calls.push(call);
 
-                        push_tool_result_event(emit_event, &session_id, result, &mut tool_messages);
+                        push_tool_result_event(emit_event, &session_id, result, &mut tool_messages)
+                            .await?;
                     }
                     ProviderEvent::ToolResult { result } => {
-                        push_tool_result_event(emit_event, &session_id, result, &mut tool_messages);
+                        push_tool_result_event(emit_event, &session_id, result, &mut tool_messages)
+                            .await?;
                     }
                     ProviderEvent::Message { message } => {
                         if message.role == MessageRole::Assistant {
@@ -165,7 +173,8 @@ impl AgentRuntime {
                 emit_event(ServerEvent::Final(FinalMessage {
                     session_id: session_id.clone(),
                     message: assistant_message,
-                }));
+                }))
+                .await?;
                 return Ok(());
             }
 
@@ -204,25 +213,30 @@ pub enum AgentError {
     Provider(#[from] ProviderError),
     #[error("maximum tool iterations exceeded ({0})")]
     MaxToolIterationsExceeded(usize),
+    #[error("event sink is closed")]
+    EventSinkClosed,
 }
 
 fn max_tool_iterations_error(max_tool_iterations: usize) -> AgentError {
     AgentError::MaxToolIterationsExceeded(max_tool_iterations)
 }
 
-fn push_tool_result_event<F>(
+async fn push_tool_result_event<F, Fut>(
     emit_event: &mut F,
     session_id: &str,
     result: ToolResult,
     tool_messages: &mut Vec<Message>,
-) where
-    F: FnMut(ServerEvent),
+) -> Result<(), AgentError>
+where
+    F: FnMut(ServerEvent) -> Fut,
+    Fut: Future<Output = Result<(), AgentError>>,
 {
     tool_messages.push(tool_result_to_message(&result));
     emit_event(ServerEvent::ToolCompleted(ToolCompleted {
         session_id: session_id.to_string(),
         result,
-    }));
+    }))
+    .await
 }
 
 static BUILTIN_TOOL_DEFINITIONS: LazyLock<Vec<ToolDefinition>> = LazyLock::new(|| {
