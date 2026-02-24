@@ -10,7 +10,6 @@ use crate::{
 };
 use ratatui::text::{Line, Span};
 use rho_core::protocol::{ErrorEvent, ServerEvent};
-use tracing::{info, trace, warn};
 
 use super::network::NetworkEvent;
 
@@ -231,28 +230,14 @@ impl AppState {
     pub(super) fn handle_network_event(&mut self, event: NetworkEvent) -> bool {
         match event {
             NetworkEvent::Server(server_event) => match server_event {
-                ServerEvent::SessionAck(ack) => {
-                    trace!(session_id = %ack.session_id, "received session ack");
-                    false
-                }
+                ServerEvent::SessionAck(_) => false,
                 ServerEvent::AssistantDelta(delta) => {
-                    trace!(
-                        session_id = %delta.session_id,
-                        delta_chars = delta.delta.chars().count(),
-                        "received assistant delta"
-                    );
                     self.awaiting_assistant = false;
                     self.append_assistant_delta(delta.delta.as_str());
                     true
                 }
                 ServerEvent::ToolStarted(tool_started) => {
                     let call = tool_started.call;
-                    info!(
-                        session_id = %tool_started.session_id,
-                        call_id = %call.call_id,
-                        tool_name = %call.name,
-                        "tool started"
-                    );
                     self.tool_call_names
                         .insert(call.call_id.clone(), call.name.clone());
                     self.push_tool_line(format_tool_started(&call), call.call_id, call.name, true);
@@ -260,12 +245,6 @@ impl AppState {
                 }
                 ServerEvent::ToolCompleted(tool_completed) => {
                     let result = tool_completed.result;
-                    info!(
-                        session_id = %tool_completed.session_id,
-                        call_id = %result.call_id,
-                        is_error = result.is_error,
-                        "tool completed"
-                    );
                     let tool_name = self
                         .tool_call_names
                         .remove(result.call_id.as_str())
@@ -279,43 +258,29 @@ impl AppState {
                     true
                 }
                 ServerEvent::Final(final_message) => {
-                    info!(
-                        session_id = %final_message.session_id,
-                        content_chars = final_message.message.content.chars().count(),
-                        "received final assistant message"
-                    );
                     self.awaiting_assistant = false;
                     self.finalize_assistant(final_message.message.content);
                     true
                 }
                 ServerEvent::Error(error) => {
-                    warn!(
-                        session_id = ?error.session_id,
-                        code = %error.code,
-                        message_chars = error.message.chars().count(),
-                        "received server error event"
-                    );
                     self.awaiting_assistant = false;
                     self.push_error(format_error(&error));
                     true
                 }
             },
             NetworkEvent::Closed => {
-                warn!("websocket closed unexpectedly");
                 self.awaiting_assistant = false;
                 self.push_error("websocket closed unexpectedly".to_string());
                 self.should_quit = true;
                 true
             }
             NetworkEvent::ReceiveError(err) => {
-                warn!(error = %err, "websocket receive failed");
                 self.awaiting_assistant = false;
                 self.push_error(err);
                 self.should_quit = true;
                 true
             }
             NetworkEvent::ProtocolError(err) => {
-                warn!(error = %err, "protocol error from websocket stream");
                 self.awaiting_assistant = false;
                 self.push_error(err);
                 self.should_quit = true;
