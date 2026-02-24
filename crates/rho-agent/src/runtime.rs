@@ -134,7 +134,7 @@ impl AgentRuntime {
                             session_id: session_id.clone(),
                             call: call.clone(),
                         }));
-                        let result = execute_builtin_tool(&call);
+                        let result = execute_builtin_tool(call.clone()).await;
                         assistant_tool_calls.push(call);
 
                         push_tool_result_event(emit_event, &session_id, result, &mut tool_messages);
@@ -290,11 +290,26 @@ fn builtin_tool_definitions() -> &'static [ToolDefinition] {
     BUILTIN_TOOL_DEFINITIONS.as_slice()
 }
 
-fn execute_builtin_tool(call: &ToolCall) -> ToolResult {
+async fn execute_builtin_tool(call: ToolCall) -> ToolResult {
+    let call_id = call.call_id.clone();
+
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => match handle
+            .spawn_blocking(move || execute_builtin_tool_blocking(call))
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => tool_error(&call_id, format!("tool execution task failed: {error}")),
+        },
+        Err(_) => execute_builtin_tool_blocking(call),
+    }
+}
+
+fn execute_builtin_tool_blocking(call: ToolCall) -> ToolResult {
     match call.name.as_str() {
-        "read" => read_tool(call),
-        "write" => write_tool(call),
-        "bash" => bash_tool(call),
+        "read" => read_tool(&call),
+        "write" => write_tool(&call),
+        "bash" => bash_tool(&call),
         _ => tool_error(
             &call.call_id,
             format!(
@@ -458,7 +473,7 @@ mod tests {
     use std::{
         collections::VecDeque,
         sync::{Arc, Mutex},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use rho_core::{
@@ -695,6 +710,57 @@ mod tests {
                 .expect_err("run should fail once the limit is exceeded");
             assert!(matches!(error, AgentError::MaxToolIterationsExceeded(1)));
         });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_tool_execution_does_not_stall_runtime_progress() {
+        let runtime = AgentRuntime::new();
+        let mut session = runtime.start_session("session-6");
+        let provider = FakeProvider::new(vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: None,
+                        call_id: "call-5".to_string(),
+                        name: "bash".to_string(),
+                        input: json!({ "command": "sleep 0.5" }),
+                    },
+                }),
+                Ok(ProviderEvent::Message {
+                    message: Message::new(MessageRole::Assistant, ""),
+                }),
+                Ok(ProviderEvent::Finished),
+            ],
+            vec![
+                Ok(ProviderEvent::Message {
+                    message: Message::new(MessageRole::Assistant, "done"),
+                }),
+                Ok(ProviderEvent::Finished),
+            ],
+        ]);
+
+        let runtime_task = tokio::spawn(async move {
+            runtime
+                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "run slow tool")
+                .await
+        });
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::time::sleep(Duration::from_millis(50)),
+        )
+        .await
+        .expect("async progress should not be blocked by tool execution");
+
+        let events = runtime_task
+            .await
+            .expect("runtime task should join successfully")
+            .expect("runtime execution should succeed");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ServerEvent::Final(_)))
+        );
     }
 
     #[test]
