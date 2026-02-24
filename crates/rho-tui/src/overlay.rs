@@ -336,7 +336,7 @@ fn apply_offset(value: u16, offset: i16) -> u16 {
     if offset.is_negative() {
         value.saturating_sub(offset.unsigned_abs())
     } else {
-        value.saturating_add(offset as u16)
+        value.saturating_add(offset.unsigned_abs())
     }
 }
 

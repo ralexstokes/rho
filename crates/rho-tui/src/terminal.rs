@@ -9,7 +9,6 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 pub struct ProcessTerminal {
     terminal: Terminal<CrosstermBackend<Stdout>>,
-    kitty_protocol_active: bool,
 }
 
 impl ProcessTerminal {
@@ -19,15 +18,11 @@ impl ProcessTerminal {
         let mut stdout = stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         stdout.write_all(b"\x1b[?2004h")?;
-        stdout.write_all(b"\x1b[?u")?;
         stdout.flush()?;
 
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
-        Ok(Self {
-            terminal,
-            kitty_protocol_active: false,
-        })
+        Ok(Self { terminal })
     }
 
     pub fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
@@ -55,9 +50,6 @@ impl ProcessTerminal {
 
 impl Drop for ProcessTerminal {
     fn drop(&mut self) {
-        if self.kitty_protocol_active {
-            let _ = self.terminal.backend_mut().write_all(b"\x1b[<u");
-        }
         let _ = self.terminal.backend_mut().write_all(b"\x1b[?2004l");
         let _ = self.terminal.backend_mut().flush();
         let _ = disable_raw_mode();

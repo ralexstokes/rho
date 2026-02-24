@@ -422,24 +422,14 @@ fn send_error(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::VecDeque,
-        sync::{Arc, Mutex as StdMutex},
-        time::Duration,
-    };
+    use std::{sync::Arc, time::Duration};
 
-    use rho_core::{
-        Message,
-        providers::{ModelKind, ProviderError, ProviderRequest, ProviderStream},
-        stream::ProviderEvent,
-    };
+    use rho_core::{Message, providers::ModelKind, stream::ProviderEvent};
     use tokio::sync::mpsc;
     use uuid::Uuid;
 
     use super::*;
-
-    type FakeResponse = Vec<Result<ProviderEvent, ProviderError>>;
-    type FakeResponseQueue = VecDeque<FakeResponse>;
+    use crate::test_helpers::{FakeProvider, PendingProvider};
 
     #[tokio::test]
     async fn start_session_emits_session_ack() {
@@ -612,48 +602,6 @@ mod tests {
             provider,
             model: ModelKind::Gpt52,
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    struct FakeProvider {
-        responses: Arc<StdMutex<FakeResponseQueue>>,
-    }
-
-    impl FakeProvider {
-        fn new(responses: Vec<FakeResponse>) -> Self {
-            Self {
-                responses: Arc::new(StdMutex::new(responses.into_iter().collect())),
-            }
-        }
-    }
-
-    impl Provider for FakeProvider {
-        fn kind(&self) -> ProviderKind {
-            ProviderKind::OpenAi
-        }
-
-        fn stream(&self, _request: ProviderRequest<'_>) -> ProviderStream {
-            let events = self
-                .responses
-                .lock()
-                .expect("responses mutex should be available")
-                .pop_front()
-                .unwrap_or_default();
-            Box::pin(futures_util::stream::iter(events))
-        }
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    struct PendingProvider;
-
-    impl Provider for PendingProvider {
-        fn kind(&self) -> ProviderKind {
-            ProviderKind::OpenAi
-        }
-
-        fn stream(&self, _request: ProviderRequest<'_>) -> ProviderStream {
-            Box::pin(futures_util::stream::pending())
         }
     }
 }

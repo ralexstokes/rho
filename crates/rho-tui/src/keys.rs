@@ -14,10 +14,8 @@ impl Key {
     pub const DOWN: &'static str = "down";
     pub const HOME: &'static str = "home";
     pub const END: &'static str = "end";
-
-    pub fn ctrl(ch: char) -> String {
-        format!("ctrl+{}", ch.to_ascii_lowercase())
-    }
+    pub const CTRL_C: &'static str = "ctrl+c";
+    pub const CTRL_T: &'static str = "ctrl+t";
 }
 
 pub fn is_key_release(event: &KeyEvent) -> bool {
