@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rho_core::providers::{Provider, ProviderKind, ProviderRequest, ProviderStream};
+use rho_core::providers::{ProviderRequest, ProviderStream};
 
 pub type FakeResponse =
     Vec<Result<rho_core::stream::ProviderEvent, rho_core::providers::ProviderError>>;
@@ -46,12 +46,8 @@ impl RecordedRequest {
     }
 }
 
-impl Provider for FakeProvider {
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::OpenAi
-    }
-
-    fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
+impl FakeProvider {
+    pub fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
         self.requests
             .lock()
             .expect("requests mutex should be available")
@@ -71,12 +67,8 @@ impl Provider for FakeProvider {
 #[derive(Debug, Clone, Copy)]
 pub struct PendingProvider;
 
-impl Provider for PendingProvider {
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::OpenAi
-    }
-
-    fn stream(&self, _request: ProviderRequest<'_>) -> ProviderStream {
+impl PendingProvider {
+    pub fn stream(&self, _request: ProviderRequest<'_>) -> ProviderStream {
         ProviderStream::from_stream(futures_util::stream::pending())
     }
 }

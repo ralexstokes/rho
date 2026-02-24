@@ -34,6 +34,9 @@ const DEFAULT_TOOL_RESULT_CALL_ID: &str = "tool-result";
 pub type ProviderEventStream =
     Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderError>> + Send>>;
 
+pub type ProviderStreamFactory =
+    dyn for<'a> Fn(ProviderRequest<'a>) -> ProviderStream + Send + Sync;
+
 #[derive(Clone)]
 pub struct ProviderCancelHandle {
     cancel: Arc<dyn Fn() + Send + Sync>,
@@ -417,12 +420,6 @@ fn normalize_tool_result_call_id(call_id: String) -> String {
 
 fn is_auth_status(status_code: u16) -> bool {
     status_code == 401 || status_code == 403
-}
-
-pub trait Provider: Send + Sync {
-    fn kind(&self) -> ProviderKind;
-
-    fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream;
 }
 
 #[cfg(test)]

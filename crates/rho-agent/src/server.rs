@@ -24,8 +24,8 @@ use rho_core::{
         SessionAck,
     },
     providers::{
-        ModelKind, Provider, ProviderKind, ProviderStream, anthropic::AnthropicProvider,
-        openai::OpenAiProvider,
+        ModelKind, ProviderKind, ProviderStream, ProviderStreamFactory,
+        anthropic::AnthropicProvider, openai::OpenAiProvider,
     },
 };
 use thiserror::Error;
@@ -44,7 +44,11 @@ pub struct AgentServer {
 }
 
 impl AgentServer {
-    pub fn new(runtime: AgentRuntime, provider: Arc<dyn Provider>, model: ModelKind) -> Self {
+    pub fn new(
+        runtime: AgentRuntime,
+        provider: Arc<ProviderStreamFactory>,
+        model: ModelKind,
+    ) -> Self {
         let state = AppState {
             runtime,
             provider,
@@ -99,10 +103,16 @@ pub enum AgentServerError {
     },
 }
 
-pub fn build_provider(kind: ProviderKind) -> Result<Arc<dyn Provider>, AgentServerError> {
+pub fn build_provider(kind: ProviderKind) -> Result<Arc<ProviderStreamFactory>, AgentServerError> {
     match kind {
-        ProviderKind::OpenAi => Ok(Arc::new(OpenAiProvider::new())),
-        ProviderKind::Anthropic => Ok(Arc::new(AnthropicProvider::new())),
+        ProviderKind::OpenAi => {
+            let provider = OpenAiProvider::new();
+            Ok(Arc::new(move |request| provider.stream(request)))
+        }
+        ProviderKind::Anthropic => {
+            let provider = AnthropicProvider::new();
+            Ok(Arc::new(move |request| provider.stream(request)))
+        }
         _ => Err(AgentServerError::UnsupportedProviderKind(format!(
             "{kind:?}"
         ))),
@@ -112,7 +122,7 @@ pub fn build_provider(kind: ProviderKind) -> Result<Arc<dyn Provider>, AgentServ
 #[derive(Clone)]
 struct AppState {
     runtime: AgentRuntime,
-    provider: Arc<dyn Provider>,
+    provider: Arc<ProviderStreamFactory>,
     model: ModelKind,
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
 }
@@ -597,7 +607,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_session_emits_session_ack() {
-        let state = test_state(Arc::new(FakeProvider::new(vec![])));
+        let state = test_state(fake_provider_stream_factory(FakeProvider::new(vec![])));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         handle_client_event(
@@ -618,7 +628,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_session_with_invalid_id_emits_error() {
-        let state = test_state(Arc::new(FakeProvider::new(vec![])));
+        let state = test_state(fake_provider_stream_factory(FakeProvider::new(vec![])));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         handle_client_event(
@@ -640,7 +650,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_message_for_unknown_session_emits_error() {
-        let state = test_state(Arc::new(FakeProvider::new(vec![])));
+        let state = test_state(fake_provider_stream_factory(FakeProvider::new(vec![])));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let missing_session_id = "00000000-0000-4000-8000-0000000000ff".to_string();
 
@@ -663,7 +673,7 @@ mod tests {
 
     #[tokio::test]
     async fn user_message_streams_assistant_events() {
-        let provider = Arc::new(FakeProvider::new(vec![vec![
+        let provider = FakeProvider::new(vec![vec![
             Ok(ProviderEvent::AssistantDelta {
                 delta: "hello".to_string(),
             }),
@@ -671,8 +681,8 @@ mod tests {
                 message: Message::new(MessageRole::Assistant, "hello"),
             }),
             Ok(ProviderEvent::Finished),
-        ]]));
-        let state = test_state(provider);
+        ]]);
+        let state = test_state(fake_provider_stream_factory(provider));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let session_id = "00000000-0000-4000-8000-00000000000a".to_string();
 
@@ -716,7 +726,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_in_flight_request_emits_cancelled_error() {
-        let state = test_state(Arc::new(PendingProvider));
+        let state = test_state(pending_provider_stream_factory(PendingProvider));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let session_id = "00000000-0000-4000-8000-00000000000b".to_string();
 
@@ -764,11 +774,11 @@ mod tests {
     async fn cancel_invokes_provider_cancel_handle() {
         let stream_started = Arc::new(AtomicBool::new(false));
         let stream_cancelled = Arc::new(AtomicBool::new(false));
-        let provider = Arc::new(CancellablePendingProvider {
+        let provider = CancellablePendingProvider {
             stream_started: Arc::clone(&stream_started),
             stream_cancelled: Arc::clone(&stream_cancelled),
-        });
-        let state = test_state(provider);
+        };
+        let state = test_state(cancellable_provider_stream_factory(provider));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let session_id = "00000000-0000-4000-8000-00000000000c".to_string();
 
@@ -849,7 +859,7 @@ mod tests {
         ));
     }
 
-    fn test_state(provider: Arc<dyn Provider>) -> AppState {
+    fn test_state(provider: Arc<ProviderStreamFactory>) -> AppState {
         AppState {
             runtime: AgentRuntime::new(),
             provider,
@@ -868,11 +878,7 @@ mod tests {
         stream_cancelled: Arc<AtomicBool>,
     }
 
-    impl Provider for CancellablePendingProvider {
-        fn kind(&self) -> ProviderKind {
-            ProviderKind::OpenAi
-        }
-
+    impl CancellablePendingProvider {
         fn stream(&self, _request: rho_core::providers::ProviderRequest<'_>) -> ProviderStream {
             self.stream_started.store(true, Ordering::SeqCst);
             let stream_cancelled = Arc::clone(&self.stream_cancelled);
@@ -884,5 +890,19 @@ mod tests {
                 cancel_handle,
             )
         }
+    }
+
+    fn fake_provider_stream_factory(provider: FakeProvider) -> Arc<ProviderStreamFactory> {
+        Arc::new(move |request| provider.stream(request))
+    }
+
+    fn pending_provider_stream_factory(provider: PendingProvider) -> Arc<ProviderStreamFactory> {
+        Arc::new(move |request| provider.stream(request))
+    }
+
+    fn cancellable_provider_stream_factory(
+        provider: CancellablePendingProvider,
+    ) -> Arc<ProviderStreamFactory> {
+        Arc::new(move |request| provider.stream(request))
     }
 }

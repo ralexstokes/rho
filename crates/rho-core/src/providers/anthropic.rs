@@ -9,8 +9,8 @@ use rig::{
 use crate::{
     Message, MessageRole,
     providers::{
-        Provider, ProviderCancelHandle, ProviderError, ProviderKind, ProviderRequest,
-        ProviderStream, apply_common_request_options, map_rig_completion_error, map_rig_http_error,
+        ProviderCancelHandle, ProviderError, ProviderRequest, ProviderStream,
+        apply_common_request_options, map_rig_completion_error, map_rig_http_error,
         map_streamed_assistant_chunk, rig_choice_text, to_rig_chat_request, validate_api_key,
     },
     stream::ProviderEvent,
@@ -45,12 +45,8 @@ impl AnthropicProvider {
     }
 }
 
-impl Provider for AnthropicProvider {
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::Anthropic
-    }
-
-    fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
+impl AnthropicProvider {
+    pub fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
         let rig_request = to_rig_chat_request(request);
         let client = self.client();
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();

@@ -12,7 +12,7 @@ use rho_core::{
     protocol::{
         AssistantDelta, FinalMessage, PROTOCOL_VERSION, ServerEvent, ToolCompleted, ToolStarted,
     },
-    providers::{ModelKind, Provider, ProviderError, ProviderRequest, ProviderStream},
+    providers::{ModelKind, ProviderError, ProviderRequest, ProviderStream},
     stream::ProviderEvent,
     tool::{ToolCall, ToolDefinition, ToolResult},
 };
@@ -63,36 +63,40 @@ impl AgentRuntime {
         }
     }
 
-    pub async fn run_user_message(
+    pub async fn run_user_message<P>(
         &self,
         session: &mut AgentSession,
-        provider: &dyn Provider,
+        provider_stream: &P,
         model: ModelKind,
         user_content: impl Into<String>,
-    ) -> Result<Vec<ServerEvent>, AgentError> {
+    ) -> Result<Vec<ServerEvent>, AgentError>
+    where
+        P: for<'a> Fn(ProviderRequest<'a>) -> ProviderStream + ?Sized,
+    {
         let user_content = user_content.into();
         let mut emitted_events = Vec::new();
-        self.run_user_message_streaming(session, provider, model, user_content, |event| {
+        self.run_user_message_streaming(session, provider_stream, model, user_content, |event| {
             emitted_events.push(event);
         })
         .await?;
         Ok(emitted_events)
     }
 
-    pub async fn run_user_message_streaming<F>(
+    pub async fn run_user_message_streaming<P, F>(
         &self,
         session: &mut AgentSession,
-        provider: &dyn Provider,
+        provider_stream: &P,
         model: ModelKind,
         user_content: impl Into<String>,
         mut emit_event: F,
     ) -> Result<(), AgentError>
     where
+        P: for<'a> Fn(ProviderRequest<'a>) -> ProviderStream + ?Sized,
         F: FnMut(ServerEvent),
     {
         self.run_user_message_streaming_with_observer(
             session,
-            provider,
+            provider_stream,
             model,
             user_content,
             &mut emit_event,
@@ -101,16 +105,17 @@ impl AgentRuntime {
         .await
     }
 
-    pub async fn run_user_message_streaming_with_observer<F, O>(
+    pub async fn run_user_message_streaming_with_observer<P, F, O>(
         &self,
         session: &mut AgentSession,
-        provider: &dyn Provider,
+        provider_stream: &P,
         model: ModelKind,
         user_content: impl Into<String>,
         mut emit_event: F,
         mut observe_provider_stream: O,
     ) -> Result<(), AgentError>
     where
+        P: for<'a> Fn(ProviderRequest<'a>) -> ProviderStream + ?Sized,
         F: FnMut(ServerEvent),
         O: FnMut(&ProviderStream),
     {
@@ -120,7 +125,7 @@ impl AgentRuntime {
             .push(Message::new(MessageRole::User, user_content));
         self.run_completion_loop(
             session,
-            provider,
+            provider_stream,
             model,
             &mut emit_event,
             &mut observe_provider_stream,
@@ -128,15 +133,16 @@ impl AgentRuntime {
         .await
     }
 
-    async fn run_completion_loop<F, O>(
+    async fn run_completion_loop<P, F, O>(
         &self,
         session: &mut AgentSession,
-        provider: &dyn Provider,
+        provider_stream: &P,
         model: ModelKind,
         emit_event: &mut F,
         observe_provider_stream: &mut O,
     ) -> Result<(), AgentError>
     where
+        P: for<'a> Fn(ProviderRequest<'a>) -> ProviderStream + ?Sized,
         F: FnMut(ServerEvent),
         O: FnMut(&ProviderStream),
     {
@@ -145,7 +151,7 @@ impl AgentRuntime {
 
         for iteration in 0..=self.max_tool_iterations {
             let request = ProviderRequest::new(model, session.messages()).with_tools(builtin_tools);
-            let mut stream = provider.stream(request);
+            let mut stream = provider_stream(request);
             observe_provider_stream(&stream);
 
             let mut assistant_message = None;
@@ -495,7 +501,7 @@ mod tests {
 
     use rho_core::{
         message::decode_assistant_message_content,
-        providers::{ModelKind, ProviderKind, ProviderRequest, ProviderStream},
+        providers::{ModelKind, ProviderRequest, ProviderStream},
         tool::ToolCall,
     };
     use serde_json::{Value, json};
@@ -517,9 +523,10 @@ mod tests {
                 }),
                 Ok(ProviderEvent::Finished),
             ]]);
+            let provider_stream = |request: ProviderRequest<'_>| provider.stream(request);
 
             let events = runtime
-                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "hi")
+                .run_user_message(&mut session, &provider_stream, ModelKind::Gpt52, "hi")
                 .await
                 .expect("run should succeed");
 
@@ -586,9 +593,15 @@ mod tests {
                     Ok(ProviderEvent::Finished),
                 ],
             ]);
+            let provider_stream = |request: ProviderRequest<'_>| provider.stream(request);
 
             let events = runtime
-                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "read the file")
+                .run_user_message(
+                    &mut session,
+                    &provider_stream,
+                    ModelKind::Gpt52,
+                    "read the file",
+                )
                 .await
                 .expect("run should succeed");
 
@@ -668,9 +681,15 @@ mod tests {
                     Ok(ProviderEvent::Finished),
                 ],
             ]);
+            let provider_stream = |request: ProviderRequest<'_>| provider.stream(request);
 
             let events = runtime
-                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "do something")
+                .run_user_message(
+                    &mut session,
+                    &provider_stream,
+                    ModelKind::Gpt52,
+                    "do something",
+                )
                 .await
                 .expect("run should continue after tool failure");
 
@@ -718,9 +737,10 @@ mod tests {
                     Ok(ProviderEvent::Finished),
                 ],
             ]);
+            let provider_stream = |request: ProviderRequest<'_>| provider.stream(request);
 
             let error = runtime
-                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "loop")
+                .run_user_message(&mut session, &provider_stream, ModelKind::Gpt52, "loop")
                 .await
                 .expect_err("run should fail once the limit is exceeded");
             assert!(matches!(error, AgentError::MaxToolIterationsExceeded(1)));
@@ -733,9 +753,10 @@ mod tests {
             let runtime = AgentRuntime::new();
             let mut session = runtime.start_session("session-5");
             let provider = PointerRecordingProvider::new(vec![vec![Ok(ProviderEvent::Finished)]]);
+            let provider_stream = |request: ProviderRequest<'_>| provider.stream(request);
 
             runtime
-                .run_user_message(&mut session, &provider, ModelKind::Gpt52, "hello")
+                .run_user_message(&mut session, &provider_stream, ModelKind::Gpt52, "hello")
                 .await
                 .expect("run should succeed");
 
@@ -780,11 +801,7 @@ mod tests {
         }
     }
 
-    impl Provider for PointerRecordingProvider {
-        fn kind(&self) -> ProviderKind {
-            ProviderKind::OpenAi
-        }
-
+    impl PointerRecordingProvider {
         fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
             self.request_pointers
                 .lock()
