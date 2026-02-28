@@ -6,6 +6,7 @@ use std::{
 use rho_core::providers::{
     CancellationToken, Provider, ProviderKind, ProviderRequest, ProviderStream,
 };
+use tokio::sync::Notify;
 
 pub type FakeResponse =
     Vec<Result<rho_core::stream::ProviderEvent, rho_core::providers::ProviderError>>;
@@ -80,5 +81,60 @@ impl Provider for PendingProvider {
 
     fn stream(&self, _request: ProviderRequest<'_>, _cancel: CancellationToken) -> ProviderStream {
         Box::pin(futures_util::stream::pending())
+    }
+}
+
+/// A provider that yields queued events then blocks until the cancellation
+/// token fires, allowing tests to verify cancellation behavior deterministically.
+///
+/// When all events for a stream call have been yielded, the provider signals
+/// via [`blocked()`](Self::blocked) and waits for cancellation.
+#[derive(Debug, Clone)]
+pub struct CancellableProvider {
+    responses: Arc<Mutex<FakeResponseQueue>>,
+    blocked: Arc<Notify>,
+}
+
+impl CancellableProvider {
+    pub fn new(responses: Vec<FakeResponse>) -> Self {
+        Self {
+            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+            blocked: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Returns a handle that is notified each time the provider exhausts its
+    /// queued events and begins waiting for cancellation.
+    pub fn blocked(&self) -> Arc<Notify> {
+        self.blocked.clone()
+    }
+}
+
+impl Provider for CancellableProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAi
+    }
+
+    fn stream(&self, _request: ProviderRequest<'_>, cancel: CancellationToken) -> ProviderStream {
+        let events = self
+            .responses
+            .lock()
+            .expect("responses mutex should be available")
+            .pop_front()
+            .unwrap_or_default();
+
+        let blocked = self.blocked.clone();
+        Box::pin(futures_util::stream::unfold(
+            (VecDeque::from(events), cancel, blocked),
+            |(mut events, cancel, blocked)| async {
+                if let Some(event) = events.pop_front() {
+                    Some((event, (events, cancel, blocked)))
+                } else {
+                    blocked.notify_one();
+                    cancel.cancelled().await;
+                    None
+                }
+            },
+        ))
     }
 }
