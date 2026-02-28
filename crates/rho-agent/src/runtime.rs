@@ -12,7 +12,7 @@ use rho_core::{
     protocol::{
         AssistantDelta, FinalMessage, PROTOCOL_VERSION, ServerEvent, ToolCompleted, ToolStarted,
     },
-    providers::{ModelKind, Provider, ProviderError, ProviderRequest},
+    providers::{CancellationToken, ModelKind, Provider, ProviderError, ProviderRequest},
     stream::ProviderEvent,
     tool::{ToolCall, ToolDefinition, ToolResult},
 };
@@ -72,7 +72,8 @@ impl AgentRuntime {
     ) -> Result<Vec<ServerEvent>, AgentError> {
         let user_content = user_content.into();
         let mut emitted_events = Vec::new();
-        self.run_user_message_streaming(session, provider, model, user_content, |event| {
+        let cancel = CancellationToken::new();
+        self.run_user_message_streaming(session, provider, model, user_content, cancel, |event| {
             emitted_events.push(event);
         })
         .await?;
@@ -85,6 +86,7 @@ impl AgentRuntime {
         provider: &dyn Provider,
         model: ModelKind,
         user_content: impl Into<String>,
+        cancel: CancellationToken,
         mut emit_event: F,
     ) -> Result<(), AgentError>
     where
@@ -94,7 +96,7 @@ impl AgentRuntime {
         session
             .messages
             .push(Message::new(MessageRole::User, user_content));
-        self.run_completion_loop(session, provider, model, &mut emit_event)
+        self.run_completion_loop(session, provider, model, &cancel, &mut emit_event)
             .await
     }
 
@@ -103,6 +105,7 @@ impl AgentRuntime {
         session: &mut AgentSession,
         provider: &dyn Provider,
         model: ModelKind,
+        cancel: &CancellationToken,
         emit_event: &mut F,
     ) -> Result<(), AgentError>
     where
@@ -113,7 +116,7 @@ impl AgentRuntime {
 
         for iteration in 0..=self.max_tool_iterations {
             let request = ProviderRequest::new(model, session.messages()).with_tools(builtin_tools);
-            let mut stream = provider.stream(request);
+            let mut stream = provider.stream(request, cancel.clone());
 
             let mut assistant_message = None;
             let mut assistant_delta_text = String::new();
@@ -149,6 +152,10 @@ impl AgentRuntime {
                     }
                     ProviderEvent::Finished => break,
                 }
+            }
+
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
             }
 
             let assistant_message = assistant_message
@@ -204,6 +211,8 @@ pub enum AgentError {
     Provider(#[from] ProviderError),
     #[error("maximum tool iterations exceeded ({0})")]
     MaxToolIterationsExceeded(usize),
+    #[error("request cancelled")]
+    Cancelled,
 }
 
 fn max_tool_iterations_error(max_tool_iterations: usize) -> AgentError {
@@ -462,7 +471,7 @@ mod tests {
 
     use rho_core::{
         message::decode_assistant_message_content,
-        providers::{ModelKind, ProviderKind, ProviderRequest, ProviderStream},
+        providers::{CancellationToken, ModelKind, ProviderKind, ProviderRequest, ProviderStream},
         tool::ToolCall,
     };
     use serde_json::{Value, json};
@@ -752,7 +761,11 @@ mod tests {
             ProviderKind::OpenAi
         }
 
-        fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
+        fn stream(
+            &self,
+            request: ProviderRequest<'_>,
+            _cancel: CancellationToken,
+        ) -> ProviderStream {
             self.request_pointers
                 .lock()
                 .expect("request pointers mutex should be available")

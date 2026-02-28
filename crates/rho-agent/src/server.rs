@@ -26,9 +26,10 @@ use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{AgentRuntime, AgentSession};
+use crate::{AgentError, AgentRuntime, AgentSession};
 
 #[derive(Clone)]
 pub struct AgentServer {
@@ -111,7 +112,12 @@ struct AppState {
 
 struct SessionState {
     session: Arc<Mutex<AgentSession>>,
-    in_flight: Option<JoinHandle<()>>,
+    in_flight: Option<InFlightRequest>,
+}
+
+struct InFlightRequest {
+    task: JoinHandle<()>,
+    cancel: CancellationToken,
 }
 
 impl SessionState {
@@ -277,8 +283,8 @@ async fn handle_client_event(
                 return;
             };
 
-            if let Some(handle) = &session_state.in_flight
-                && !handle.is_finished()
+            if let Some(in_flight) = &session_state.in_flight
+                && !in_flight.task.is_finished()
             {
                 send_error(
                     outbound_sender,
@@ -298,6 +304,9 @@ async fn handle_client_event(
             let outbound_sender = outbound_sender.clone();
             let sessions = Arc::clone(&state.sessions);
             let cleanup_session_id = session_id.clone();
+            let cancel = CancellationToken::new();
+            let cancel_for_task = cancel.clone();
+            let cancel_for_emit = cancel.clone();
 
             let task = tokio::spawn(async move {
                 let run_result = {
@@ -308,18 +317,27 @@ async fn handle_client_event(
                             provider.as_ref(),
                             model,
                             user_content,
-                            |event| send_event(&outbound_sender, event),
+                            cancel_for_task,
+                            |event| {
+                                if !cancel_for_emit.is_cancelled() {
+                                    send_event(&outbound_sender, event);
+                                }
+                            },
                         )
                         .await
                 };
 
-                if let Err(error) = run_result {
-                    send_error(
-                        &outbound_sender,
-                        Some(cleanup_session_id.clone()),
-                        "runtime_error",
-                        error.to_string(),
-                    );
+                match run_result {
+                    Err(AgentError::Cancelled) => {}
+                    Err(error) => {
+                        send_error(
+                            &outbound_sender,
+                            Some(cleanup_session_id.clone()),
+                            "runtime_error",
+                            error.to_string(),
+                        );
+                    }
+                    Ok(()) => {}
                 }
 
                 let mut sessions_guard = sessions.lock().await;
@@ -328,7 +346,7 @@ async fn handle_client_event(
                 }
             });
 
-            session_state.in_flight = Some(task);
+            session_state.in_flight = Some(InFlightRequest { task, cancel });
         }
         ClientEvent::Cancel(cancel_request) => {
             let session_id = cancel_request.session_id;
@@ -349,8 +367,9 @@ async fn handle_client_event(
                 return;
             };
 
-            if let Some(task) = session_state.in_flight.take() {
-                task.abort();
+            if let Some(in_flight) = session_state.in_flight.take() {
+                in_flight.cancel.cancel();
+                in_flight.task.abort();
                 send_error(
                     outbound_sender,
                     Some(session_id),

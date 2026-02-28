@@ -8,7 +8,7 @@ use rig::{
 use crate::{
     Message, MessageRole,
     providers::{
-        Provider, ProviderError, ProviderKind, ProviderRequest, ProviderStream,
+        CancellationToken, Provider, ProviderError, ProviderKind, ProviderRequest, ProviderStream,
         apply_common_request_options, map_rig_completion_error, map_rig_http_error,
         map_streamed_assistant_chunk, rig_choice_text, to_rig_chat_request, validate_api_key,
     },
@@ -49,7 +49,7 @@ impl Provider for AnthropicProvider {
         ProviderKind::Anthropic
     }
 
-    fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream {
+    fn stream(&self, request: ProviderRequest<'_>, cancel: CancellationToken) -> ProviderStream {
         let rig_request = to_rig_chat_request(request);
         let client = self.client();
         Box::pin(async_stream::try_stream! {
@@ -70,11 +70,25 @@ impl Provider for AnthropicProvider {
                 .await
                 .map_err(|error| map_rig_completion_error(ANTHROPIC_API_KEY_ENV, error))?;
 
-            while let Some(next_chunk) = stream.next().await {
-                let chunk = next_chunk
-                    .map_err(|error| map_rig_completion_error(ANTHROPIC_API_KEY_ENV, error))?;
-                if let Some(event) = map_streamed_assistant_chunk(chunk) {
-                    yield event;
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        stream.cancel();
+                        return;
+                    }
+                    next = stream.next() => next,
+                };
+                match next {
+                    Some(Ok(chunk)) => {
+                        if let Some(event) = map_streamed_assistant_chunk(chunk) {
+                            yield event;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        Err(map_rig_completion_error(ANTHROPIC_API_KEY_ENV, error))?;
+                    }
+                    None => break,
                 }
             }
 
