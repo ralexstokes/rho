@@ -107,8 +107,12 @@ fn handle_key_event(
             }
         }
         KeyCode::Tab => {
-            app.refresh_autocomplete(true);
-            state_changed = true;
+            if app.has_autocomplete() {
+                state_changed |= app.apply_autocomplete_selection();
+            } else {
+                app.refresh_autocomplete(true);
+                state_changed = true;
+            }
         }
         KeyCode::Backspace => {
             app.editor.backspace();
