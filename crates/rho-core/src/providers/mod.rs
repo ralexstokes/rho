@@ -1,17 +1,18 @@
 use std::pin::Pin;
 
 use futures_core::Stream;
+use futures_util::StreamExt;
 use rig::{
     OneOrMany,
     completion::{
         AssistantContent as RigAssistantContent, CompletionError as RigCompletionError,
         CompletionModel as RigCompletionModel,
-        CompletionRequestBuilder as RigCompletionRequestBuilder, Message as RigMessage,
-        ToolDefinition as RigToolDefinition,
+        CompletionRequestBuilder as RigCompletionRequestBuilder, GetTokenUsage,
+        Message as RigMessage, ToolDefinition as RigToolDefinition,
         message::{ToolResultContent as RigToolResultContent, UserContent as RigUserContent},
     },
     http_client::Error as RigHttpError,
-    streaming::StreamedAssistantContent,
+    streaming::{StreamedAssistantContent, StreamingCompletionResponse},
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -255,6 +256,43 @@ where
     } else {
         builder.tools(tools)
     }
+}
+
+pub(crate) fn stream_from_response<R>(
+    mut stream: StreamingCompletionResponse<R>,
+    env_var: &'static str,
+    cancel: CancellationToken,
+) -> ProviderStream
+where
+    R: Clone + Unpin + GetTokenUsage + Send + 'static,
+{
+    Box::pin(async_stream::try_stream! {
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    stream.cancel();
+                    return;
+                }
+                next = stream.next() => next,
+            };
+            match next {
+                Some(Ok(chunk)) => {
+                    if let Some(event) = map_streamed_assistant_chunk(chunk) {
+                        yield event;
+                    }
+                }
+                Some(Err(error)) => {
+                    Err(map_rig_completion_error(env_var, error))?;
+                }
+                None => break,
+            }
+        }
+
+        let message = Message::new(MessageRole::Assistant, rig_choice_text(&stream.choice));
+        yield ProviderEvent::Message { message };
+        yield ProviderEvent::Finished;
+    })
 }
 
 fn to_rig_tool_result_message(content: &str) -> RigMessage {

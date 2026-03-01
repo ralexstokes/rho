@@ -1,16 +1,11 @@
 use std::sync::{Arc, OnceLock};
 
-use futures_util::StreamExt;
 use rig::{client::completion::CompletionClient, completion::CompletionModel, providers::openai};
 
-use crate::{
-    Message, MessageRole,
-    providers::{
-        CancellationToken, Provider, ProviderError, ProviderKind, ProviderRequest, ProviderStream,
-        apply_common_request_options, map_rig_completion_error, map_rig_http_error,
-        map_streamed_assistant_chunk, rig_choice_text, to_rig_chat_request, validate_api_key,
-    },
-    stream::ProviderEvent,
+use crate::providers::{
+    CancellationToken, Provider, ProviderError, ProviderKind, ProviderRequest, ProviderStream,
+    apply_common_request_options, map_rig_completion_error, map_rig_http_error,
+    stream_from_response, to_rig_chat_request, validate_api_key,
 };
 
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
@@ -60,36 +55,14 @@ impl Provider for OpenAiProvider {
             let builder =
                 apply_common_request_options(builder, rig_request.preamble, rig_request.tools);
 
-            let mut stream = builder
+            let stream = builder
                 .stream()
                 .await
                 .map_err(|error| map_rig_completion_error(OPENAI_API_KEY_ENV, error))?;
 
-            loop {
-                let next = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        stream.cancel();
-                        return;
-                    }
-                    next = stream.next() => next,
-                };
-                match next {
-                    Some(Ok(chunk)) => {
-                        if let Some(event) = map_streamed_assistant_chunk(chunk) {
-                            yield event;
-                        }
-                    }
-                    Some(Err(error)) => {
-                        Err(map_rig_completion_error(OPENAI_API_KEY_ENV, error))?;
-                    }
-                    None => break,
-                }
+            for await event in stream_from_response(stream, OPENAI_API_KEY_ENV, cancel) {
+                yield event?;
             }
-
-            let message = Message::new(MessageRole::Assistant, rig_choice_text(&stream.choice));
-            yield ProviderEvent::Message { message };
-            yield ProviderEvent::Finished;
         })
     }
 }
