@@ -24,6 +24,8 @@ use self::{
     render::{RenderState, draw_ui},
 };
 
+const IN_PROCESS_ENDPOINT: &str = "in-process://rho";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiClient {
     url: String,
@@ -54,15 +56,13 @@ impl TuiClient {
     }
 
     pub async fn run_in_process(
-        endpoint: impl Into<String>,
         outbound_tx: mpsc::UnboundedSender<ClientEvent>,
         server_events: mpsc::UnboundedReceiver<ServerEvent>,
     ) -> Result<(), TuiClientError> {
-        let endpoint = endpoint.into();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         tokio::spawn(run_in_process_reader(server_events, inbound_tx));
 
-        run_event_loop(endpoint, outbound_tx, inbound_rx).await
+        run_event_loop(IN_PROCESS_ENDPOINT.to_string(), outbound_tx, inbound_rx).await
     }
 }
 

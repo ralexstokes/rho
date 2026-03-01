@@ -147,12 +147,7 @@ async fn run_local(local: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         "rho running local mode"
     );
     let connection = server.connect_in_process();
-    TuiClient::run_in_process(
-        "in-process://rho",
-        connection.client_events,
-        connection.server_events,
-    )
-    .await?;
+    TuiClient::run_in_process(connection.client_events, connection.server_events).await?;
     Ok(())
 }
 
