@@ -3,9 +3,9 @@ use std::sync::{Arc, OnceLock};
 use rig::{client::completion::CompletionClient, completion::CompletionModel, providers::openai};
 
 use crate::providers::{
-    CancellationToken, Provider, ProviderError, ProviderKind, ProviderRequest, ProviderStream,
+    CancellationToken, PreparedRequest, Provider, ProviderError, ProviderKind, ProviderStream,
     apply_common_request_options, map_rig_completion_error, map_rig_http_error,
-    stream_from_response, to_rig_chat_request, validate_api_key,
+    stream_from_response, validate_api_key,
 };
 
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
@@ -42,18 +42,21 @@ impl Provider for OpenAiProvider {
         ProviderKind::OpenAi
     }
 
-    fn stream(&self, request: ProviderRequest<'_>, cancel: CancellationToken) -> ProviderStream {
-        let rig_request = to_rig_chat_request(request);
+    fn stream(&self, request: &PreparedRequest, cancel: CancellationToken) -> ProviderStream {
+        let model = request.inner.model.clone();
+        let prompt = request.inner.prompt.clone();
+        let history = request.inner.history.clone();
+        let preamble = request.inner.preamble.clone();
+        let tools = request.inner.tools.clone();
         let client = self.client();
         Box::pin(async_stream::try_stream! {
             let client = client?;
-            let rig_request = rig_request?;
             let builder = client
-                .completion_model(rig_request.model.clone())
-                .completion_request(rig_request.prompt)
-                .messages(rig_request.history);
+                .completion_model(model)
+                .completion_request(prompt)
+                .messages(history);
             let builder =
-                apply_common_request_options(builder, rig_request.preamble, rig_request.tools);
+                apply_common_request_options(builder, preamble, tools);
 
             let stream = builder
                 .stream()

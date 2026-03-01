@@ -121,22 +121,28 @@ pub(crate) struct RigChatRequest {
     pub tools: Vec<RigToolDefinition>,
 }
 
+fn convert_message(message: &Message) -> Option<RigMessage> {
+    match message.role {
+        MessageRole::System => None,
+        MessageRole::User => Some(RigMessage::from(RigUserContent::text(
+            message.content.clone(),
+        ))),
+        MessageRole::Assistant => Some(to_rig_assistant_message(&message.content)),
+        MessageRole::Tool => Some(to_rig_tool_result_message(&message.content)),
+    }
+}
+
 pub(crate) fn to_rig_chat_request(
-    request: ProviderRequest<'_>,
+    request: &ProviderRequest<'_>,
 ) -> Result<RigChatRequest, ProviderError> {
     let mut system_sections = Vec::new();
     let mut chat_messages = Vec::new();
 
     for message in request.messages {
-        match message.role {
-            MessageRole::System => system_sections.push(message.content.clone()),
-            MessageRole::User => chat_messages.push(RigMessage::from(RigUserContent::text(
-                message.content.clone(),
-            ))),
-            MessageRole::Assistant => {
-                chat_messages.push(to_rig_assistant_message(&message.content));
-            }
-            MessageRole::Tool => chat_messages.push(to_rig_tool_result_message(&message.content)),
+        if message.role == MessageRole::System {
+            system_sections.push(message.content.clone());
+        } else if let Some(rig_msg) = convert_message(message) {
+            chat_messages.push(rig_msg);
         }
     }
 
@@ -167,6 +173,57 @@ pub(crate) fn to_rig_chat_request(
             })
             .collect(),
     })
+}
+
+#[derive(Debug)]
+pub struct PreparedRequest {
+    original_messages: Vec<Message>,
+    original_tools: Vec<ToolDefinition>,
+    pub(crate) inner: RigChatRequest,
+}
+
+impl PreparedRequest {
+    pub fn new(request: ProviderRequest<'_>) -> Result<Self, ProviderError> {
+        let inner = to_rig_chat_request(&request)?;
+        Ok(Self {
+            original_messages: request.messages.to_vec(),
+            original_tools: request.tools.to_vec(),
+            inner,
+        })
+    }
+
+    pub fn extend(&mut self, messages: &[Message]) {
+        self.original_messages.extend_from_slice(messages);
+
+        // Current prompt becomes part of history
+        let old_prompt = std::mem::replace(
+            &mut self.inner.prompt,
+            RigMessage::from(RigUserContent::text("")),
+        );
+        self.inner.history.push(old_prompt);
+
+        // Convert and append only the new messages
+        for msg in messages {
+            if let Some(rig_msg) = convert_message(msg) {
+                self.inner.history.push(rig_msg);
+            }
+        }
+
+        // Last message becomes the new prompt
+        self.inner.prompt = self
+            .inner
+            .history
+            .pop()
+            .expect("extend must be called with at least one non-system message");
+    }
+
+    pub fn messages(&self) -> &[Message] {
+        &self.original_messages
+    }
+
+    pub fn tools(&self) -> &[ToolDefinition] {
+        &self.original_tools
+    }
 }
 
 pub(crate) fn rig_choice_text(choice: &OneOrMany<RigAssistantContent>) -> String {
@@ -374,7 +431,7 @@ fn is_auth_status(status_code: u16) -> bool {
 pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
 
-    fn stream(&self, request: ProviderRequest<'_>, cancel: CancellationToken) -> ProviderStream;
+    fn stream(&self, request: &PreparedRequest, cancel: CancellationToken) -> ProviderStream;
 }
 
 #[cfg(test)]
@@ -417,7 +474,7 @@ mod tests {
         }];
         let request = ProviderRequest::new(ModelKind::Gpt52, &messages).with_tools(&tools);
 
-        let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
+        let rig_request = to_rig_chat_request(&request).expect("request conversion should succeed");
 
         assert_eq!(rig_request.model, ModelKind::Gpt52.as_str());
         assert_eq!(
@@ -440,7 +497,7 @@ mod tests {
         let messages = vec![Message::new(MessageRole::System, "only system")];
         let request = ProviderRequest::new(ModelKind::Gpt52, &messages);
 
-        let error = to_rig_chat_request(request).expect_err("conversion should fail");
+        let error = to_rig_chat_request(&request).expect_err("conversion should fail");
         assert!(matches!(error, ProviderError::Transport(_)));
     }
 
@@ -461,7 +518,7 @@ mod tests {
         ];
         let request = ProviderRequest::new(ModelKind::Gpt52, &messages);
 
-        let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
+        let rig_request = to_rig_chat_request(&request).expect("request conversion should succeed");
         assert!(matches!(
             &rig_request.history[1],
             RigMessage::User { content }
@@ -503,7 +560,7 @@ mod tests {
         ];
         let request = ProviderRequest::new(ModelKind::Gpt52, &messages);
 
-        let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
+        let rig_request = to_rig_chat_request(&request).expect("request conversion should succeed");
         assert!(matches!(
             &rig_request.history[1],
             RigMessage::Assistant { content, .. }
@@ -560,7 +617,7 @@ mod tests {
         ];
         let request = ProviderRequest::new(ModelKind::Gpt52, &messages);
 
-        let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
+        let rig_request = to_rig_chat_request(&request).expect("request conversion should succeed");
         assert!(matches!(
             &rig_request.history[1],
             RigMessage::Assistant { content, .. }
