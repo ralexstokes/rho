@@ -5,9 +5,9 @@ use rig::{
 };
 
 use crate::providers::{
-    CancellationToken, Provider, ProviderError, ProviderKind, ProviderRequest, ProviderStream,
+    CancellationToken, PreparedRequest, Provider, ProviderError, ProviderKind, ProviderStream,
     apply_common_request_options, map_rig_completion_error, map_rig_http_error,
-    stream_from_response, to_rig_chat_request, validate_api_key,
+    stream_from_response, validate_api_key,
 };
 
 const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
@@ -44,21 +44,24 @@ impl Provider for AnthropicProvider {
         ProviderKind::Anthropic
     }
 
-    fn stream(&self, request: ProviderRequest<'_>, cancel: CancellationToken) -> ProviderStream {
-        let rig_request = to_rig_chat_request(request);
+    fn stream(&self, request: &PreparedRequest, cancel: CancellationToken) -> ProviderStream {
+        let model_name = request.inner.model.clone();
+        let prompt = request.inner.prompt.clone();
+        let history = request.inner.history.clone();
+        let preamble = request.inner.preamble.clone();
+        let tools = request.inner.tools.clone();
         let client = self.client();
         Box::pin(async_stream::try_stream! {
             let client = client?;
-            let rig_request = rig_request?;
 
             let model = client
-                .completion_model(rig_request.model.clone())
+                .completion_model(model_name)
                 .with_prompt_caching();
             let builder = model
-                .completion_request(rig_request.prompt)
-                .messages(rig_request.history);
+                .completion_request(prompt)
+                .messages(history);
             let builder =
-                apply_common_request_options(builder, rig_request.preamble, rig_request.tools);
+                apply_common_request_options(builder, preamble, tools);
 
             let stream = builder
                 .stream()

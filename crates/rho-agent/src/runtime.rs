@@ -10,7 +10,9 @@ use rho_core::{
     Message, MessageRole,
     message::encode_assistant_message_content,
     protocol::{AssistantDelta, FinalMessage, ServerEvent, ToolCompleted, ToolStarted},
-    providers::{CancellationToken, ModelKind, Provider, ProviderError, ProviderRequest},
+    providers::{
+        CancellationToken, ModelKind, PreparedRequest, Provider, ProviderError, ProviderRequest,
+    },
     stream::ProviderEvent,
     tool::{ToolCall, ToolDefinition, ToolResult},
 };
@@ -111,9 +113,11 @@ impl AgentRuntime {
         let session_id = session.id.clone();
         let builtin_tools = builtin_tool_definitions();
 
+        let request = ProviderRequest::new(model, session.messages()).with_tools(builtin_tools);
+        let mut prepared = PreparedRequest::new(request)?;
+
         for iteration in 0..=self.max_tool_iterations {
-            let request = ProviderRequest::new(model, session.messages()).with_tools(builtin_tools);
-            let mut stream = provider.stream(request, cancel.clone());
+            let mut stream = provider.stream(&prepared, cancel.clone());
 
             let mut assistant_message = None;
             let mut assistant_delta_text = String::new();
@@ -176,13 +180,16 @@ impl AgentRuntime {
                 return Ok(());
             }
 
+            let mut new_messages = Vec::new();
             if !assistant_message.content.is_empty() {
+                new_messages.push(assistant_message.clone());
                 session.messages.push(assistant_message);
             }
-
             for tool_message in tool_messages {
+                new_messages.push(tool_message.clone());
                 session.messages.push(tool_message);
             }
+            prepared.extend(&new_messages);
 
             if iteration == self.max_tool_iterations {
                 return Err(AgentError::MaxToolIterationsExceeded(
@@ -466,19 +473,19 @@ fn tool_error(call_id: &str, output: impl Into<String>) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Mutex},
+        sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use rho_core::{
         message::decode_assistant_message_content,
-        providers::{CancellationToken, ModelKind, ProviderKind, ProviderRequest, ProviderStream},
+        providers::{CancellationToken, ModelKind},
         tool::ToolCall,
     };
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::test_helpers::{FakeProvider, FakeResponse, FakeResponseQueue};
+    use crate::test_helpers::FakeProvider;
 
     #[tokio::test]
     async fn run_user_message_without_tool_calls_emits_final() {
@@ -697,83 +704,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_user_message_borrows_history_and_reuses_builtin_tools() {
+    async fn run_user_message_provides_builtin_tools() {
         let runtime = AgentRuntime::new();
         let mut session = runtime.start_session("session-5");
-        let provider = PointerRecordingProvider::new(vec![vec![Ok(ProviderEvent::Finished)]]);
+        let provider = FakeProvider::new(vec![vec![Ok(ProviderEvent::Finished)]]);
 
         runtime
             .run_user_message(&mut session, &provider, ModelKind::Gpt52, "hello")
             .await
             .expect("run should succeed");
 
-        let request_pointers = provider.request_pointers();
-        assert_eq!(request_pointers.len(), 1);
-        assert_eq!(
-            request_pointers[0].message_ptr,
-            session.messages().as_ptr() as usize
-        );
-        assert_eq!(
-            request_pointers[0].tool_ptr,
-            builtin_tool_definitions().as_ptr() as usize
-        );
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    struct RequestPointers {
-        message_ptr: usize,
-        tool_ptr: usize,
-    }
-
-    #[derive(Debug, Clone)]
-    struct PointerRecordingProvider {
-        responses: Arc<Mutex<FakeResponseQueue>>,
-        request_pointers: Arc<Mutex<Vec<RequestPointers>>>,
-    }
-
-    impl PointerRecordingProvider {
-        fn new(responses: Vec<FakeResponse>) -> Self {
-            Self {
-                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
-                request_pointers: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn request_pointers(&self) -> Vec<RequestPointers> {
-            self.request_pointers
-                .lock()
-                .expect("request pointers mutex should be available")
-                .clone()
-        }
-    }
-
-    impl Provider for PointerRecordingProvider {
-        fn kind(&self) -> ProviderKind {
-            ProviderKind::OpenAi
-        }
-
-        fn stream(
-            &self,
-            request: ProviderRequest<'_>,
-            _cancel: CancellationToken,
-        ) -> ProviderStream {
-            self.request_pointers
-                .lock()
-                .expect("request pointers mutex should be available")
-                .push(RequestPointers {
-                    message_ptr: request.messages.as_ptr() as usize,
-                    tool_ptr: request.tools.as_ptr() as usize,
-                });
-
-            let events = self
-                .responses
-                .lock()
-                .expect("responses mutex should be available")
-                .pop_front()
-                .unwrap_or_default();
-
-            Box::pin(futures_util::stream::iter(events))
-        }
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        let tool_names: Vec<String> = requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        assert_eq!(tool_names, ["read", "write", "bash"]);
     }
 
     fn temp_file_path(label: &str) -> PathBuf {

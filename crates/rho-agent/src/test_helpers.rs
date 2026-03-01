@@ -4,7 +4,7 @@ use std::{
 };
 
 use rho_core::providers::{
-    CancellationToken, Provider, ProviderKind, ProviderRequest, ProviderStream,
+    CancellationToken, PreparedRequest, Provider, ProviderKind, ProviderStream,
 };
 use tokio::sync::Notify;
 
@@ -41,10 +41,10 @@ pub struct RecordedRequest {
 }
 
 impl RecordedRequest {
-    pub fn from_request(request: ProviderRequest<'_>) -> Self {
+    pub fn from_request(request: &PreparedRequest) -> Self {
         Self {
-            messages: request.messages.to_vec(),
-            tools: request.tools.to_vec(),
+            messages: request.messages().to_vec(),
+            tools: request.tools().to_vec(),
         }
     }
 }
@@ -54,7 +54,7 @@ impl Provider for FakeProvider {
         ProviderKind::OpenAi
     }
 
-    fn stream(&self, request: ProviderRequest<'_>, _cancel: CancellationToken) -> ProviderStream {
+    fn stream(&self, request: &PreparedRequest, _cancel: CancellationToken) -> ProviderStream {
         self.requests
             .lock()
             .expect("requests mutex should be available")
@@ -79,7 +79,7 @@ impl Provider for PendingProvider {
         ProviderKind::OpenAi
     }
 
-    fn stream(&self, _request: ProviderRequest<'_>, _cancel: CancellationToken) -> ProviderStream {
+    fn stream(&self, _request: &PreparedRequest, _cancel: CancellationToken) -> ProviderStream {
         Box::pin(futures_util::stream::pending())
     }
 }
@@ -115,7 +115,7 @@ impl Provider for CancellableProvider {
         ProviderKind::OpenAi
     }
 
-    fn stream(&self, _request: ProviderRequest<'_>, cancel: CancellationToken) -> ProviderStream {
+    fn stream(&self, _request: &PreparedRequest, cancel: CancellationToken) -> ProviderStream {
         let events = self
             .responses
             .lock()
