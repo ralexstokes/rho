@@ -127,6 +127,9 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
     let mut rendered_collapsed_calls = HashSet::new();
 
     for entry in &app.log_lines {
+        if !app.show_system_messages && matches!(entry.kind, LogKind::System) {
+            continue;
+        }
         if app.collapse_tool_calls && matches!(entry.kind, LogKind::Tool) {
             let Some(call_id) = entry.tool_call_id.as_ref() else {
                 continue;
@@ -173,6 +176,11 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
             &app.theme,
         );
 
+        let body_style_override = match entry.kind {
+            LogKind::System => Some(app.theme.system_body),
+            _ => None,
+        };
+
         let indent = " ".repeat(prefix.chars().count());
         for (index, line) in body_lines.into_iter().enumerate() {
             let mut spans = Vec::new();
@@ -181,7 +189,11 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
             } else {
                 spans.push(Span::styled(indent.clone(), prefix_style));
             }
-            spans.extend(line.spans);
+            if let Some(style) = body_style_override {
+                spans.extend(line.spans.into_iter().map(|s| Span::styled(s.content, style)));
+            } else {
+                spans.extend(line.spans);
+            }
             flow_lines.push(Line::from(spans));
         }
     }
@@ -240,10 +252,20 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
         .scroll((scroll_top, 0));
     frame.render_widget(flow, flow_area);
 
-    let footer_text = format!("url={} session_id={}  ?=help", app.url, app.session_id);
+    let footer_left = if app.request_in_flight {
+        "cancel with esc"
+    } else {
+        ""
+    };
+    let footer_right = "?=help  ctrl+s=status";
+    let width = usize::from(footer_area.width);
+    let left_len = footer_left.len();
+    let right_len = footer_right.len();
+    let padding = width.saturating_sub(left_len).saturating_sub(right_len);
+    let footer_text = format!("{}{:padding$}{}", footer_left, "", footer_right, padding = padding);
     let status = Paragraph::new(truncate_to_width(
         footer_text.as_str(),
-        usize::from(footer_area.width),
+        width,
     ))
     .style(app.theme.footer);
     frame.render_widget(status, footer_area);
@@ -268,6 +290,7 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
     }
 
     app.sync_help_overlay();
+    app.sync_status_overlay();
     app.overlays.render(frame, frame.area());
     frame.set_cursor_position((cursor_x, cursor_y));
 }

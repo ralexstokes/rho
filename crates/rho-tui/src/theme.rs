@@ -7,6 +7,7 @@ pub struct UiTheme {
     pub assistant_prefix: Style,
     pub tool_prefix: Style,
     pub system_prefix: Style,
+    pub system_body: Style,
     pub error_prefix: Style,
     pub heading: Style,
     pub bullet: Style,
@@ -33,6 +34,7 @@ impl Default for UiTheme {
             system_prefix: Style::default()
                 .fg(Color::Rgb(92, 99, 112))
                 .add_modifier(Modifier::BOLD),
+            system_body: Style::default().fg(Color::Rgb(92, 99, 112)),
             error_prefix: Style::default()
                 .fg(Color::Rgb(224, 108, 117))
                 .add_modifier(Modifier::BOLD),
@@ -44,7 +46,7 @@ impl Default for UiTheme {
                 .fg(Color::Rgb(124, 132, 149))
                 .add_modifier(Modifier::ITALIC),
             code: Style::default().fg(Color::Rgb(229, 192, 123)),
-            body: Style::default().fg(Color::Rgb(171, 178, 191)),
+            body: Style::default().fg(Color::White),
             loader: Style::default().fg(Color::Rgb(198, 120, 221)),
             footer: Style::default().fg(Color::Rgb(171, 178, 191)),
         }

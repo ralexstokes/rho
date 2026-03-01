@@ -77,6 +77,15 @@ fn handle_key_event(
         app.collapse_tool_calls = !app.collapse_tool_calls;
         return Ok(true);
     }
+    if matches_key(&key, Key::CTRL_G) {
+        app.show_system_messages = !app.show_system_messages;
+        return Ok(true);
+    }
+    if matches_key(&key, Key::CTRL_S) {
+        app.clear_autocomplete();
+        app.toggle_status_overlay();
+        return Ok(true);
+    }
 
     app.quit_pending = false;
 

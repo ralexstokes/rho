@@ -45,8 +45,10 @@ pub(super) struct AppState {
     pub(super) overlays: OverlayStack,
     pub(super) autocomplete_overlay_id: Option<u64>,
     pub(super) help_overlay_id: Option<u64>,
+    pub(super) status_overlay_id: Option<u64>,
     pub(super) tool_call_names: HashMap<String, String>,
     pub(super) collapse_tool_calls: bool,
+    pub(super) show_system_messages: bool,
     pub(super) awaiting_assistant: bool,
     pub(super) request_in_flight: bool,
     pub(super) transcript_scroll_up: usize,
@@ -142,8 +144,10 @@ impl AppState {
             overlays: OverlayStack::new(),
             autocomplete_overlay_id: None,
             help_overlay_id: None,
+            status_overlay_id: None,
             tool_call_names: HashMap::new(),
             collapse_tool_calls: true,
+            show_system_messages: false,
             awaiting_assistant: false,
             request_in_flight: false,
             transcript_scroll_up: 0,
@@ -314,6 +318,11 @@ impl AppState {
         {
             self.help_overlay_id = None;
         }
+        if let Some(id) = self.status_overlay_id
+            && !self.overlays.has(id)
+        {
+            self.status_overlay_id = None;
+        }
     }
 
     pub(super) fn has_autocomplete(&self) -> bool {
@@ -423,19 +432,19 @@ impl AppState {
         self.autocomplete_overlay_id = Some(id);
     }
 
-    fn scroll_state_label(&self) -> String {
-        if self.transcript_scroll_up == 0 {
-            "follow".to_string()
+    fn tool_state_label(&self) -> &'static str {
+        if self.collapse_tool_calls {
+            "collapsed"
         } else {
-            format!("scroll+{}", self.transcript_scroll_up)
+            "expanded"
         }
     }
 
-    fn tool_state_label(&self) -> &'static str {
-        if self.collapse_tool_calls {
-            "tools=collapsed"
+    fn system_state_label(&self) -> &'static str {
+        if self.show_system_messages {
+            "visible"
         } else {
-            "tools=expanded"
+            "hidden"
         }
     }
 
@@ -449,11 +458,11 @@ impl AppState {
             Line::from("ctrl+p/n = history"),
             Line::from("ctrl+b/f/a/e = move"),
             Line::from("ctrl+t = toggle tool view"),
+            Line::from("ctrl+g = toggle system messages"),
+            Line::from("ctrl+s = status"),
             Line::from("esc = close overlay / quit"),
             Line::from(""),
-            Line::from(format!("current {}", self.tool_state_label())),
-            Line::from(format!("current {}", self.scroll_state_label())),
-            Line::from("press ? to close"),
+            Line::from("press ? or esc to close"),
         ]
     }
 
@@ -489,6 +498,54 @@ impl AppState {
         };
         if !self.overlays.update(id, self.help_overlay_lines()) {
             self.help_overlay_id = None;
+        }
+    }
+
+    fn status_overlay_lines(&self) -> Vec<Line<'static>> {
+        vec![
+            Line::from(vec![Span::styled("Status", self.theme.heading)]),
+            Line::from(""),
+            Line::from(format!("url        {}", self.url)),
+            Line::from(format!("session_id {}", self.session_id)),
+            Line::from(format!("tools      {}", self.tool_state_label())),
+            Line::from(format!("system     {}", self.system_state_label())),
+            Line::from(""),
+            Line::from("press ctrl+s or esc to close"),
+        ]
+    }
+
+    pub(super) fn toggle_status_overlay(&mut self) {
+        if let Some(id) = self.status_overlay_id.take() {
+            let _ = self.overlays.hide(id);
+            return;
+        }
+
+        let options = OverlayOptions {
+            width: Some(SizeValue::Percent(65)),
+            min_width: Some(42),
+            max_height: Some(SizeValue::Absolute(12)),
+            anchor: OverlayAnchor::Center,
+            margin: OverlayMargin {
+                top: 1,
+                right: 1,
+                bottom: 1,
+                left: 1,
+            },
+            min_terminal_width: Some(40),
+            title: Some("status".to_string()),
+            ..OverlayOptions::default()
+        };
+
+        let id = self.overlays.show(self.status_overlay_lines(), options);
+        self.status_overlay_id = Some(id);
+    }
+
+    pub(super) fn sync_status_overlay(&mut self) {
+        let Some(id) = self.status_overlay_id else {
+            return;
+        };
+        if !self.overlays.update(id, self.status_overlay_lines()) {
+            self.status_overlay_id = None;
         }
     }
 
