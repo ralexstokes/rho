@@ -7,19 +7,16 @@ fmt:
 lint:
     cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings
 
-build:
-    cargo build --workspace
-
-ci: fmt lint build test
-
 check:
     cargo check --workspace
+
+build:
+    cargo build --workspace
 
 test:
     cargo test --workspace
 
-run:
-    cargo run -p rho
+ci: fmt lint build test
 
 build-book:
     mdbook build docs
