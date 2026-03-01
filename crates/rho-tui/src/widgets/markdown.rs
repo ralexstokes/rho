@@ -108,20 +108,12 @@ pub fn render_markdown(markdown: &str, width: u16, theme: &UiTheme) -> Vec<Line<
 }
 
 fn parse_heading(line: &str) -> Option<&str> {
-    let hash_count = line.chars().take_while(|ch| *ch == '#').count();
+    let trimmed = line.as_bytes();
+    let hash_count = trimmed.iter().take_while(|&&b| b == b'#').count();
     if hash_count == 0 || hash_count > 6 {
         return None;
     }
-    let mut chars = line.chars();
-    for _ in 0..hash_count {
-        let _ = chars.next();
-    }
-
-    if !matches!(chars.next(), Some(' ')) {
-        return None;
-    }
-
-    Some(chars.as_str())
+    line.get(hash_count..)?.strip_prefix(' ')
 }
 
 fn parse_markdown_image(line: &str) -> Option<(&str, &str)> {

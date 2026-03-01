@@ -185,7 +185,9 @@ impl AgentRuntime {
             }
 
             if iteration == self.max_tool_iterations {
-                return Err(max_tool_iterations_error(self.max_tool_iterations));
+                return Err(AgentError::MaxToolIterationsExceeded(
+                    self.max_tool_iterations,
+                ));
             }
         }
 
@@ -213,10 +215,6 @@ pub enum AgentError {
     MaxToolIterationsExceeded(usize),
     #[error("request cancelled")]
     Cancelled,
-}
-
-fn max_tool_iterations_error(max_tool_iterations: usize) -> AgentError {
-    AgentError::MaxToolIterationsExceeded(max_tool_iterations)
 }
 
 fn push_tool_result_event<F>(
