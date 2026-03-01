@@ -54,8 +54,14 @@ fn handle_key_event(
         return Ok(false);
     }
 
-    if matches_key(&key, Key::CTRL_C) {
-        app.should_quit = true;
+    if matches_key(&key, Key::CTRL_C) || matches_key(&key, Key::CTRL_D) {
+        if app.quit_pending {
+            app.should_quit = true;
+        } else {
+            app.quit_pending = true;
+            app.push_system("press again to exit".to_string());
+            app.scroll_to_bottom();
+        }
         return Ok(true);
     }
     if matches!(
@@ -72,6 +78,8 @@ fn handle_key_event(
         return Ok(true);
     }
 
+    app.quit_pending = false;
+
     let mut edited = false;
     let mut state_changed = false;
     match key.code {
@@ -81,9 +89,6 @@ fn handle_key_event(
                 state_changed = true;
             } else if app.overlays.hide_topmost() {
                 app.sync_overlay_ids();
-                state_changed = true;
-            } else {
-                app.should_quit = true;
                 state_changed = true;
             }
         }

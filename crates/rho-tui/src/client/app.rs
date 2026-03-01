@@ -52,6 +52,7 @@ pub(super) struct AppState {
     pub(super) transcript_viewport_height: usize,
     pub(super) transcript_cache: TranscriptRenderCache,
     pub(super) frame_tick: u64,
+    pub(super) quit_pending: bool,
     pub(super) should_quit: bool,
 }
 
@@ -145,6 +146,7 @@ impl AppState {
             transcript_viewport_height: 0,
             transcript_cache: TranscriptRenderCache::default(),
             frame_tick: 0,
+            quit_pending: false,
             should_quit: false,
         };
         app.push_system("connected".to_string());
@@ -264,7 +266,11 @@ impl AppState {
                 }
                 ServerEvent::Error(error) => {
                     self.awaiting_assistant = false;
-                    self.push_error(format_error(&error));
+                    if error.code == "cancelled" {
+                        self.push_system(error.message);
+                    } else {
+                        self.push_error(format_error(&error));
+                    }
                     true
                 }
             },
