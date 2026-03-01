@@ -9,9 +9,7 @@ use futures_util::StreamExt;
 use rho_core::{
     Message, MessageRole,
     message::encode_assistant_message_content,
-    protocol::{
-        AssistantDelta, FinalMessage, PROTOCOL_VERSION, ServerEvent, ToolCompleted, ToolStarted,
-    },
+    protocol::{AssistantDelta, FinalMessage, ServerEvent, ToolCompleted, ToolStarted},
     providers::{CancellationToken, ModelKind, Provider, ProviderError, ProviderRequest},
     stream::ProviderEvent,
     tool::{ToolCall, ToolDefinition, ToolResult},
@@ -23,14 +21,12 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct AgentRuntime {
-    protocol_version: u16,
     max_tool_iterations: usize,
 }
 
 impl Default for AgentRuntime {
     fn default() -> Self {
         Self {
-            protocol_version: PROTOCOL_VERSION,
             max_tool_iterations: DEFAULT_MAX_TOOL_ITERATIONS,
         }
     }
@@ -44,12 +40,7 @@ impl AgentRuntime {
     pub fn with_max_tool_iterations(max_tool_iterations: usize) -> Self {
         Self {
             max_tool_iterations,
-            ..Self::default()
         }
-    }
-
-    pub fn protocol_version(&self) -> u16 {
-        self.protocol_version
     }
 
     pub fn max_tool_iterations(&self) -> usize {
