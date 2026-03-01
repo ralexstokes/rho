@@ -401,7 +401,6 @@ async fn handle_client_event(
 
             if let Some(in_flight) = session_state.in_flight.take() {
                 in_flight.cancel.cancel();
-                in_flight.task.abort();
                 send_error(
                     outbound_sender,
                     Some(session_id),
