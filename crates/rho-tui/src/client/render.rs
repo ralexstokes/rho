@@ -190,7 +190,11 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
                 spans.push(Span::styled(indent.clone(), prefix_style));
             }
             if let Some(style) = body_style_override {
-                spans.extend(line.spans.into_iter().map(|s| Span::styled(s.content, style)));
+                spans.extend(
+                    line.spans
+                        .into_iter()
+                        .map(|s| Span::styled(s.content, style)),
+                );
             } else {
                 spans.extend(line.spans);
             }
@@ -264,12 +268,15 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
     let left_len = footer_left.len();
     let right_len = footer_right.len();
     let padding = width.saturating_sub(left_len).saturating_sub(right_len);
-    let footer_text = format!("{}{:padding$}{}", footer_left, "", footer_right, padding = padding);
-    let status = Paragraph::new(truncate_to_width(
-        footer_text.as_str(),
-        width,
-    ))
-    .style(app.theme.footer);
+    let footer_text = format!(
+        "{}{:padding$}{}",
+        footer_left,
+        "",
+        footer_right,
+        padding = padding
+    );
+    let status =
+        Paragraph::new(truncate_to_width(footer_text.as_str(), width)).style(app.theme.footer);
     frame.render_widget(status, footer_area);
 
     let cursor_visible = cursor_flow_row >= usize::from(scroll_top)
