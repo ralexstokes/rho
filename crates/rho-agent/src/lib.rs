@@ -5,4 +5,4 @@ pub mod server;
 mod test_helpers;
 
 pub use runtime::{AgentError, AgentRuntime, AgentSession};
-pub use server::{AgentServer, AgentServerError, build_provider};
+pub use server::{AgentServer, AgentServerError, InProcessConnection, build_provider};

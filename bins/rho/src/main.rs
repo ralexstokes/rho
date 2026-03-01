@@ -1,5 +1,3 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rho_agent::{AgentRuntime, AgentServer, AgentServerError, build_provider};
 use rho_core::{
@@ -7,7 +5,6 @@ use rho_core::{
     providers::{ModelKind, ProviderKind},
 };
 use rho_tui::TuiClient;
-use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -116,23 +113,6 @@ fn build_server(
     Ok((provider_kind, server))
 }
 
-fn parse_bind_address(bind: &str) -> Result<SocketAddr, AgentServerError> {
-    bind.parse::<SocketAddr>()
-        .map_err(|error| AgentServerError::InvalidBindAddress {
-            bind: bind.to_string(),
-            error,
-        })
-}
-
-fn websocket_client_addr(listener_addr: SocketAddr) -> SocketAddr {
-    let ip = match listener_addr.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ip => ip,
-    };
-    SocketAddr::new(ip, listener_addr.port())
-}
-
 async fn run_serve(serve: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ServeArgs {
         bind,
@@ -156,37 +136,24 @@ async fn run_local(local: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         provider,
         model,
     } = local;
-    let bind_addr = parse_bind_address(&bind)?;
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .map_err(AgentServerError::Bind)?;
-    let listen_addr = listener.local_addr().map_err(AgentServerError::Bind)?;
-    let connect_addr = websocket_client_addr(listen_addr);
-    let url = format!("ws://{connect_addr}/ws");
-
     let (provider_kind, server) = build_server(provider, model)?;
+    if bind != DEFAULT_BIND {
+        info!(bind = %bind, "local mode ignores --bind when using in-process transport");
+    }
     info!(
-        listen_addr = %listen_addr,
         provider = ?provider_kind,
         protocol_version = PROTOCOL_VERSION,
-        tui_url = %url,
+        transport = "in-process",
         "rho running local mode"
     );
-
-    let server_task = tokio::spawn(server.serve_with_listener(listener));
-    let tui_result = TuiClient::new(url).run().await;
-
-    server_task.abort();
-    let server_result = server_task.await;
-
-    tui_result?;
-
-    match server_result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(Box::new(error)),
-        Err(join_error) if join_error.is_cancelled() => Ok(()),
-        Err(join_error) => Err(Box::new(join_error)),
-    }
+    let connection = server.connect_in_process();
+    TuiClient::run_in_process(
+        "in-process://rho",
+        connection.client_events,
+        connection.server_events,
+    )
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -236,19 +203,5 @@ mod tests {
                 model: ModelKind::ClaudeSonnet46,
             }
         ));
-    }
-
-    #[test]
-    fn websocket_client_addr_rewrites_unspecified_ipv4() {
-        let listener_addr: SocketAddr = "0.0.0.0:8787".parse().expect("valid socket address");
-        let client_addr = websocket_client_addr(listener_addr);
-        assert_eq!(client_addr.to_string(), "127.0.0.1:8787");
-    }
-
-    #[test]
-    fn websocket_client_addr_rewrites_unspecified_ipv6() {
-        let listener_addr: SocketAddr = "[::]:8787".parse().expect("valid socket address");
-        let client_addr = websocket_client_addr(listener_addr);
-        assert_eq!(client_addr.to_string(), "[::1]:8787");
     }
 }

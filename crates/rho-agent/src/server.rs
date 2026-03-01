@@ -36,6 +36,11 @@ pub struct AgentServer {
     state: AppState,
 }
 
+pub struct InProcessConnection {
+    pub client_events: mpsc::UnboundedSender<ClientEvent>,
+    pub server_events: mpsc::UnboundedReceiver<ServerEvent>,
+}
+
 impl AgentServer {
     pub fn new(runtime: AgentRuntime, provider: Arc<dyn Provider>, model: ModelKind) -> Self {
         let state = AppState {
@@ -68,6 +73,33 @@ impl AgentServer {
         axum::serve(listener, router)
             .await
             .map_err(AgentServerError::Serve)
+    }
+
+    pub fn connect_in_process(&self) -> InProcessConnection {
+        let (client_events, mut client_event_rx) = mpsc::unbounded_channel::<ClientEvent>();
+        let (server_envelope_tx, mut server_envelope_rx) =
+            mpsc::unbounded_channel::<ServerEnvelope>();
+        let (server_event_tx, server_events) = mpsc::unbounded_channel::<ServerEvent>();
+        let state = self.state.clone();
+
+        tokio::spawn(async move {
+            while let Some(event) = client_event_rx.recv().await {
+                handle_client_event(&state, &server_envelope_tx, event).await;
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(envelope) = server_envelope_rx.recv().await {
+                if server_event_tx.send(envelope.event).is_err() {
+                    break;
+                }
+            }
+        });
+
+        InProcessConnection {
+            client_events,
+            server_events,
+        }
     }
 }
 
@@ -469,6 +501,31 @@ mod tests {
         };
         assert!(Uuid::try_parse(&session_id).is_ok());
         assert_eq!(state.sessions.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn in_process_connection_forwards_session_ack() {
+        let provider: Arc<dyn Provider> = Arc::new(FakeProvider::new(vec![]));
+        let server = AgentServer::new(AgentRuntime::new(), provider, ModelKind::Gpt52);
+        let mut connection = server.connect_in_process();
+
+        connection
+            .client_events
+            .send(ClientEvent::StartSession(
+                rho_core::protocol::StartSession { session_id: None },
+            ))
+            .expect("client event channel should be open");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), connection.server_events.recv())
+            .await
+            .expect("timed out waiting for session ack")
+            .expect("missing session ack");
+
+        let session_id = match event {
+            ServerEvent::SessionAck(SessionAck { session_id }) => session_id,
+            _ => panic!("expected session ack"),
+        };
+        assert!(Uuid::try_parse(&session_id).is_ok());
     }
 
     #[tokio::test]
