@@ -93,11 +93,17 @@ impl AgentRuntime {
         F: FnMut(ServerEvent),
     {
         let user_content = user_content.into();
+        let message_count = session.messages.len();
         session
             .messages
             .push(Message::new(MessageRole::User, user_content));
-        self.run_completion_loop(session, provider, model, &cancel, &mut emit_event)
-            .await
+        let result = self
+            .run_completion_loop(session, provider, model, &cancel, &mut emit_event)
+            .await;
+        if matches!(result, Err(AgentError::Cancelled)) {
+            session.messages.truncate(message_count);
+        }
+        result
     }
 
     async fn run_completion_loop<F>(
@@ -795,6 +801,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_preserves_prior_session_messages() {
+        let runtime = AgentRuntime::new();
+        let mut session = runtime.start_session("session-cancel-prior");
+
+        // Complete a successful exchange first
+        let provider = FakeProvider::new(vec![vec![
+            Ok(ProviderEvent::Message {
+                message: Message::new(MessageRole::Assistant, "hi there"),
+            }),
+            Ok(ProviderEvent::Finished),
+        ]]);
+        runtime
+            .run_user_message(&mut session, &provider, ModelKind::Gpt52, "hi")
+            .await
+            .expect("first run should succeed");
+        assert_eq!(session.messages().len(), 2);
+
+        // Now cancel a second request
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let provider = crate::test_helpers::CancellableProvider::new(vec![vec![]]);
+
+        let result = runtime
+            .run_user_message_streaming(
+                &mut session,
+                &provider,
+                ModelKind::Gpt52,
+                "this should be cancelled",
+                cancel,
+                |_| {},
+            )
+            .await;
+
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        // Only the prior successful exchange remains
+        assert_eq!(session.messages().len(), 2);
+        assert_eq!(session.messages()[0], Message::new(MessageRole::User, "hi"));
+        assert_eq!(
+            session.messages()[1],
+            Message::new(MessageRole::Assistant, "hi there"),
+        );
+    }
+
+    #[tokio::test]
     async fn cancel_before_first_delta_returns_cancelled() {
         let runtime = AgentRuntime::new();
         let mut session = runtime.start_session("session-cancel-early");
@@ -817,11 +867,7 @@ mod tests {
 
         assert!(matches!(result, Err(AgentError::Cancelled)));
         assert!(emitted.is_empty());
-        assert_eq!(session.messages().len(), 1);
-        assert_eq!(
-            session.messages()[0],
-            Message::new(MessageRole::User, "hello")
-        );
+        assert_eq!(session.messages().len(), 0);
     }
 
     #[tokio::test]
@@ -861,11 +907,7 @@ mod tests {
             &emitted[0],
             ServerEvent::AssistantDelta(AssistantDelta { delta, .. }) if delta == "partial"
         ));
-        assert_eq!(session.messages().len(), 1);
-        assert_eq!(
-            session.messages()[0],
-            Message::new(MessageRole::User, "hello")
-        );
+        assert_eq!(session.messages().len(), 0);
     }
 
     #[tokio::test]
@@ -915,11 +957,7 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(AgentError::Cancelled)));
-        // Session should have: user msg + assistant msg (iter 1) + tool result (iter 1)
-        // but NOT the partial assistant from iteration 2
-        assert_eq!(session.messages().len(), 3);
-        assert_eq!(session.messages()[0].role, MessageRole::User);
-        assert_eq!(session.messages()[1].role, MessageRole::Assistant);
-        assert_eq!(session.messages()[2].role, MessageRole::Tool);
+        // All messages from the cancelled run are removed
+        assert_eq!(session.messages().len(), 0);
     }
 }
