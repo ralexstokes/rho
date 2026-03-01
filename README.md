@@ -1,5 +1,7 @@
 # rho ρ
 
+[![docs](https://img.shields.io/badge/docs-mdbook-blue)](https://ralexstokes.github.io/rho)
+
 an agent harness.
 
 ## Dependencies
@@ -9,8 +11,6 @@ This repo provides a nix shell you can access with `nix develop`.
 Otherwise refer to `flake.nix` for any required dependencies.
 
 ## Documentation
-
-[![docs](https://img.shields.io/badge/docs-GitBook-blue)](https://ralexstokes.gitbook.io/rho)
 
 Refer to the documentation under `docs/` for more information.
 
