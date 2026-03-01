@@ -14,41 +14,44 @@
   outputs =
     { self, nixpkgs, flake-utils, rust-overlay, crane }:
     let
+      rustOverlay = import rust-overlay;
+
+      mkPkgs = system:
+        import nixpkgs {
+          inherit system;
+          overlays = [ rustOverlay ];
+        };
+
       mkRhoFor = pkgs:
         let
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
         in
-        import ./nix/rho.nix {
-          inherit craneLib;
-          src = craneLib.cleanCargoSource ./.;
-        };
+        import ./nix/rho.nix { inherit craneLib; };
     in
     {
-      overlays.default = nixpkgs.lib.composeExtensions (import rust-overlay) (
-        final: _: { rho = (mkRhoFor final).package; }
+      overlays.default = nixpkgs.lib.composeExtensions rustOverlay (
+        final: _prev: { rho = (mkRhoFor final).package; }
       );
     }
     // flake-utils.lib.eachDefaultSystem (
       system:
       let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [ (import rust-overlay) ];
-        };
+        pkgs = mkPkgs system;
+        rho = mkRhoFor pkgs;
+        package = rho.package;
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         rustNightlyToolchain = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default);
-        rho = mkRhoFor pkgs;
       in
       {
         packages = {
-          rho = rho.package;
-          default = rho.package;
+          default = package;
+          rho = package;
         };
 
-        apps.default = flake-utils.lib.mkApp { drv = rho.package; };
+        apps.default = flake-utils.lib.mkApp { drv = package; };
 
-        checks = { build = rho.package; } // rho.checks;
+        checks = rho.checks // { build = package; };
 
         formatter = pkgs.nixfmt;
 

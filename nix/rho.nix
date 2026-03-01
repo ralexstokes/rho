@@ -1,6 +1,8 @@
-{ craneLib, src }:
+{ craneLib }:
 let
-  crateInfo = craneLib.crateNameFromCargoToml { cargoToml = "${src}/bins/rho/Cargo.toml"; };
+  src = craneLib.cleanCargoSource ../.;
+  cargoToml = "${src}/bins/rho/Cargo.toml";
+  crateInfo = craneLib.crateNameFromCargoToml { inherit cargoToml; };
 
   commonArgs = {
     inherit src;
@@ -8,22 +10,19 @@ let
     strictDeps = true;
   };
 
-  cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+  withCargoArtifacts = commonArgs // {
+    cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+  };
 in
 {
-  package = craneLib.buildPackage (commonArgs // {
-    inherit cargoArtifacts;
-  });
+  package = craneLib.buildPackage withCargoArtifacts;
 
   checks = {
-    clippy = craneLib.cargoClippy (commonArgs // {
-      inherit cargoArtifacts;
+    clippy = craneLib.cargoClippy (withCargoArtifacts // {
       cargoClippyExtraArgs = "--workspace --all-targets --all-features -- -D warnings";
     });
 
-    test = craneLib.cargoTest (commonArgs // {
-      inherit cargoArtifacts;
-    });
+    test = craneLib.cargoTest withCargoArtifacts;
 
     fmt = craneLib.cargoFmt commonArgs;
   };
