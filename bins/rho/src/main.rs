@@ -34,7 +34,7 @@ struct ServeArgs {
 #[derive(Debug, Subcommand)]
 enum Command {
     Serve(ServeArgs),
-    Tui {
+    Attach {
         #[arg(long)]
         url: String,
     },
@@ -88,7 +88,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Command::Serve(serve)) => run_serve(serve).await?,
-        Some(Command::Tui { url }) => TuiClient::new(url).run().await?,
+        Some(Command::Attach { url }) => TuiClient::new(url).run().await?,
         None => run_local(cli.local).await?,
     }
 

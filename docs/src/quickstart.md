@@ -47,10 +47,10 @@ ANTHROPIC_API_KEY=... cargo run -- serve \
   --model claude-sonnet-4-6
 ```
 
-Run TUI client:
+Attach a TUI client:
 
 ```sh
-cargo run -- tui --url ws://127.0.0.1:8787/ws
+cargo run -- attach --url ws://127.0.0.1:8787/ws
 ```
 
 Adjust IPs and ports as appropriate to run across separate machines.
