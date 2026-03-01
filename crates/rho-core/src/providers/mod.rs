@@ -15,6 +15,7 @@ use rig::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+pub use tokio_util::sync::CancellationToken;
 
 use crate::{
     message::{Message, MessageRole, decode_assistant_message_content},
@@ -335,7 +336,7 @@ fn is_auth_status(status_code: u16) -> bool {
 pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
 
-    fn stream(&self, request: ProviderRequest<'_>) -> ProviderStream;
+    fn stream(&self, request: ProviderRequest<'_>, cancel: CancellationToken) -> ProviderStream;
 }
 
 #[cfg(test)]

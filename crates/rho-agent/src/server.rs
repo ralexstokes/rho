@@ -26,9 +26,10 @@ use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{AgentRuntime, AgentSession};
+use crate::{AgentError, AgentRuntime, AgentSession};
 
 #[derive(Clone)]
 pub struct AgentServer {
@@ -111,7 +112,12 @@ struct AppState {
 
 struct SessionState {
     session: Arc<Mutex<AgentSession>>,
-    in_flight: Option<JoinHandle<()>>,
+    in_flight: Option<InFlightRequest>,
+}
+
+struct InFlightRequest {
+    task: JoinHandle<()>,
+    cancel: CancellationToken,
 }
 
 impl SessionState {
@@ -277,8 +283,8 @@ async fn handle_client_event(
                 return;
             };
 
-            if let Some(handle) = &session_state.in_flight
-                && !handle.is_finished()
+            if let Some(in_flight) = &session_state.in_flight
+                && !in_flight.task.is_finished()
             {
                 send_error(
                     outbound_sender,
@@ -298,6 +304,9 @@ async fn handle_client_event(
             let outbound_sender = outbound_sender.clone();
             let sessions = Arc::clone(&state.sessions);
             let cleanup_session_id = session_id.clone();
+            let cancel = CancellationToken::new();
+            let cancel_for_task = cancel.clone();
+            let cancel_for_emit = cancel.clone();
 
             let task = tokio::spawn(async move {
                 let run_result = {
@@ -308,18 +317,27 @@ async fn handle_client_event(
                             provider.as_ref(),
                             model,
                             user_content,
-                            |event| send_event(&outbound_sender, event),
+                            cancel_for_task,
+                            |event| {
+                                if !cancel_for_emit.is_cancelled() {
+                                    send_event(&outbound_sender, event);
+                                }
+                            },
                         )
                         .await
                 };
 
-                if let Err(error) = run_result {
-                    send_error(
-                        &outbound_sender,
-                        Some(cleanup_session_id.clone()),
-                        "runtime_error",
-                        error.to_string(),
-                    );
+                match run_result {
+                    Err(AgentError::Cancelled) => {}
+                    Err(error) => {
+                        send_error(
+                            &outbound_sender,
+                            Some(cleanup_session_id.clone()),
+                            "runtime_error",
+                            error.to_string(),
+                        );
+                    }
+                    Ok(()) => {}
                 }
 
                 let mut sessions_guard = sessions.lock().await;
@@ -328,7 +346,7 @@ async fn handle_client_event(
                 }
             });
 
-            session_state.in_flight = Some(task);
+            session_state.in_flight = Some(InFlightRequest { task, cancel });
         }
         ClientEvent::Cancel(cancel_request) => {
             let session_id = cancel_request.session_id;
@@ -349,8 +367,9 @@ async fn handle_client_event(
                 return;
             };
 
-            if let Some(task) = session_state.in_flight.take() {
-                task.abort();
+            if let Some(in_flight) = session_state.in_flight.take() {
+                in_flight.cancel.cancel();
+                in_flight.task.abort();
                 send_error(
                     outbound_sender,
                     Some(session_id),
@@ -594,6 +613,114 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn cancel_then_new_prompt_receives_no_stale_deltas() {
+        let provider = Arc::new(crate::test_helpers::CancellableProvider::new(vec![
+            // First request: stale delta then blocks
+            vec![Ok(ProviderEvent::AssistantDelta {
+                delta: "stale-A".to_string(),
+            })],
+            // Second request: fresh complete response
+            vec![
+                Ok(ProviderEvent::AssistantDelta {
+                    delta: "fresh-B".to_string(),
+                }),
+                Ok(ProviderEvent::Message {
+                    message: Message::new(MessageRole::User, "fresh-B"),
+                }),
+                Ok(ProviderEvent::Finished),
+            ],
+        ]));
+        let blocked = provider.blocked();
+        let state = test_state(provider);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session_id = "00000000-0000-4000-8000-00000000000c".to_string();
+
+        // Start session
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::StartSession(rho_core::protocol::StartSession {
+                session_id: Some(session_id.clone()),
+            }),
+        )
+        .await;
+        let _ = rx.recv().await; // SessionAck
+
+        // Send first user message (yields stale-A delta then blocks)
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::UserMessage(rho_core::protocol::UserMessage {
+                session_id: session_id.clone(),
+                message: Message::new(MessageRole::User, "prompt A"),
+            }),
+        )
+        .await;
+
+        // Wait for the provider to block (stale delta has been yielded)
+        blocked.notified().await;
+
+        // Cancel
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::Cancel(rho_core::protocol::CancelRequest {
+                session_id: session_id.clone(),
+            }),
+        )
+        .await;
+
+        // Drain events up to and including the cancelled error
+        loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("timed out waiting for cancel response")
+                .expect("missing cancel response");
+
+            if matches!(
+                &envelope.event,
+                ServerEvent::Error(ErrorEvent { code, .. }) if code == "cancelled"
+            ) {
+                break;
+            }
+        }
+
+        // Small delay to let the cancelled task fully clean up
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Send second user message
+        handle_client_event(
+            &state,
+            &tx,
+            ClientEvent::UserMessage(rho_core::protocol::UserMessage {
+                session_id: session_id.clone(),
+                message: Message::new(MessageRole::User, "prompt B"),
+            }),
+        )
+        .await;
+
+        // Collect all events from the second request
+        let mut post_cancel_deltas = Vec::new();
+        loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("timed out waiting for second response")
+                .expect("missing second response");
+
+            if let ServerEvent::AssistantDelta(delta) = &envelope.event {
+                post_cancel_deltas.push(delta.delta.clone());
+            }
+
+            if matches!(envelope.event, ServerEvent::Final(_)) {
+                break;
+            }
+        }
+
+        // No stale deltas from request A should appear after cancel
+        assert_eq!(post_cancel_deltas, vec!["fresh-B"]);
     }
 
     fn test_state(provider: Arc<dyn Provider>) -> AppState {
