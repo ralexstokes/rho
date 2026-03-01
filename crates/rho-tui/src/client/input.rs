@@ -54,13 +54,11 @@ fn handle_key_event(
         return Ok(false);
     }
 
-    if matches_key(&key, Key::CTRL_C) || matches_key(&key, Key::CTRL_D) {
+    if matches_key(&key, Key::CTRL_C) {
         if app.quit_pending {
             app.should_quit = true;
         } else {
             app.quit_pending = true;
-            app.push_system("press again to exit".to_string());
-            app.scroll_to_bottom();
         }
         return Ok(true);
     }

@@ -15,7 +15,6 @@ impl Key {
     pub const HOME: &'static str = "home";
     pub const END: &'static str = "end";
     pub const CTRL_C: &'static str = "ctrl+c";
-    pub const CTRL_D: &'static str = "ctrl+d";
     pub const CTRL_G: &'static str = "ctrl+g";
     pub const CTRL_S: &'static str = "ctrl+s";
     pub const CTRL_T: &'static str = "ctrl+t";

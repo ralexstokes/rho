@@ -252,7 +252,9 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
         .scroll((scroll_top, 0));
     frame.render_widget(flow, flow_area);
 
-    let footer_left = if app.request_in_flight {
+    let footer_left = if app.quit_pending {
+        "press ctrl+c again to exit"
+    } else if app.request_in_flight {
         "cancel with esc"
     } else {
         ""

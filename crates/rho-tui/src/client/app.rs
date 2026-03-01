@@ -460,7 +460,8 @@ impl AppState {
             Line::from("ctrl+t = toggle tool view"),
             Line::from("ctrl+g = toggle system messages"),
             Line::from("ctrl+s = status"),
-            Line::from("esc = close overlay / quit"),
+            Line::from("ctrl+c = quit"),
+            Line::from("esc = close overlay"),
             Line::from(""),
             Line::from("press ? or esc to close"),
         ]
