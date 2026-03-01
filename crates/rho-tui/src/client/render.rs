@@ -4,7 +4,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Clear, Paragraph},
 };
 
 use crate::{
@@ -254,6 +254,7 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
     let flow = Paragraph::new(flow_lines)
         .block(flow_block)
         .scroll((scroll_top, 0));
+    frame.render_widget(Clear, flow_inner);
     frame.render_widget(flow, flow_area);
 
     let footer_left = if app.quit_pending {
@@ -306,6 +307,8 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::{Terminal, backend::TestBackend};
+
     use super::*;
 
     #[test]
@@ -355,5 +358,35 @@ mod tests {
                 running: true
             })
         );
+    }
+
+    #[test]
+    fn scrolling_up_with_blank_line_above_heading_clears_stale_cell() {
+        let backend = TestBackend::new(32, 5);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = AppState::new("in-process://rho".to_string(), "session-1".to_string());
+        app.log_lines.clear();
+        app.push_line(LogKind::Assistant, "\n# 123456789012345678)".to_string());
+        app.scroll_up_lines(1);
+
+        terminal
+            .draw(|frame| draw_ui(frame, &mut app))
+            .expect("first draw");
+
+        let heading_y = 1u16;
+        let heading_x = {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.width)
+                .find(|&x| buffer[(x, heading_y)].symbol() == ")")
+                .expect("closing heading character should be visible")
+        };
+
+        app.scroll_up_lines(1);
+        terminal
+            .draw(|frame| draw_ui(frame, &mut app))
+            .expect("second draw");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(heading_x, heading_y)].symbol(), " ");
     }
 }
