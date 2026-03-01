@@ -24,8 +24,7 @@ Override local mode options:
 ```sh
 ANTHROPIC_API_KEY=... cargo run -p rho -- \
   --provider anthropic \
-  --model claude-sonnet-4-6 \
-  --bind 127.0.0.1:8787
+  --model claude-sonnet-4-6
 ```
 
 ### Run client and server separately

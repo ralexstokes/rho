@@ -64,6 +64,19 @@ pub(super) async fn run_reader(
     }
 }
 
+pub(super) async fn run_in_process_reader(
+    mut server_events: mpsc::UnboundedReceiver<ServerEvent>,
+    inbound_tx: mpsc::UnboundedSender<NetworkEvent>,
+) {
+    while let Some(server_event) = server_events.recv().await {
+        if inbound_tx.send(NetworkEvent::Server(server_event)).is_err() {
+            return;
+        }
+    }
+
+    let _ = inbound_tx.send(NetworkEvent::Closed);
+}
+
 pub(super) fn send_outbound(
     outbound_tx: &mpsc::UnboundedSender<ClientEvent>,
     event: ClientEvent,
