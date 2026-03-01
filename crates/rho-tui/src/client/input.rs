@@ -1,7 +1,7 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use rho_core::{
     Message, MessageRole,
-    protocol::{ClientEvent, UserMessage},
+    protocol::{CancelRequest, ClientEvent, UserMessage},
 };
 use tokio::sync::mpsc;
 
@@ -89,6 +89,16 @@ fn handle_key_event(
                 state_changed = true;
             } else if app.overlays.hide_topmost() {
                 app.sync_overlay_ids();
+                state_changed = true;
+            } else {
+                send_outbound(
+                    outbound_tx,
+                    ClientEvent::Cancel(CancelRequest {
+                        session_id: app.session_id.clone(),
+                    }),
+                )?;
+                app.push_system("cancel requested".to_string());
+                app.scroll_to_bottom();
                 state_changed = true;
             }
         }
