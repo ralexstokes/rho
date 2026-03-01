@@ -27,7 +27,8 @@ pub fn is_key_repeat(event: &KeyEvent) -> bool {
     event.kind == KeyEventKind::Repeat
 }
 
-pub fn parse_key_event(event: &KeyEvent) -> Option<String> {
+#[cfg(test)]
+fn parse_key_event(event: &KeyEvent) -> Option<String> {
     let key_name = match event.code {
         KeyCode::Backspace => Key::BACKSPACE.to_string(),
         KeyCode::Enter => Key::ENTER.to_string(),
@@ -63,7 +64,45 @@ pub fn parse_key_event(event: &KeyEvent) -> Option<String> {
 }
 
 pub fn matches_key(event: &KeyEvent, key_id: &str) -> bool {
-    parse_key_event(event).is_some_and(|parsed| parsed == key_id)
+    let (expected_mods, expected_key) = match key_id.rsplit_once('+') {
+        Some((mod_part, key_part)) => {
+            let mut mods = KeyModifiers::NONE;
+            for m in mod_part.split('+') {
+                match m {
+                    "ctrl" => mods |= KeyModifiers::CONTROL,
+                    "shift" => mods |= KeyModifiers::SHIFT,
+                    "alt" => mods |= KeyModifiers::ALT,
+                    _ => return false,
+                }
+            }
+            (mods, key_part)
+        }
+        None => (KeyModifiers::NONE, key_id),
+    };
+
+    if event.modifiers != expected_mods {
+        return false;
+    }
+
+    match event.code {
+        KeyCode::Backspace => expected_key == Key::BACKSPACE,
+        KeyCode::Enter => expected_key == Key::ENTER,
+        KeyCode::Left => expected_key == Key::LEFT,
+        KeyCode::Right => expected_key == Key::RIGHT,
+        KeyCode::Up => expected_key == Key::UP,
+        KeyCode::Down => expected_key == Key::DOWN,
+        KeyCode::Home => expected_key == Key::HOME,
+        KeyCode::End => expected_key == Key::END,
+        KeyCode::Tab => expected_key == Key::TAB,
+        KeyCode::Delete => expected_key == Key::DELETE,
+        KeyCode::Esc => expected_key == Key::ESCAPE,
+        KeyCode::Char(ch) => {
+            let mut buf = [0u8; 4];
+            let lower = ch.to_ascii_lowercase();
+            expected_key == lower.encode_utf8(&mut buf)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
