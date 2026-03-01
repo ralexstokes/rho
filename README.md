@@ -2,22 +2,22 @@
 
 an agent harness.
 
-Minimal Rust reimplementation of core pi-mono ideas with:
-- shared provider/protocol contracts in `rho-core`
-- agent runtime + websocket server in `rho-agent`
-- websocket TUI client in `rho-tui`
-- top-level CLI in `rho`
+## Dependencies
+
+This repo provides a nix shell you can access with `nix develop`.
+
+Otherwise refer to `flake.nix` for any required dependencies.
 
 ## Documentation
 
-- mdBook source lives in `docs/`
-- Quickstart: [`docs/src/quickstart.md`](docs/src/quickstart.md)
-- Entry page: [`docs/src/index.md`](docs/src/index.md)
+[![docs](https://img.shields.io/badge/docs-GitBook-blue)](https://ralexstokes.gitbook.io/rho)
 
-To build docs locally:
+Refer to the documentation under `docs/` for more information.
+
+To serve docs locally:
 
 ```sh
-mdbook build docs
+mdbook serve docs
 ```
 
 ## License
