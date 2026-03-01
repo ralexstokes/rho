@@ -9,7 +9,7 @@ use ratatui::{
 
 use crate::{
     terminal::ProcessTerminal,
-    widgets::{TextBlock, loader_frame, section_block, spacer_lines, truncate_to_width},
+    widgets::{loader_frame, section_block, truncate_to_width},
 };
 
 use super::{
@@ -122,7 +122,6 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
     let flow_block = section_block("rho", app.theme.history_border);
     let flow_inner = flow_block.inner(flow_area);
     let flow_width = flow_inner.width.max(1);
-    let text_block = TextBlock::new(0, 0);
     let mut flow_lines = Vec::new();
     let tool_states = collapsed_tool_states(app.log_lines.as_slice());
     let mut rendered_collapsed_calls = HashSet::new();
@@ -172,7 +171,6 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
             body_width,
             render_mode,
             &app.theme,
-            &text_block,
         );
 
         let indent = " ".repeat(prefix.chars().count());
@@ -189,7 +187,7 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
     }
 
     if app.awaiting_assistant || app.active_assistant_line.is_some() {
-        flow_lines.extend(spacer_lines(1));
+        flow_lines.push(Line::from(String::new()));
         flow_lines.push(Line::from(vec![
             Span::styled("assistant> ", app.theme.assistant_prefix),
             Span::styled(
@@ -200,7 +198,7 @@ pub(super) fn draw_ui(frame: &mut Frame<'_>, app: &mut AppState) {
     }
 
     if !flow_lines.is_empty() {
-        flow_lines.extend(spacer_lines(1));
+        flow_lines.push(Line::from(String::new()));
     }
 
     let prompt = "you> ";

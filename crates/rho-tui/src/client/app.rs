@@ -6,7 +6,7 @@ use crate::{
     overlay::{OverlayAnchor, OverlayMargin, OverlayOptions, OverlayStack, SizeValue},
     select_list::SelectList,
     theme::UiTheme,
-    widgets::{TextBlock, render_markdown},
+    widgets::{render_markdown, text::wrap_text},
 };
 use ratatui::text::{Line, Span};
 use rho_core::protocol::{ErrorEvent, ServerEvent};
@@ -83,7 +83,6 @@ impl TranscriptRenderCache {
         width: u16,
         mode: TranscriptRenderMode,
         theme: &UiTheme,
-        text_block: &TextBlock,
     ) -> Vec<Line<'static>> {
         let key = TranscriptRenderKey {
             width,
@@ -96,7 +95,10 @@ impl TranscriptRenderCache {
         }
 
         let lines = match mode {
-            TranscriptRenderMode::Plain => text_block.render_lines(text, width),
+            TranscriptRenderMode::Plain => wrap_text(text, usize::from(width).max(1))
+                .into_iter()
+                .map(Line::from)
+                .collect(),
             TranscriptRenderMode::Markdown => render_markdown(text, width, theme),
         };
 
@@ -280,13 +282,7 @@ impl AppState {
                 self.should_quit = true;
                 true
             }
-            NetworkEvent::ReceiveError(err) => {
-                self.awaiting_assistant = false;
-                self.push_error(err);
-                self.should_quit = true;
-                true
-            }
-            NetworkEvent::ProtocolError(err) => {
+            NetworkEvent::ReceiveError(err) | NetworkEvent::ProtocolError(err) => {
                 self.awaiting_assistant = false;
                 self.push_error(err);
                 self.should_quit = true;
@@ -563,7 +559,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::widgets::TextBlock;
 
     #[test]
     fn tool_started_format_includes_call_id_name_and_input() {
@@ -676,25 +671,12 @@ mod tests {
     fn transcript_cache_reuses_rendered_entry() {
         let mut cache = TranscriptRenderCache::default();
         let theme = UiTheme::default();
-        let text_block = TextBlock::new(0, 0);
         let width = 20;
 
-        let _ = cache.render_lines(
-            "hello world",
-            width,
-            TranscriptRenderMode::Plain,
-            &theme,
-            &text_block,
-        );
+        let _ = cache.render_lines("hello world", width, TranscriptRenderMode::Plain, &theme);
         assert_eq!(cache.entries.len(), 1);
 
-        let _ = cache.render_lines(
-            "hello world",
-            width,
-            TranscriptRenderMode::Plain,
-            &theme,
-            &text_block,
-        );
+        let _ = cache.render_lines("hello world", width, TranscriptRenderMode::Plain, &theme);
         assert_eq!(cache.entries.len(), 1);
     }
 }
