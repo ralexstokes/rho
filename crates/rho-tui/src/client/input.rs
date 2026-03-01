@@ -90,7 +90,7 @@ fn handle_key_event(
             } else if app.overlays.hide_topmost() {
                 app.sync_overlay_ids();
                 state_changed = true;
-            } else {
+            } else if app.request_in_flight {
                 send_outbound(
                     outbound_tx,
                     ClientEvent::Cancel(CancelRequest {
@@ -292,13 +292,17 @@ fn submit_input(
     }
 
     if trimmed == "/cancel" {
-        send_outbound(
-            outbound_tx,
-            ClientEvent::Cancel(rho_core::protocol::CancelRequest {
-                session_id: app.session_id.clone(),
-            }),
-        )?;
-        app.push_system("cancel requested".to_string());
+        if app.request_in_flight {
+            send_outbound(
+                outbound_tx,
+                ClientEvent::Cancel(rho_core::protocol::CancelRequest {
+                    session_id: app.session_id.clone(),
+                }),
+            )?;
+            app.push_system("cancel requested".to_string());
+        } else {
+            app.push_system("nothing to cancel".to_string());
+        }
         return Ok(());
     }
 
@@ -321,6 +325,7 @@ fn submit_input(
         }),
     )?;
     app.awaiting_assistant = true;
+    app.request_in_flight = true;
 
     Ok(())
 }

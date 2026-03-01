@@ -48,6 +48,7 @@ pub(super) struct AppState {
     pub(super) tool_call_names: HashMap<String, String>,
     pub(super) collapse_tool_calls: bool,
     pub(super) awaiting_assistant: bool,
+    pub(super) request_in_flight: bool,
     pub(super) transcript_scroll_up: usize,
     pub(super) transcript_viewport_height: usize,
     pub(super) transcript_cache: TranscriptRenderCache,
@@ -144,6 +145,7 @@ impl AppState {
             tool_call_names: HashMap::new(),
             collapse_tool_calls: true,
             awaiting_assistant: false,
+            request_in_flight: false,
             transcript_scroll_up: 0,
             transcript_viewport_height: 0,
             transcript_cache: TranscriptRenderCache::default(),
@@ -263,11 +265,13 @@ impl AppState {
                 }
                 ServerEvent::Final(final_message) => {
                     self.awaiting_assistant = false;
+                    self.request_in_flight = false;
                     self.finalize_assistant(final_message.message.content);
                     true
                 }
                 ServerEvent::Error(error) => {
                     self.awaiting_assistant = false;
+                    self.request_in_flight = false;
                     if error.code == "cancelled" {
                         self.push_system(error.message);
                     } else {
