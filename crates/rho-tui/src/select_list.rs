@@ -51,7 +51,7 @@ impl SelectList {
         if self.items.is_empty() {
             return vec![Line::from(vec![Span::styled(
                 "  no suggestions",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Rgb(75, 82, 99)),
             )])];
         }
 
@@ -70,10 +70,10 @@ impl SelectList {
             let prefix = if selected { "→ " } else { "  " };
             let style = if selected {
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(Color::Rgb(198, 120, 221))
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(Color::Rgb(171, 178, 191))
             };
 
             let mut line = format!("{prefix}{}", item.label);
@@ -92,7 +92,7 @@ impl SelectList {
         if self.items.len() > self.max_visible {
             lines.push(Line::from(vec![Span::styled(
                 format!("  ({}/{})", self.selected + 1, self.items.len()),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Rgb(75, 82, 99)),
             )]));
         }
 

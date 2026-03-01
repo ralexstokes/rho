@@ -2,7 +2,7 @@ use ratatui::{
     Frame,
     layout::Rect,
     text::Line,
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 
 #[allow(dead_code)]
@@ -214,7 +214,12 @@ fn build_overlay_paragraph(
         .clone()
         .unwrap_or_else(|| "overlay".to_string());
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(title),
+        )
         .wrap(Wrap { trim: false });
     (paragraph, content_width, content_height)
 }
