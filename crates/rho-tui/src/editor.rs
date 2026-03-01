@@ -98,9 +98,7 @@ impl EditorState {
         let byte_index = char_to_byte_index(line.as_str(), self.cursor_col);
         line.insert(byte_index, ch);
         self.cursor_col += 1;
-        self.preferred_visual_col = None;
-        self.last_action = LastAction::Other;
-        self.last_yank_len = None;
+        self.reset_action_state();
     }
 
     pub fn insert_newline(&mut self) {
@@ -112,18 +110,14 @@ impl EditorState {
         self.lines.insert(self.cursor_line + 1, tail);
         self.cursor_line += 1;
         self.cursor_col = 0;
-        self.preferred_visual_col = None;
-        self.last_action = LastAction::Other;
-        self.last_yank_len = None;
+        self.reset_action_state();
     }
 
     pub fn insert_text(&mut self, text: &str) {
         self.push_undo_snapshot();
         self.exit_history_mode();
         self.insert_text_internal(text);
-        self.preferred_visual_col = None;
-        self.last_action = LastAction::Other;
-        self.last_yank_len = None;
+        self.reset_action_state();
     }
 
     pub fn handle_paste(&mut self, pasted_text: String) {
@@ -153,9 +147,7 @@ impl EditorState {
             self.cursor_line -= 1;
             self.cursor_col = char_len(self.lines[self.cursor_line].as_str());
         }
-        self.preferred_visual_col = None;
-        self.last_action = LastAction::Other;
-        self.last_yank_len = None;
+        self.reset_action_state();
     }
 
     pub fn move_right(&mut self) {
@@ -166,9 +158,7 @@ impl EditorState {
             self.cursor_line += 1;
             self.cursor_col = 0;
         }
-        self.preferred_visual_col = None;
-        self.last_action = LastAction::Other;
-        self.last_yank_len = None;
+        self.reset_action_state();
     }
 
     pub fn move_up(&mut self) {
@@ -179,9 +169,8 @@ impl EditorState {
         let target_col = self.preferred_visual_col.unwrap_or(self.cursor_col);
         self.cursor_line -= 1;
         self.cursor_col = min(target_col, char_len(self.lines[self.cursor_line].as_str()));
+        self.reset_action_state();
         self.preferred_visual_col = Some(target_col);
-        self.last_action = LastAction::Other;
-        self.last_yank_len = None;
     }
 
     pub fn move_down(&mut self) {
@@ -192,23 +181,18 @@ impl EditorState {
         let target_col = self.preferred_visual_col.unwrap_or(self.cursor_col);
         self.cursor_line += 1;
         self.cursor_col = min(target_col, char_len(self.lines[self.cursor_line].as_str()));
+        self.reset_action_state();
         self.preferred_visual_col = Some(target_col);
-        self.last_action = LastAction::Other;
-        self.last_yank_len = None;
     }
 
     pub fn move_home(&mut self) {
         self.cursor_col = 0;
-        self.preferred_visual_col = None;
-        self.last_action = LastAction::Other;
-        self.last_yank_len = None;
+        self.reset_action_state();
     }
 
     pub fn move_end(&mut self) {
         self.cursor_col = char_len(self.lines[self.cursor_line].as_str());
-        self.preferred_visual_col = None;
-        self.last_action = LastAction::Other;
-        self.last_yank_len = None;
+        self.reset_action_state();
     }
 
     pub fn backspace(&mut self) {
@@ -218,23 +202,8 @@ impl EditorState {
 
         self.push_undo_snapshot();
         self.exit_history_mode();
-
-        if self.cursor_col > 0 {
-            let line = &mut self.lines[self.cursor_line];
-            let start = char_to_byte_index(line.as_str(), self.cursor_col - 1);
-            let end = char_to_byte_index(line.as_str(), self.cursor_col);
-            line.replace_range(start..end, "");
-            self.cursor_col -= 1;
-        } else {
-            let tail = self.lines.remove(self.cursor_line);
-            self.cursor_line -= 1;
-            self.cursor_col = char_len(self.lines[self.cursor_line].as_str());
-            self.lines[self.cursor_line].push_str(tail.as_str());
-        }
-
-        self.preferred_visual_col = None;
-        self.last_action = LastAction::Other;
-        self.last_yank_len = None;
+        self.backspace_without_undo();
+        self.reset_action_state();
     }
 
     pub fn delete(&mut self) {
@@ -256,9 +225,7 @@ impl EditorState {
             self.lines[self.cursor_line].push_str(tail.as_str());
         }
 
-        self.preferred_visual_col = None;
-        self.last_action = LastAction::Other;
-        self.last_yank_len = None;
+        self.reset_action_state();
     }
 
     pub fn delete_word_backward(&mut self) {
@@ -346,9 +313,7 @@ impl EditorState {
             self.cursor_line = snapshot.cursor_line;
             self.cursor_col = snapshot.cursor_col;
             self.history_index = None;
-            self.preferred_visual_col = None;
-            self.last_action = LastAction::Other;
-            self.last_yank_len = None;
+            self.reset_action_state();
         }
     }
 
@@ -455,9 +420,7 @@ impl EditorState {
         let end_byte = char_to_byte_index(line.as_str(), self.cursor_col);
         line.replace_range(start_byte..end_byte, replacement);
         self.cursor_col = start_col + replacement.chars().count();
-        self.preferred_visual_col = None;
-        self.last_action = LastAction::Other;
-        self.last_yank_len = None;
+        self.reset_action_state();
     }
 
     pub fn render(&self, width: usize, height: usize) -> EditorRender {
@@ -548,6 +511,12 @@ impl EditorState {
 
     fn exit_history_mode(&mut self) {
         self.history_index = None;
+    }
+
+    fn reset_action_state(&mut self) {
+        self.preferred_visual_col = None;
+        self.last_action = LastAction::Other;
+        self.last_yank_len = None;
     }
 
     fn insert_text_internal(&mut self, text: &str) {

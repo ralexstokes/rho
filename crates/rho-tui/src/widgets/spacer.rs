@@ -1,5 +1,5 @@
 use ratatui::text::Line;
 
-pub fn spacer_lines(lines: usize) -> Vec<Line<'static>> {
-    (0..lines).map(|_| Line::from(String::new())).collect()
+pub fn spacer_lines(count: usize) -> Vec<Line<'static>> {
+    vec![Line::from(String::new()); count]
 }

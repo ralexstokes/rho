@@ -297,15 +297,19 @@ fn resolve_overlay_rect_from_content(
 }
 
 fn max_content_width(lines: &[Line<'_>]) -> u16 {
-    let mut max_width = 1u16;
-    for line in lines {
-        let width = u16::try_from(line.spans.iter().fold(0usize, |sum, span| {
-            sum.saturating_add(span.content.chars().count())
-        }))
-        .unwrap_or(u16::MAX);
-        max_width = max_width.max(width);
-    }
-    max_width
+    lines
+        .iter()
+        .map(|line| {
+            u16::try_from(
+                line.spans
+                    .iter()
+                    .map(|span| span.content.chars().count())
+                    .sum::<usize>(),
+            )
+            .unwrap_or(u16::MAX)
+        })
+        .max()
+        .unwrap_or(1)
 }
 
 fn anchor_row(anchor: OverlayAnchor, available_height: u16, overlay_height: u16) -> u16 {
