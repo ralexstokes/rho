@@ -5,9 +5,10 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
+eventsource-stream.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
-rig.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

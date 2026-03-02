@@ -1,33 +1,21 @@
-use std::pin::Pin;
+use std::{pin::Pin, sync::OnceLock};
 
 use futures_core::Stream;
-use futures_util::StreamExt;
-use rig::{
-    OneOrMany,
-    completion::{
-        AssistantContent as RigAssistantContent, CompletionError as RigCompletionError,
-        CompletionModel as RigCompletionModel,
-        CompletionRequestBuilder as RigCompletionRequestBuilder, GetTokenUsage,
-        Message as RigMessage, ToolDefinition as RigToolDefinition,
-        message::{ToolResultContent as RigToolResultContent, UserContent as RigUserContent},
-    },
-    http_client::Error as RigHttpError,
-    streaming::{StreamedAssistantContent, StreamingCompletionResponse},
-};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 pub use tokio_util::sync::CancellationToken;
 
 use crate::{
-    message::{Message, MessageRole, decode_assistant_message_content},
+    message::{Message, MessageRole},
     stream::ProviderEvent,
-    tool::{ToolCall, ToolDefinition},
+    tool::ToolDefinition,
 };
 
 pub mod anthropic;
 pub mod openai;
 
 const DEFAULT_TOOL_RESULT_CALL_ID: &str = "tool-result";
+const MAX_ERROR_BODY_LEN: usize = 512;
 
 pub type ProviderStream = Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderError>> + Send>>;
 
@@ -112,237 +100,128 @@ pub(crate) fn validate_api_key(
     Ok(api_key)
 }
 
-#[derive(Debug)]
-pub(crate) struct RigChatRequest {
-    pub model: String,
-    pub prompt: RigMessage,
-    pub history: Vec<RigMessage>,
-    pub preamble: Option<String>,
-    pub tools: Vec<RigToolDefinition>,
+pub(crate) fn shared_http_client() -> Result<reqwest::Client, ProviderError> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(map_reqwest_error)?;
+    let _ = CLIENT.set(client);
+
+    Ok(CLIENT
+        .get()
+        .expect("shared HTTP client should be initialized")
+        .clone())
 }
 
-pub(crate) fn to_rig_chat_request(
+#[derive(Debug)]
+pub(crate) struct NormalizedProviderRequest<'a> {
+    pub model: String,
+    pub system: Option<String>,
+    pub messages: Vec<&'a Message>,
+    pub tools: &'a [ToolDefinition],
+}
+
+pub(crate) fn normalize_provider_request(
     request: ProviderRequest<'_>,
-) -> Result<RigChatRequest, ProviderError> {
+) -> Result<NormalizedProviderRequest<'_>, ProviderError> {
     let mut system_sections = Vec::new();
     let mut chat_messages = Vec::new();
 
     for message in request.messages {
         match message.role {
             MessageRole::System => system_sections.push(message.content.clone()),
-            MessageRole::User => chat_messages.push(RigMessage::from(RigUserContent::text(
-                message.content.clone(),
-            ))),
-            MessageRole::Assistant => {
-                chat_messages.push(to_rig_assistant_message(&message.content));
-            }
-            MessageRole::Tool => chat_messages.push(to_rig_tool_result_message(&message.content)),
+            _ => chat_messages.push(message),
         }
     }
 
-    let Some(prompt) = chat_messages.pop() else {
+    if chat_messages.is_empty() {
         return Err(ProviderError::Transport(
             "provider request must include at least one non-system message".to_string(),
         ));
-    };
+    }
 
-    let preamble = if system_sections.is_empty() {
+    let system = if system_sections.is_empty() {
         None
     } else {
         Some(system_sections.join("\n\n"))
     };
 
-    Ok(RigChatRequest {
+    Ok(NormalizedProviderRequest {
         model: request.model.to_string(),
-        prompt,
-        history: chat_messages,
-        preamble,
-        tools: request
-            .tools
-            .iter()
-            .map(|tool| RigToolDefinition {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
-            })
-            .collect(),
+        system,
+        messages: chat_messages,
+        tools: request.tools,
     })
 }
 
-pub(crate) fn rig_choice_text(choice: &OneOrMany<RigAssistantContent>) -> String {
-    choice
-        .iter()
-        .filter_map(|item| match item {
-            RigAssistantContent::Text(text) => Some(text.text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
+pub(crate) fn map_reqwest_error(error: reqwest::Error) -> ProviderError {
+    ProviderError::Transport(error.to_string())
 }
 
-pub(crate) fn map_rig_completion_error(
+pub(crate) fn map_status_error(
     env_var: &'static str,
-    error: RigCompletionError,
+    status_code: u16,
+    response_body: &str,
 ) -> ProviderError {
-    match error {
-        RigCompletionError::HttpError(http_error) => map_rig_http_error(env_var, http_error),
-        RigCompletionError::ProviderError(message) if looks_like_auth_error(&message) => {
-            ProviderError::InvalidApiKey(env_var)
-        }
-        other => ProviderError::Transport(other.to_string()),
+    if is_auth_status(status_code) || looks_like_auth_error(response_body) {
+        return ProviderError::InvalidApiKey(env_var);
+    }
+
+    let response_body = sanitized_error_body(response_body);
+    if response_body.is_empty() {
+        ProviderError::Transport(format!("provider returned HTTP status {status_code}"))
+    } else {
+        ProviderError::Transport(format!(
+            "provider returned HTTP status {status_code}: {response_body}"
+        ))
     }
 }
 
-pub(crate) fn map_rig_http_error(env_var: &'static str, error: RigHttpError) -> ProviderError {
-    match error {
-        RigHttpError::InvalidStatusCode(status)
-        | RigHttpError::InvalidStatusCodeWithMessage(status, _)
-            if is_auth_status(status.as_u16()) =>
-        {
-            ProviderError::InvalidApiKey(env_var)
-        }
-        other => ProviderError::Transport(other.to_string()),
-    }
-}
-
-fn looks_like_auth_error(message: &str) -> bool {
+pub(crate) fn looks_like_auth_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("unauthorized")
         || lower.contains("forbidden")
         || lower.contains("invalid_api_key")
+        || lower.contains("invalid api key")
         || lower.contains("status code: 401")
         || lower.contains("status code: 403")
+        || lower.contains("authentication_error")
 }
 
-pub(crate) fn map_streamed_assistant_chunk<R>(
-    chunk: StreamedAssistantContent<R>,
-) -> Option<ProviderEvent> {
-    match chunk {
-        StreamedAssistantContent::Text(text) if !text.text.is_empty() => {
-            Some(ProviderEvent::AssistantDelta { delta: text.text })
-        }
-        StreamedAssistantContent::ToolCall { tool_call, .. } => {
-            let id = tool_call.id;
-            let call_id = tool_call.call_id.unwrap_or_else(|| id.clone());
-            Some(ProviderEvent::ToolCall {
-                call: crate::tool::ToolCall {
-                    id: Some(id),
-                    call_id,
-                    name: tool_call.function.name,
-                    input: tool_call.function.arguments,
-                },
-            })
-        }
-        _ => None,
-    }
+#[derive(Debug, Clone)]
+pub(crate) struct NormalizedToolResultMessage {
+    pub call_id: String,
+    pub output: String,
+    pub is_error: bool,
 }
 
-pub(crate) fn apply_common_request_options<M>(
-    builder: RigCompletionRequestBuilder<M>,
-    preamble: Option<String>,
-    tools: Vec<RigToolDefinition>,
-) -> RigCompletionRequestBuilder<M>
-where
-    M: RigCompletionModel,
-{
-    let builder = if let Some(preamble) = preamble {
-        builder.preamble(preamble)
-    } else {
-        builder
-    };
-
-    if tools.is_empty() {
-        builder
-    } else {
-        builder.tools(tools)
-    }
-}
-
-pub(crate) fn stream_from_response<R>(
-    mut stream: StreamingCompletionResponse<R>,
-    env_var: &'static str,
-    cancel: CancellationToken,
-) -> ProviderStream
-where
-    R: Clone + Unpin + GetTokenUsage + Send + 'static,
-{
-    Box::pin(async_stream::try_stream! {
-        loop {
-            let next = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    stream.cancel();
-                    return;
-                }
-                next = stream.next() => next,
-            };
-            match next {
-                Some(Ok(chunk)) => {
-                    if let Some(event) = map_streamed_assistant_chunk(chunk) {
-                        yield event;
-                    }
-                }
-                Some(Err(error)) => {
-                    Err(map_rig_completion_error(env_var, error))?;
-                }
-                None => break,
-            }
-        }
-
-        let message = Message::new(MessageRole::Assistant, rig_choice_text(&stream.choice));
-        yield ProviderEvent::Message { message };
-        yield ProviderEvent::Finished;
-    })
-}
-
-fn to_rig_tool_result_message(content: &str) -> RigMessage {
-    let (call_id, output) = match serde_json::from_str::<ToolMessagePayload>(content) {
+pub(crate) fn normalize_tool_result_message(content: &str) -> NormalizedToolResultMessage {
+    match serde_json::from_str::<ToolMessagePayload>(content) {
         Ok(payload) => {
             let call_id = normalize_tool_result_call_id(payload.call_id);
-            let output = serde_json::to_string(&RigToolMessagePayload {
+            let output = serde_json::to_string(&ModelToolMessagePayload {
                 is_error: payload.is_error,
                 output: payload.output.as_str(),
             })
             .unwrap_or_else(|_| content.to_string());
-            (call_id, output)
+
+            NormalizedToolResultMessage {
+                call_id,
+                output,
+                is_error: payload.is_error,
+            }
         }
-        Err(_) => (DEFAULT_TOOL_RESULT_CALL_ID.to_string(), content.to_string()),
-    };
-
-    RigMessage::from(RigUserContent::tool_result_with_call_id(
-        call_id.clone(),
-        call_id,
-        RigToolResultContent::from_tool_output(output),
-    ))
-}
-
-fn to_rig_assistant_message(content: &str) -> RigMessage {
-    let parsed = decode_assistant_message_content(content);
-    if parsed.tool_calls.is_empty() {
-        return RigMessage::from(RigAssistantContent::text(parsed.text));
+        Err(_) => NormalizedToolResultMessage {
+            call_id: DEFAULT_TOOL_RESULT_CALL_ID.to_string(),
+            output: content.to_string(),
+            is_error: false,
+        },
     }
-
-    let mut assistant_content = Vec::new();
-    if !parsed.text.is_empty() {
-        assistant_content.push(RigAssistantContent::text(parsed.text));
-    }
-    assistant_content.extend(
-        parsed
-            .tool_calls
-            .into_iter()
-            .map(to_rig_assistant_tool_call),
-    );
-
-    RigMessage::Assistant {
-        id: None,
-        content: OneOrMany::many(assistant_content)
-            .expect("assistant message with tool calls should not be empty"),
-    }
-}
-
-fn to_rig_assistant_tool_call(call: ToolCall) -> RigAssistantContent {
-    let id = call.id.unwrap_or_else(|| call.call_id.clone());
-    RigAssistantContent::tool_call_with_call_id(id, call.call_id, call.name, call.input)
 }
 
 #[derive(Debug, Deserialize)]
@@ -354,7 +233,7 @@ struct ToolMessagePayload {
 }
 
 #[derive(Debug, Serialize)]
-struct RigToolMessagePayload<'a> {
+struct ModelToolMessagePayload<'a> {
     is_error: bool,
     output: &'a str,
 }
@@ -365,6 +244,20 @@ fn normalize_tool_result_call_id(call_id: String) -> String {
     } else {
         call_id
     }
+}
+
+fn sanitized_error_body(body: &str) -> String {
+    let collapsed = body.trim().replace('\n', " ");
+    if collapsed.is_empty() {
+        return String::new();
+    }
+
+    let mut truncated: String = collapsed.chars().take(MAX_ERROR_BODY_LEN).collect();
+    if collapsed.chars().count() > MAX_ERROR_BODY_LEN {
+        truncated.push_str("...");
+    }
+
+    truncated
 }
 
 fn is_auth_status(status_code: u16) -> bool {
@@ -379,197 +272,91 @@ pub trait Provider: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use rig::completion::{
-        AssistantContent as RigAssistantContent, Message as RigMessage,
-        message::UserContent as RigUserContent,
-    };
     use serde_json::json;
 
     use super::*;
-    use crate::{Message, message::encode_assistant_message_content};
 
     #[test]
-    fn to_rig_chat_request_extracts_preamble_prompt_history_and_tools() {
+    fn normalize_provider_request_extracts_system_and_chat_messages() {
         let messages = vec![
             Message::new(MessageRole::System, "system-a"),
             Message::new(MessageRole::System, "system-b"),
             Message::new(MessageRole::User, "first"),
             Message::new(MessageRole::Assistant, "second"),
-            Message::new(
-                MessageRole::Tool,
-                json!({
-                    "call_id": "call-1",
-                    "is_error": false,
-                    "output": "file-content",
-                })
-                .to_string(),
-            ),
-            Message::new(MessageRole::User, "final-prompt"),
         ];
         let tools = vec![ToolDefinition {
             name: "read".to_string(),
             description: "read file".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "path": { "type": "string" } },
-                "required": ["path"],
-            }),
+            parameters: json!({ "type": "object" }),
         }];
+
         let request = ProviderRequest::new(ModelKind::Gpt52, &messages).with_tools(&tools);
+        let normalized = normalize_provider_request(request).expect("request should normalize");
 
-        let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
-
-        assert_eq!(rig_request.model, ModelKind::Gpt52.as_str());
-        assert_eq!(
-            rig_request.preamble,
-            Some("system-a\n\nsystem-b".to_string())
-        );
-        assert_eq!(rig_request.history.len(), 3);
-        assert_eq!(rig_request.tools.len(), 1);
-        assert_eq!(rig_request.tools[0].name, "read");
-
-        assert!(matches!(
-            &rig_request.prompt,
-            RigMessage::User { content }
-            if matches!(content.first_ref(), RigUserContent::Text(text) if text.text == "final-prompt")
-        ));
+        assert_eq!(normalized.model, ModelKind::Gpt52.as_str());
+        assert_eq!(normalized.system, Some("system-a\n\nsystem-b".to_string()));
+        assert_eq!(normalized.messages.len(), 2);
+        assert_eq!(normalized.messages[0].content, "first");
+        assert_eq!(normalized.messages[1].content, "second");
+        assert_eq!(normalized.tools.len(), 1);
+        assert_eq!(normalized.tools[0].name, "read");
     }
 
     #[test]
-    fn to_rig_chat_request_requires_a_non_system_prompt() {
-        let messages = vec![Message::new(MessageRole::System, "only system")];
+    fn normalize_provider_request_requires_non_system_message() {
+        let messages = vec![Message::new(MessageRole::System, "system-only")];
         let request = ProviderRequest::new(ModelKind::Gpt52, &messages);
 
-        let error = to_rig_chat_request(request).expect_err("conversion should fail");
+        let error = normalize_provider_request(request).expect_err("request should fail");
         assert!(matches!(error, ProviderError::Transport(_)));
     }
 
     #[test]
-    fn to_rig_chat_request_preserves_tool_result_call_id() {
-        let messages = vec![
-            Message::new(MessageRole::User, "first"),
-            Message::new(
-                MessageRole::Tool,
-                json!({
-                    "call_id": "call-123",
-                    "is_error": false,
-                    "output": "result",
-                })
-                .to_string(),
-            ),
-            Message::new(MessageRole::User, "next"),
-        ];
-        let request = ProviderRequest::new(ModelKind::Gpt52, &messages);
+    fn normalize_tool_result_message_preserves_call_id_and_output() {
+        let normalized = normalize_tool_result_message(
+            &json!({
+                "call_id": "call-123",
+                "is_error": true,
+                "output": "result",
+            })
+            .to_string(),
+        );
 
-        let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
-        assert!(matches!(
-            &rig_request.history[1],
-            RigMessage::User { content }
-                if matches!(
-                    content.first_ref(),
-                    RigUserContent::ToolResult(tool_result)
-                        if tool_result.id == "call-123"
-                            && tool_result.call_id.as_deref() == Some("call-123")
-                )
-        ));
+        assert_eq!(normalized.call_id, "call-123");
+        assert!(normalized.is_error);
+        assert_eq!(
+            normalized.output,
+            json!({ "is_error": true, "output": "result" }).to_string()
+        );
     }
 
     #[test]
-    fn to_rig_chat_request_preserves_assistant_tool_calls() {
-        let messages = vec![
-            Message::new(MessageRole::User, "first"),
-            Message::new(
-                MessageRole::Assistant,
-                encode_assistant_message_content(
-                    "",
-                    &[ToolCall {
-                        id: Some("toolu_123".to_string()),
-                        call_id: "toolu_123".to_string(),
-                        name: "read".to_string(),
-                        input: json!({ "path": "README.md" }),
-                    }],
-                ),
-            ),
-            Message::new(
-                MessageRole::Tool,
-                json!({
-                    "call_id": "toolu_123",
-                    "is_error": false,
-                    "output": "ok",
-                })
-                .to_string(),
-            ),
-            Message::new(MessageRole::User, "next"),
-        ];
-        let request = ProviderRequest::new(ModelKind::Gpt52, &messages);
-
-        let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
-        assert!(matches!(
-            &rig_request.history[1],
-            RigMessage::Assistant { content, .. }
-                if matches!(
-                    content.first_ref(),
-                    RigAssistantContent::ToolCall(tool_call)
-                        if tool_call.id == "toolu_123"
-                            && tool_call.call_id.as_deref() == Some("toolu_123")
-                            && tool_call.function.name == "read"
-                            && tool_call.function.arguments == json!({ "path": "README.md" })
-                )
-        ));
+    fn normalize_tool_result_message_uses_fallback_for_non_json_content() {
+        let normalized = normalize_tool_result_message("raw output");
+        assert_eq!(normalized.call_id, "tool-result");
+        assert_eq!(normalized.output, "raw output");
+        assert!(!normalized.is_error);
     }
 
     #[test]
     fn validate_api_key_rejects_missing_value() {
-        let error = validate_api_key("TEST_KEY", None).expect_err("missing API key should fail");
+        let error = validate_api_key("TEST_KEY", None).expect_err("missing key should fail");
         assert!(matches!(error, ProviderError::MissingApiKey("TEST_KEY")));
     }
 
     #[test]
     fn validate_api_key_rejects_blank_value() {
         let error = validate_api_key("TEST_KEY", Some("   ".to_string()))
-            .expect_err("blank API key should fail");
+            .expect_err("blank key should fail");
         assert!(matches!(error, ProviderError::InvalidApiKey("TEST_KEY")));
     }
 
     #[test]
-    fn to_rig_chat_request_preserves_distinct_tool_call_id_and_call_id() {
-        let messages = vec![
-            Message::new(MessageRole::User, "first"),
-            Message::new(
-                MessageRole::Assistant,
-                encode_assistant_message_content(
-                    "",
-                    &[ToolCall {
-                        id: Some("fc_123".to_string()),
-                        call_id: "call_123".to_string(),
-                        name: "read".to_string(),
-                        input: json!({ "path": "README.md" }),
-                    }],
-                ),
-            ),
-            Message::new(
-                MessageRole::Tool,
-                json!({
-                    "call_id": "call_123",
-                    "is_error": false,
-                    "output": "ok",
-                })
-                .to_string(),
-            ),
-            Message::new(MessageRole::User, "next"),
-        ];
-        let request = ProviderRequest::new(ModelKind::Gpt52, &messages);
-
-        let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
+    fn map_status_error_maps_auth_status_to_invalid_api_key() {
+        let error = map_status_error("OPENAI_API_KEY", 401, "Unauthorized");
         assert!(matches!(
-            &rig_request.history[1],
-            RigMessage::Assistant { content, .. }
-                if matches!(
-                    content.first_ref(),
-                    RigAssistantContent::ToolCall(tool_call)
-                        if tool_call.id == "fc_123"
-                            && tool_call.call_id.as_deref() == Some("call_123")
-                )
+            error,
+            ProviderError::InvalidApiKey("OPENAI_API_KEY")
         ));
     }
 }
