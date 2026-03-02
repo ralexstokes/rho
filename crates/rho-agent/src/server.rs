@@ -16,9 +16,7 @@ use rho_core::{
         ClientEnvelope, ClientEvent, ErrorEvent, PROTOCOL_VERSION, ServerEnvelope, ServerEvent,
         SessionAck,
     },
-    providers::{
-        ModelKind, Provider, ProviderKind, anthropic::AnthropicProvider, openai::OpenAiProvider,
-    },
+    providers::{ModelKind, Provider, ProviderKind, RigProvider},
 };
 use thiserror::Error;
 use tokio::{
@@ -126,8 +124,8 @@ pub enum AgentServerError {
 
 pub fn build_provider(kind: ProviderKind) -> Result<Arc<dyn Provider>, AgentServerError> {
     match kind {
-        ProviderKind::OpenAi => Ok(Arc::new(OpenAiProvider::new())),
-        ProviderKind::Anthropic => Ok(Arc::new(AnthropicProvider::new())),
+        ProviderKind::OpenAi => Ok(Arc::new(RigProvider::new(ProviderKind::OpenAi))),
+        ProviderKind::Anthropic => Ok(Arc::new(RigProvider::new(ProviderKind::Anthropic))),
         _ => Err(AgentServerError::UnsupportedProviderKind(format!(
             "{kind:?}"
         ))),
