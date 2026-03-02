@@ -182,6 +182,19 @@ pub(crate) fn map_status_error(
     }
 }
 
+pub(crate) async fn ensure_success_status(
+    env_var: &'static str,
+    response: reqwest::Response,
+) -> Result<reqwest::Response, ProviderError> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    Err(map_status_error(env_var, status, &body))
+}
+
 pub(crate) fn looks_like_auth_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("unauthorized")

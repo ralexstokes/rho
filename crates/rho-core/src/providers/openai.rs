@@ -9,8 +9,9 @@ use crate::{
     message::{Message, MessageRole, decode_assistant_message_content},
     providers::{
         CancellationToken, Provider, ProviderError, ProviderKind, ProviderRequest, ProviderStream,
-        looks_like_auth_error, map_reqwest_error, map_status_error, normalize_provider_request,
-        normalize_tool_result_message, shared_http_client, validate_api_key,
+        ensure_success_status, looks_like_auth_error, map_reqwest_error,
+        normalize_provider_request, normalize_tool_result_message, shared_http_client,
+        validate_api_key,
     },
     stream::ProviderEvent,
     tool::{ToolCall, ToolDefinition},
@@ -55,14 +56,8 @@ impl Provider for OpenAiProvider {
                 .await
                 .map_err(map_reqwest_error)?;
 
-            let mut event_stream = if response.status().is_success() {
-                response.bytes_stream().eventsource()
-            } else {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                Err(map_status_error(OPENAI_API_KEY_ENV, status, &body))?;
-                unreachable!("error path should have returned");
-            };
+            let response = ensure_success_status(OPENAI_API_KEY_ENV, response).await?;
+            let mut event_stream = response.bytes_stream().eventsource();
             let mut pending_tool_calls = BTreeMap::<usize, PendingOpenAiToolCall>::new();
             let mut assistant_text = String::new();
 
