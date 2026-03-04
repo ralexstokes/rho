@@ -1,9 +1,13 @@
-use std::pin::Pin;
+use std::{
+    pin::Pin,
+    sync::{Arc, OnceLock},
+};
 
 use futures_core::Stream;
 use futures_util::StreamExt;
 use rig::{
     OneOrMany,
+    client::completion::CompletionClient,
     completion::{
         AssistantContent as RigAssistantContent, CompletionError as RigCompletionError,
         CompletionModel as RigCompletionModel,
@@ -12,6 +16,7 @@ use rig::{
         message::{ToolResultContent as RigToolResultContent, UserContent as RigUserContent},
     },
     http_client::Error as RigHttpError,
+    providers::{anthropic, openai},
     streaming::{StreamedAssistantContent, StreamingCompletionResponse},
 };
 use serde::{Deserialize, Serialize};
@@ -24,10 +29,10 @@ use crate::{
     tool::{ToolCall, ToolDefinition},
 };
 
-pub mod anthropic;
-pub mod openai;
-
 const DEFAULT_TOOL_RESULT_CALL_ID: &str = "tool-result";
+const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
+const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
+const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
 pub type ProviderStream = Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderError>> + Send>>;
 
@@ -101,6 +106,101 @@ pub enum ProviderError {
     Transport(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct RigProvider {
+    kind: ProviderKind,
+    client: Arc<OnceLock<RigClient>>,
+}
+
+impl RigProvider {
+    pub fn new(kind: ProviderKind) -> Self {
+        Self {
+            kind,
+            client: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn client(&self) -> Result<RigClient, ProviderError> {
+        if let Some(client) = self.client.get() {
+            return Ok(client.clone());
+        }
+
+        let client = build_rig_client(self.kind)?;
+        let _ = self.client.set(client);
+
+        Ok(self
+            .client
+            .get()
+            .expect("provider client should be initialized")
+            .clone())
+    }
+}
+
+impl Provider for RigProvider {
+    fn kind(&self) -> ProviderKind {
+        self.kind
+    }
+
+    fn stream(&self, request: ProviderRequest<'_>, cancel: CancellationToken) -> ProviderStream {
+        let rig_request = to_rig_chat_request(request);
+        let client = self.client();
+
+        Box::pin(async_stream::try_stream! {
+            let client = client?;
+            let rig_request = rig_request?;
+
+            match client {
+                RigClient::OpenAi(client) => {
+                    let builder = client
+                        .completion_model(rig_request.model.clone())
+                        .completion_request(rig_request.prompt)
+                        .messages(rig_request.history);
+                    let builder = apply_common_request_options(
+                        builder,
+                        rig_request.preamble,
+                        rig_request.tools,
+                    );
+
+                    let stream = builder
+                        .stream()
+                        .await
+                        .map_err(|error| map_rig_completion_error(OPENAI_API_KEY_ENV, error))?;
+
+                    for await event in
+                        stream_from_response(stream, OPENAI_API_KEY_ENV, cancel)
+                    {
+                        yield event?;
+                    }
+                }
+                RigClient::Anthropic(client) => {
+                    let model = client
+                        .completion_model(rig_request.model.clone())
+                        .with_prompt_caching();
+                    let builder = model
+                        .completion_request(rig_request.prompt)
+                        .messages(rig_request.history);
+                    let builder = apply_common_request_options(
+                        builder,
+                        rig_request.preamble,
+                        rig_request.tools,
+                    );
+
+                    let stream = builder
+                        .stream()
+                        .await
+                        .map_err(|error| map_rig_completion_error(ANTHROPIC_API_KEY_ENV, error))?;
+
+                    for await event in
+                        stream_from_response(stream, ANTHROPIC_API_KEY_ENV, cancel)
+                    {
+                        yield event?;
+                    }
+                }
+            }
+        })
+    }
+}
+
 pub(crate) fn validate_api_key(
     env_var: &'static str,
     api_key: Option<String>,
@@ -110,6 +210,57 @@ pub(crate) fn validate_api_key(
         return Err(ProviderError::InvalidApiKey(env_var));
     }
     Ok(api_key)
+}
+
+#[derive(Debug, Clone)]
+enum RigClient {
+    OpenAi(openai::Client),
+    Anthropic(anthropic::Client),
+}
+
+fn build_rig_client(kind: ProviderKind) -> Result<RigClient, ProviderError> {
+    match kind {
+        ProviderKind::OpenAi => {
+            let api_key = openai_api_key()?;
+            Ok(RigClient::OpenAi(openai_client(api_key)?))
+        }
+        ProviderKind::Anthropic => {
+            let api_key = anthropic_api_key()?;
+            Ok(RigClient::Anthropic(anthropic_client(api_key)?))
+        }
+    }
+}
+
+fn openai_api_key() -> Result<String, ProviderError> {
+    validate_api_key(OPENAI_API_KEY_ENV, std::env::var(OPENAI_API_KEY_ENV).ok())
+}
+
+fn openai_client(api_key: String) -> Result<openai::Client, ProviderError> {
+    let mut builder = openai::Client::builder().api_key(api_key);
+
+    if let Ok(base_url) = std::env::var(OPENAI_BASE_URL_ENV)
+        && !base_url.trim().is_empty()
+    {
+        builder = builder.base_url(&base_url);
+    }
+
+    builder
+        .build()
+        .map_err(|error| map_rig_http_error(OPENAI_API_KEY_ENV, error))
+}
+
+fn anthropic_api_key() -> Result<String, ProviderError> {
+    validate_api_key(
+        ANTHROPIC_API_KEY_ENV,
+        std::env::var(ANTHROPIC_API_KEY_ENV).ok(),
+    )
+}
+
+fn anthropic_client(api_key: String) -> Result<anthropic::Client, ProviderError> {
+    anthropic::Client::builder()
+        .api_key(api_key)
+        .build()
+        .map_err(|error| map_rig_http_error(ANTHROPIC_API_KEY_ENV, error))
 }
 
 #[derive(Debug)]
@@ -379,11 +530,15 @@ pub trait Provider: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use rig::completion::{
-        AssistantContent as RigAssistantContent, Message as RigMessage,
-        message::UserContent as RigUserContent,
+    use rig::{
+        completion::{
+            AssistantContent as RigAssistantContent, Message as RigMessage,
+            message::{ToolResultContent as RigToolResultContent, UserContent as RigUserContent},
+        },
+        message::{ToolCall as RigToolCall, ToolFunction as RigToolFunction},
+        streaming::StreamedAssistantContent,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::{Message, message::encode_assistant_message_content};
@@ -472,6 +627,85 @@ mod tests {
                             && tool_result.call_id.as_deref() == Some("call-123")
                 )
         ));
+    }
+
+    #[test]
+    fn to_rig_chat_request_normalizes_blank_tool_result_call_id() {
+        let messages = vec![
+            Message::new(MessageRole::User, "first"),
+            Message::new(
+                MessageRole::Tool,
+                json!({
+                    "call_id": "   ",
+                    "is_error": true,
+                    "output": "boom",
+                })
+                .to_string(),
+            ),
+            Message::new(MessageRole::User, "next"),
+        ];
+        let request = ProviderRequest::new(ModelKind::Gpt52, &messages);
+
+        let rig_request = to_rig_chat_request(request).expect("request conversion should succeed");
+
+        let RigMessage::User { content } = &rig_request.history[1] else {
+            panic!("expected tool result user message");
+        };
+        let RigUserContent::ToolResult(tool_result) = content.first_ref() else {
+            panic!("expected tool result payload");
+        };
+        assert_eq!(tool_result.id, DEFAULT_TOOL_RESULT_CALL_ID);
+        assert_eq!(
+            tool_result.call_id.as_deref(),
+            Some(DEFAULT_TOOL_RESULT_CALL_ID)
+        );
+
+        let RigToolResultContent::Text(text) = tool_result.content.first_ref() else {
+            panic!("expected text tool result content");
+        };
+        let payload: Value =
+            serde_json::from_str(&text.text).expect("tool result payload should be JSON");
+        assert_eq!(payload, json!({ "is_error": true, "output": "boom" }));
+    }
+
+    #[test]
+    fn map_streamed_assistant_chunk_preserves_distinct_tool_call_id_and_call_id() {
+        let chunk = StreamedAssistantContent::<()>::ToolCall {
+            tool_call: RigToolCall::new(
+                "fc_123".to_string(),
+                RigToolFunction::new("read".to_string(), json!({ "path": "README.md" })),
+            )
+            .with_call_id("call_123".to_string()),
+            internal_call_id: "internal-call-1".to_string(),
+        };
+
+        let event = map_streamed_assistant_chunk(chunk).expect("tool call chunk should map");
+        let ProviderEvent::ToolCall { call } = event else {
+            panic!("expected tool call event");
+        };
+        assert_eq!(call.id.as_deref(), Some("fc_123"));
+        assert_eq!(call.call_id, "call_123");
+        assert_eq!(call.name, "read");
+        assert_eq!(call.input, json!({ "path": "README.md" }));
+    }
+
+    #[test]
+    fn map_streamed_assistant_chunk_uses_tool_call_id_when_call_id_missing() {
+        let chunk = StreamedAssistantContent::<()>::ToolCall {
+            tool_call: RigToolCall::new(
+                "fc_456".to_string(),
+                RigToolFunction::new("write".to_string(), json!({ "path": "README.md" })),
+            ),
+            internal_call_id: "internal-call-2".to_string(),
+        };
+
+        let event = map_streamed_assistant_chunk(chunk).expect("tool call chunk should map");
+        let ProviderEvent::ToolCall { call } = event else {
+            panic!("expected tool call event");
+        };
+        assert_eq!(call.id.as_deref(), Some("fc_456"));
+        assert_eq!(call.call_id, "fc_456");
+        assert_eq!(call.name, "write");
     }
 
     #[test]
