@@ -16,7 +16,7 @@ use nanocodex_oai_api::{
     responses::{
         ContentItem, FunctionOutputBody, JsonSchema, MessageRole,
         ReasoningContent as OpenAiReasoningContent, ReasoningSummary, ResponseItem, ResponseItemId,
-        ToolDefinition as OpenAiToolDefinition,
+        ToolDefinition as OpenAiToolDefinition, Usage as OpenAiUsage,
     },
     session::ResponseInput,
     tower::DefaultResponsesService,
@@ -580,26 +580,31 @@ fn completed_message(
     } else {
         StopReason::Stop
     };
-    let usage = completed
-        .usage()
-        .map_or_else(Usage::default, |usage| Usage {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            cache_read_tokens: usage
-                .input_tokens_details
-                .as_ref()
-                .map_or(0, |details| details.cached_tokens),
-            cache_write_tokens: usage
-                .input_tokens_details
-                .as_ref()
-                .map_or(0, |details| details.cache_write_tokens),
-        });
+    let usage = completed_usage(completed.usage())?;
     Ok(AssistantMessage {
         blocks,
         stop,
         usage,
         provider: ProviderId::from(PROVIDER),
         model: model.clone(),
+    })
+}
+
+fn completed_usage(usage: Option<&OpenAiUsage>) -> Result<Usage, ProviderError> {
+    let usage = usage.ok_or_else(|| {
+        ProviderError::invalid_response("OpenAI completed response omitted token usage")
+    })?;
+    Ok(Usage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage
+            .input_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cached_tokens),
+        cache_write_tokens: usage
+            .input_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cache_write_tokens),
     })
 }
 
@@ -1387,6 +1392,13 @@ mod tests {
             ContentBlock::Text { text } if text == "partial"
         ));
         assert!(!map_error(&error).retryable);
+    }
+
+    #[test]
+    fn completed_response_without_usage_is_rejected() {
+        let error = completed_usage(None).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidResponse);
+        assert!(error.message.contains("omitted token usage"));
     }
 
     #[test]

@@ -5,8 +5,11 @@ readonly banned='^(mio|nanocodex-oai-api|reqwest|rusqlite|tokio|wasmtime) v'
 readonly pure_crates=(rho-ai rho-core rho-codec-jsonl)
 
 for crate in "${pure_crates[@]}"; do
-  if cargo tree --locked --edges normal --prefix none -p "$crate" |
-    grep -E "$banned"; then
+  if ! dependency_tree="$(cargo tree --locked --edges normal --prefix none -p "$crate")"; then
+    echo "error: cargo tree failed for pure crate $crate" >&2
+    exit 1
+  fi
+  if grep -E "$banned" <<<"$dependency_tree"; then
     echo "error: pure crate $crate depends on a shell/runtime crate" >&2
     exit 1
   fi
