@@ -1,47 +1,43 @@
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, sync::Arc};
 
-use anyhow::{Context as _, Result, anyhow};
 use rho_ai::{Credential, CredentialError, CredentialSource, CredentialStore, ProviderId};
 
-struct EnvironmentCredentialSource;
+struct UserCredentialSource;
 
-impl CredentialSource for EnvironmentCredentialSource {
+impl CredentialSource for UserCredentialSource {
     fn resolve(&self, provider: &ProviderId) -> Result<Credential, CredentialError> {
-        let Some(variable) = environment_variable(provider) else {
-            return Err(CredentialError::Missing {
-                provider: provider.clone(),
-            });
-        };
-        let value = env::var(variable).map_err(|_| CredentialError::Missing {
-            provider: provider.clone(),
-        })?;
-        if value.is_empty() {
-            return Err(CredentialError::Empty {
-                provider: provider.clone(),
-            });
+        if let Some(variable) = environment_variable(provider) {
+            match env::var(variable) {
+                Ok(value) if value.is_empty() => {
+                    return Err(CredentialError::Empty {
+                        provider: provider.clone(),
+                    });
+                }
+                Ok(value) => return Ok(Credential::ApiKey(value)),
+                Err(env::VarError::NotPresent) => {}
+                Err(error) => return Err(unavailable(provider, error)),
+            }
         }
-        Ok(Credential::ApiKey(value))
+
+        let path = credentials_path().map_err(|error| unavailable(provider, error))?;
+        let bytes = fs::read(&path).map_err(|error| {
+            unavailable(
+                provider,
+                format!("failed to read {}: {error}", path.display()),
+            )
+        })?;
+        let store = CredentialStore::from_json(&bytes).map_err(|error| {
+            unavailable(
+                provider,
+                format!("failed to parse {}: {error}", path.display()),
+            )
+        })?;
+        store.resolve(provider)
     }
 }
 
-pub(crate) fn resolve_credential(provider: &ProviderId) -> Result<Credential> {
-    match EnvironmentCredentialSource.resolve(provider) {
-        Ok(credential) => return Ok(credential),
-        Err(CredentialError::Missing { .. }) => {}
-        Err(error) => return Err(error.into()),
-    }
-
-    let path = credentials_path()?;
-    let bytes = fs::read(&path).with_context(|| {
-        format!(
-            "no {} credential in the environment and failed to read {}",
-            provider,
-            path.display()
-        )
-    })?;
-    let store = CredentialStore::from_json(&bytes)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-    store.resolve(provider).map_err(Into::into)
+pub(crate) fn credential_source() -> Arc<dyn CredentialSource> {
+    Arc::new(UserCredentialSource)
 }
 
 fn environment_variable(provider: &ProviderId) -> Option<&'static str> {
@@ -52,12 +48,19 @@ fn environment_variable(provider: &ProviderId) -> Option<&'static str> {
     }
 }
 
-fn credentials_path() -> Result<PathBuf> {
+fn credentials_path() -> Result<PathBuf, String> {
     if let Some(path) = env::var_os("RHO_CREDENTIALS_FILE") {
         return Ok(PathBuf::from(path));
     }
     let home = env::var_os("HOME").ok_or_else(|| {
-        anyhow!("HOME is not set; set RHO_CREDENTIALS_FILE to a credentials file")
+        "HOME is not set; set RHO_CREDENTIALS_FILE to a credentials file".to_owned()
     })?;
     Ok(PathBuf::from(home).join(".rho").join("credentials.json"))
+}
+
+fn unavailable(provider: &ProviderId, error: impl std::fmt::Display) -> CredentialError {
+    CredentialError::Unavailable {
+        provider: provider.clone(),
+        message: error.to_string(),
+    }
 }

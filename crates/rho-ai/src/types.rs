@@ -286,7 +286,14 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
-/// Complete stateless provider request.
+/// Configuration fixed for one live provider session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionConfig {
+    /// Provider model used for every generation in the session.
+    pub model: ModelId,
+}
+
+/// Complete authoritative provider request.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Request {
     /// Stable developer/system instructions.
@@ -295,8 +302,6 @@ pub struct Request {
     pub messages: Vec<Message>,
     /// Complete tool set available for this request.
     pub tools: Vec<ToolDefinition>,
-    /// Provider model to invoke.
-    pub model: ModelId,
     /// Hard provider output-token limit.
     pub max_output_tokens: u64,
     /// Requested reasoning effort.

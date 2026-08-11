@@ -30,7 +30,7 @@ impl Credential {
 }
 
 /// Resolves credentials without coupling the provider boundary to an I/O source.
-pub trait CredentialSource {
+pub trait CredentialSource: Send + Sync {
     /// Resolves one provider's credential.
     fn resolve(&self, provider: &ProviderId) -> Result<Credential, CredentialError>;
 }
@@ -49,6 +49,14 @@ pub enum CredentialError {
     Empty {
         /// Provider whose credential was empty.
         provider: ProviderId,
+    },
+    /// The credential source could not be read or parsed.
+    #[error("credential source for provider {provider} is unavailable: {message}")]
+    Unavailable {
+        /// Provider whose credential was requested.
+        provider: ProviderId,
+        /// Stable source diagnostic with no secret contents.
+        message: String,
     },
 }
 

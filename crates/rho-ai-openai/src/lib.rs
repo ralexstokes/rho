@@ -1,10 +1,11 @@
 //! OpenAI provider adapter and quarantine boundary for Nanocodex.
 //!
-//! The adapter creates a fresh lower-level Nanocodex session for every rho
-//! request and supplies the complete transcript as typed input. Nanocodex's
-//! agent loop and retained-history API never cross this crate boundary.
+//! Each opened rho provider owns one lower-level Nanocodex session. The
+//! adapter continues it only when rho's complete transcript extends the
+//! acknowledged prefix; otherwise it rebuilds from the authoritative input.
+//! Nanocodex's agent loop never crosses this crate boundary.
 
-use std::{collections::BTreeSet, num::NonZeroU32};
+use std::{collections::BTreeSet, num::NonZeroU32, sync::Arc};
 
 use async_stream::stream;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -18,13 +19,15 @@ use nanocodex_oai_api::{
         ToolDefinition as OpenAiToolDefinition,
     },
     session::ResponseInput,
+    tower::DefaultResponsesService,
     transport::ResponsesHistory,
 };
 use rho_ai::{
-    AssistantMessage, CancellationToken, ContentBlock, DeltaKind, ErrorKind, Message, ModelId,
-    ModelInfo, OpaqueBlob, Provider, ProviderError, ProviderId, ProviderStream, Request,
-    StopReason, StreamEvent, ThinkingLevel, ToolArgumentError, ToolCallId, ToolDefinition, Usage,
-    validate_tool_arguments, validate_tool_definition,
+    AssistantMessage, CancellationToken, ContentBlock, CredentialSource, DeltaKind, ErrorKind,
+    Message, ModelId, ModelInfo, OpaqueBlob, OpenProvider, Provider, ProviderError,
+    ProviderFactory, ProviderId, ProviderStream, Request, SessionConfig, StopReason, StreamEvent,
+    ThinkingLevel, ToolArgumentError, ToolCallId, ToolDefinition, Usage, validate_tool_arguments,
+    validate_tool_definition,
 };
 use serde::{Deserialize, Serialize};
 
@@ -39,40 +42,31 @@ struct EncryptedReasoningState {
     encrypted_content: Box<str>,
 }
 
-/// OpenAI adapter construction failure.
-#[derive(Debug, thiserror::Error)]
-pub enum BuildError {
-    /// API key was empty.
-    #[error("OpenAI API key must not be empty")]
-    EmptyApiKey,
-}
+type NativeSession = nanocodex_oai_api::Session<DefaultResponsesService>;
 
-/// Stateless OpenAI Responses adapter built on `nanocodex-oai-api`.
+/// Shared OpenAI configuration, credentials, and model catalog.
 #[derive(Clone)]
-pub struct OpenAiProvider {
-    api_key: String,
+pub struct OpenAiFactory {
+    credentials: Arc<dyn CredentialSource>,
     models: Vec<ModelInfo>,
 }
 
-impl std::fmt::Debug for OpenAiProvider {
+impl std::fmt::Debug for OpenAiFactory {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("OpenAiProvider")
-            .field("api_key", &"[REDACTED]")
+            .debug_struct("OpenAiFactory")
+            .field("credentials", &"[REDACTED]")
             .field("models", &self.models)
             .finish()
     }
 }
 
-impl OpenAiProvider {
-    /// Creates an adapter using API-key authentication.
-    pub fn new(api_key: impl Into<String>) -> Result<Self, BuildError> {
-        let api_key = api_key.into();
-        if api_key.is_empty() {
-            return Err(BuildError::EmptyApiKey);
-        }
-        Ok(Self {
-            api_key,
+impl OpenAiFactory {
+    /// Creates a factory using credentials resolved when sessions are opened.
+    #[must_use]
+    pub fn new(credentials: Arc<dyn CredentialSource>) -> Self {
+        Self {
+            credentials,
             models: vec![
                 ModelInfo {
                     id: ModelId::from(MODEL),
@@ -87,94 +81,133 @@ impl OpenAiProvider {
                     max_output_tokens: None,
                 },
             ],
-        })
+        }
     }
 }
 
-impl Provider for OpenAiProvider {
+impl ProviderFactory for OpenAiFactory {
     fn models(&self) -> &[ModelInfo] {
         &self.models
     }
 
-    fn stream(&self, request: Request, cancellation: CancellationToken) -> ProviderStream {
-        let api_key = self.api_key.clone();
+    fn open(&self, config: SessionConfig) -> OpenProvider<'_> {
+        let result = (|| {
+            openai_model(&config.model)?;
+            let credential = self
+                .credentials
+                .resolve(&ProviderId::from(PROVIDER))
+                .map_err(authentication_error)?;
+            Ok(Box::new(OpenAiProvider {
+                api_key: credential.expose_api_key().to_owned(),
+                model: config.model,
+                session: None,
+                shape: None,
+                acknowledged: Vec::new(),
+                poisoned: false,
+            }) as Box<dyn Provider>)
+        })();
+        Box::pin(async move { result })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SessionShape {
+    system: String,
+    tools: Vec<ToolDefinition>,
+    thinking: ThinkingLevel,
+}
+
+impl From<&Request> for SessionShape {
+    fn from(request: &Request) -> Self {
+        Self {
+            system: request.system.clone(),
+            tools: request.tools.clone(),
+            thinking: request.thinking,
+        }
+    }
+}
+
+/// One live logical OpenAI model session.
+struct OpenAiProvider {
+    api_key: String,
+    model: ModelId,
+    session: Option<NativeSession>,
+    shape: Option<SessionShape>,
+    acknowledged: Vec<Message>,
+    poisoned: bool,
+}
+
+impl std::fmt::Debug for OpenAiProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAiProvider")
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("has_native_session", &self.session.is_some())
+            .field("shape", &self.shape)
+            .field("acknowledged_messages", &self.acknowledged.len())
+            .field("poisoned", &self.poisoned)
+            .finish()
+    }
+}
+
+impl Provider for OpenAiProvider {
+    fn generate(
+        &mut self,
+        request: Request,
+        cancellation: CancellationToken,
+    ) -> ProviderStream<'_> {
+        let was_poisoned = self.poisoned;
+        // Any stream that is dropped, cancelled, or fails before a complete
+        // Done leaves the native continuation ambiguous.
+        self.poisoned = true;
         Box::pin(stream! {
             if cancellation.is_cancelled() {
                 yield StreamEvent::Error(ProviderError::cancelled());
                 return;
             }
-            let openai_model = match request.model.as_str() {
-                MODEL => OpenAiModel::Luna,
-                SOL_MODEL => OpenAiModel::Sol,
-                model => {
-                    yield StreamEvent::Error(invalid_request(format!(
-                        "OpenAI model {model:?} is unsupported; expected {MODEL} or {SOL_MODEL}"
-                    )));
-                    return;
-                }
-            };
-            if request.system.trim().is_empty() {
-                yield StreamEvent::Error(invalid_request("system instructions must not be empty"));
+            if let Err(error) = validate_request(&request) {
+                yield StreamEvent::Error(error);
                 return;
             }
-            if request.max_output_tokens == 0 {
-                yield StreamEvent::Error(invalid_request(
-                    "max_output_tokens must be greater than zero",
-                ));
-                return;
-            }
-            let mut tool_names = BTreeSet::new();
-            for tool in &request.tools {
-                if let Err(error) = validate_tool_definition(tool) {
-                    yield StreamEvent::Error(invalid_request(format!(
-                        "tool {}: {error}", tool.name
-                    )));
-                    return;
-                }
-                if !tool_names.insert(tool.name.as_str()) {
-                    yield StreamEvent::Error(invalid_request(format!(
-                        "duplicate tool definition {:?}",
-                        tool.name
-                    )));
-                    return;
-                }
-            }
-            let items = match request_items(&request) {
+
+            let shape = SessionShape::from(&request);
+            let continuation = continuation_start(
+                was_poisoned,
+                self.session.is_some(),
+                self.shape.as_ref(),
+                &shape,
+                &self.acknowledged,
+                &request.messages,
+            );
+            let input_messages = continuation
+                .map_or(request.messages.as_slice(), |start| &request.messages[start..]);
+            let items = match request_items(input_messages) {
                 Ok(items) => items,
                 Err(error) => {
                     yield StreamEvent::Error(error);
                     return;
                 }
             };
-            let tools = request.tools.iter().map(openai_tool).collect::<Vec<_>>();
-            let openai = match OpenAi::builder(api_key)
-                .model(openai_model)
-                .max_attempts(NonZeroU32::MIN)
-                .store(false)
-                .history(ResponsesHistory::FullReplay)
-                .thinking(openai_thinking(request.thinking))
-                .build()
-            {
-                Ok(openai) => openai,
-                Err(error) => {
-                    yield StreamEvent::Error(ProviderError {
-                        retryable: false,
-                        kind: ErrorKind::Authentication,
-                        message: error.to_string(),
-                    });
-                    return;
-                }
-            };
-            let mut session = match openai
-                .instructions(request.system.clone())
-                .tool_definitions(tools)
-                .build()
-            {
-                Ok(session) => session,
-                Err(error) => {
-                    yield StreamEvent::Error(invalid_request(error.to_string()));
-                    return;
-                }
+            if continuation.is_none() {
+                self.session = match build_session(&self.api_key, &self.model, &request) {
+                    Ok(session) => Some(session),
+                    Err(error) => {
+                        self.shape = None;
+                        self.acknowledged.clear();
+                        yield StreamEvent::Error(error);
+                        return;
+                    }
+                };
+                self.shape = Some(shape);
+                self.acknowledged.clear();
+            }
+
+            let Some(session) = self.session.as_mut() else {
+                yield StreamEvent::Error(ProviderError::invalid_response(
+                    "OpenAI native session was not initialized",
+                ));
+                return;
             };
             let mut turn = session.turn();
             let mut response = turn.create(ResponseInput::items(items));
@@ -192,7 +225,7 @@ impl Provider for OpenAiProvider {
                 let event = match next {
                     Ok(event) => event,
                     Err(error) => {
-                        match incomplete_message(&error, &request.tools, &request.model) {
+                        match incomplete_message(&error, &request.tools, &self.model) {
                             Ok(Some(message)) => yield StreamEvent::Done(message),
                             Ok(None) => yield StreamEvent::Error(map_error(&error)),
                             Err(error) => yield StreamEvent::Error(error),
@@ -272,17 +305,100 @@ impl Provider for OpenAiProvider {
                     }
                 }
             };
-            match completed_message(&completed, &request.tools, &request.model) {
-                Ok(message) => yield StreamEvent::Done(message),
+            match completed_message(&completed, &request.tools, &self.model) {
+                Ok(message) => {
+                    let mut acknowledged = request.messages.clone();
+                    acknowledged.push(Message::Assistant(message.clone()));
+                    self.acknowledged = acknowledged;
+                    self.poisoned = false;
+                    yield StreamEvent::Done(message);
+                }
                 Err(error) => yield StreamEvent::Error(error),
             }
         })
     }
 }
 
-fn request_items(request: &Request) -> Result<Vec<ResponseItem>, ProviderError> {
+fn continuation_start(
+    poisoned: bool,
+    has_session: bool,
+    current_shape: Option<&SessionShape>,
+    requested_shape: &SessionShape,
+    acknowledged: &[Message],
+    messages: &[Message],
+) -> Option<usize> {
+    (!poisoned
+        && has_session
+        && current_shape == Some(requested_shape)
+        && messages.starts_with(acknowledged))
+    .then_some(acknowledged.len())
+}
+
+fn validate_request(request: &Request) -> Result<(), ProviderError> {
+    if request.system.trim().is_empty() {
+        return Err(invalid_request("system instructions must not be empty"));
+    }
+    if request.max_output_tokens == 0 {
+        return Err(invalid_request(
+            "max_output_tokens must be greater than zero",
+        ));
+    }
+    let mut tool_names = BTreeSet::new();
+    for tool in &request.tools {
+        validate_tool_definition(tool)
+            .map_err(|error| invalid_request(format!("tool {}: {error}", tool.name)))?;
+        if !tool_names.insert(tool.name.as_str()) {
+            return Err(invalid_request(format!(
+                "duplicate tool definition {:?}",
+                tool.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn build_session(
+    api_key: &str,
+    model: &ModelId,
+    request: &Request,
+) -> Result<NativeSession, ProviderError> {
+    let tools = request.tools.iter().map(openai_tool).collect::<Vec<_>>();
+    let openai = OpenAi::builder(api_key.to_owned())
+        .model(openai_model(model)?)
+        .max_attempts(NonZeroU32::MIN)
+        .store(false)
+        .history(ResponsesHistory::FullReplay)
+        .thinking(openai_thinking(request.thinking))
+        .build()
+        .map_err(authentication_error)?;
+    openai
+        .instructions(request.system.clone())
+        .tool_definitions(tools)
+        .build()
+        .map_err(|error| invalid_request(error.to_string()))
+}
+
+fn openai_model(model: &ModelId) -> Result<OpenAiModel, ProviderError> {
+    match model.as_str() {
+        MODEL => Ok(OpenAiModel::Luna),
+        SOL_MODEL => Ok(OpenAiModel::Sol),
+        model => Err(invalid_request(format!(
+            "OpenAI model {model:?} is unsupported; expected {MODEL} or {SOL_MODEL}"
+        ))),
+    }
+}
+
+fn authentication_error(error: impl std::fmt::Display) -> ProviderError {
+    ProviderError {
+        retryable: false,
+        kind: ErrorKind::Authentication,
+        message: error.to_string(),
+    }
+}
+
+fn request_items(messages: &[Message]) -> Result<Vec<ResponseItem>, ProviderError> {
     let mut items = Vec::new();
-    for message in &request.messages {
+    for message in messages {
         match message {
             Message::User { content } => {
                 let content = content
@@ -927,15 +1043,72 @@ mod tests {
                 Message::user("second"),
             ],
             tools: Vec::new(),
-            model: ModelId::from(MODEL),
             max_output_tokens: 1024,
             thinking: ThinkingLevel::High,
         };
-        let encoded = serde_json::to_string(&request_items(&request).unwrap()).unwrap();
+        let encoded = serde_json::to_string(&request_items(&request.messages).unwrap()).unwrap();
         assert!(encoded.contains("first"));
         assert!(encoded.contains("second"));
         assert!(encoded.contains("summary"));
         assert!(!encoded.contains("foreign-secret"));
+    }
+
+    #[test]
+    fn continuation_requires_a_clean_exact_acknowledged_prefix_and_compatible_shape() {
+        let request = Request {
+            system: "test".to_owned(),
+            messages: vec![Message::user("first"), Message::user("second")],
+            tools: vec![bash_tool()],
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::High,
+        };
+        let shape = SessionShape::from(&request);
+        let acknowledged = &request.messages[..1];
+
+        assert_eq!(
+            continuation_start(
+                false,
+                true,
+                Some(&shape),
+                &shape,
+                acknowledged,
+                &request.messages,
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            continuation_start(
+                true,
+                true,
+                Some(&shape),
+                &shape,
+                acknowledged,
+                &request.messages,
+            ),
+            None
+        );
+
+        let branch = vec![Message::user("branched")];
+        assert_eq!(
+            continuation_start(false, true, Some(&shape), &shape, acknowledged, &branch,),
+            None
+        );
+
+        let incompatible = SessionShape {
+            thinking: ThinkingLevel::Low,
+            ..shape.clone()
+        };
+        assert_eq!(
+            continuation_start(
+                false,
+                true,
+                Some(&shape),
+                &incompatible,
+                acknowledged,
+                &request.messages,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -967,11 +1140,10 @@ mod tests {
                 model: ModelId::from(MODEL),
             })],
             tools: Vec::new(),
-            model: ModelId::from(MODEL),
             max_output_tokens: 100,
             thinking: ThinkingLevel::High,
         };
-        let replay = serde_json::to_value(request_items(&request).unwrap()).unwrap();
+        let replay = serde_json::to_value(request_items(&request.messages).unwrap()).unwrap();
         assert_eq!(replay[0]["id"], "rs_original-item");
         assert_eq!(replay[0]["encrypted_content"], "bound-ciphertext");
     }
@@ -1008,17 +1180,23 @@ mod tests {
                 model: ModelId::from(MODEL),
             })],
             tools: Vec::new(),
-            model: ModelId::from(MODEL),
             max_output_tokens: 100,
             thinking: ThinkingLevel::High,
         };
-        let error = request_items(&request).unwrap_err();
+        let error = request_items(&request.messages).unwrap_err();
         assert_eq!(error.kind, ErrorKind::InvalidRequest);
     }
 
     #[test]
     fn provider_debug_redacts_api_key() {
-        let provider = OpenAiProvider::new("secret-key").unwrap();
+        let provider = OpenAiProvider {
+            api_key: "secret-key".to_owned(),
+            model: ModelId::from(MODEL),
+            session: None,
+            shape: None,
+            acknowledged: Vec::new(),
+            poisoned: false,
+        };
         let debug = format!("{provider:?}");
         assert!(!debug.contains("secret-key"));
         assert!(debug.contains("REDACTED"));
@@ -1026,9 +1204,16 @@ mod tests {
 
     #[test]
     fn model_catalog_lists_luna_first_and_retains_sol() {
-        let provider = OpenAiProvider::new("secret-key").unwrap();
-        assert_eq!(provider.models()[0].id, ModelId::from(MODEL));
-        assert_eq!(provider.models()[1].id, ModelId::from(SOL_MODEL));
+        let mut credentials = rho_ai::CredentialStore::default();
+        credentials.insert(
+            ProviderId::from(PROVIDER),
+            rho_ai::StoredCredential::ApiKey {
+                api_key: "secret-key".to_owned(),
+            },
+        );
+        let factory = OpenAiFactory::new(Arc::new(credentials));
+        assert_eq!(factory.models()[0].id, ModelId::from(MODEL));
+        assert_eq!(factory.models()[1].id, ModelId::from(SOL_MODEL));
     }
 
     #[test]
@@ -1058,12 +1243,11 @@ mod tests {
                 }),
             ],
             tools: vec![bash_tool()],
-            model: ModelId::from(MODEL),
             max_output_tokens: 100,
             thinking: ThinkingLevel::None,
         };
 
-        let encoded = serde_json::to_value(request_items(&request).unwrap()).unwrap();
+        let encoded = serde_json::to_value(request_items(&request.messages).unwrap()).unwrap();
         assert_eq!(encoded[0]["arguments"], "{}");
         assert_eq!(encoded[0]["call_id"], "call-1");
         assert_eq!(encoded[1]["call_id"], "call-1");

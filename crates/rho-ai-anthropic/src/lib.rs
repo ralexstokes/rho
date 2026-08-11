@@ -6,16 +6,16 @@
 pub mod decoder;
 mod response;
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use async_stream::stream;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::StreamExt as _;
 use reqwest::StatusCode;
 use rho_ai::{
-    CancellationToken, ContentBlock, ErrorKind, Message, ModelId, ModelInfo, OpaqueBlob, Provider,
-    ProviderError, ProviderId, ProviderStream, Request, StreamEvent, ThinkingLevel,
-    validate_tool_definition,
+    CancellationToken, ContentBlock, CredentialSource, ErrorKind, Message, ModelId, ModelInfo,
+    OpaqueBlob, OpenProvider, Provider, ProviderError, ProviderFactory, ProviderId, ProviderStream,
+    Request, SessionConfig, StreamEvent, ThinkingLevel, validate_tool_definition,
 };
 use serde_json::{Value, json};
 
@@ -24,24 +24,90 @@ use crate::{decoder::Decoder, response::ResponseAssembler};
 const PROVIDER: &str = "anthropic";
 const API_VERSION: &str = "2023-06-01";
 
-/// Anthropic adapter construction failure.
+/// Anthropic factory construction failure.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
-    /// API key was empty.
-    #[error("Anthropic API key must not be empty")]
-    EmptyApiKey,
     /// HTTP client construction failed.
     #[error("failed to build Anthropic HTTP client: {0}")]
     Http(#[from] reqwest::Error),
 }
 
-/// Stateless Anthropic Messages API adapter.
+/// Shared Anthropic configuration, credentials, and model catalog.
 #[derive(Clone)]
-pub struct AnthropicProvider {
-    api_key: String,
+pub struct AnthropicFactory {
+    credentials: Arc<dyn CredentialSource>,
     base_url: String,
     client: reqwest::Client,
     models: Vec<ModelInfo>,
+}
+
+impl std::fmt::Debug for AnthropicFactory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnthropicFactory")
+            .field("credentials", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("models", &self.models)
+            .finish()
+    }
+}
+
+impl AnthropicFactory {
+    /// Creates a factory for the public Anthropic API.
+    pub fn new(credentials: Arc<dyn CredentialSource>) -> Result<Self, BuildError> {
+        Self::with_base_url(credentials, "https://api.anthropic.com")
+    }
+
+    /// Creates a factory with a custom base URL, primarily for compatible gateways and tests.
+    pub fn with_base_url(
+        credentials: Arc<dyn CredentialSource>,
+        base_url: impl Into<String>,
+    ) -> Result<Self, BuildError> {
+        Ok(Self {
+            credentials,
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
+            client: http_client()?,
+            models: current_models(),
+        })
+    }
+}
+
+impl ProviderFactory for AnthropicFactory {
+    fn models(&self) -> &[ModelInfo] {
+        &self.models
+    }
+
+    fn open(&self, config: SessionConfig) -> OpenProvider<'_> {
+        let result = (|| {
+            if !self.models.iter().any(|model| model.id == config.model) {
+                return Err(invalid_request(format!(
+                    "Anthropic model {:?} is unsupported",
+                    config.model.as_str()
+                )));
+            }
+            let credential = self
+                .credentials
+                .resolve(&ProviderId::from(PROVIDER))
+                .map_err(authentication_error)?;
+            Ok(Box::new(AnthropicProvider {
+                api_key: credential.expose_api_key().to_owned(),
+                base_url: self.base_url.clone(),
+                client: self.client.clone(),
+                model: config.model,
+            }) as Box<dyn Provider>)
+        })();
+        Box::pin(async move { result })
+    }
+}
+
+/// One logical Anthropic model session.
+///
+/// Messages API requests are always rebased from rho's complete transcript.
+struct AnthropicProvider {
+    api_key: String,
+    base_url: String,
+    client: reqwest::Client,
+    model: ModelId,
 }
 
 impl std::fmt::Debug for AnthropicProvider {
@@ -50,32 +116,8 @@ impl std::fmt::Debug for AnthropicProvider {
             .debug_struct("AnthropicProvider")
             .field("api_key", &"[REDACTED]")
             .field("base_url", &self.base_url)
-            .field("models", &self.models)
+            .field("model", &self.model)
             .finish()
-    }
-}
-
-impl AnthropicProvider {
-    /// Creates an adapter for the public Anthropic API.
-    pub fn new(api_key: impl Into<String>) -> Result<Self, BuildError> {
-        Self::with_base_url(api_key, "https://api.anthropic.com")
-    }
-
-    /// Creates an adapter with a custom base URL, primarily for compatible gateways and tests.
-    pub fn with_base_url(
-        api_key: impl Into<String>,
-        base_url: impl Into<String>,
-    ) -> Result<Self, BuildError> {
-        let api_key = api_key.into();
-        if api_key.is_empty() {
-            return Err(BuildError::EmptyApiKey);
-        }
-        Ok(Self {
-            api_key,
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
-            client: http_client()?,
-            models: current_models(),
-        })
     }
 }
 
@@ -91,20 +133,21 @@ fn http_client() -> Result<reqwest::Client, reqwest::Error> {
 }
 
 impl Provider for AnthropicProvider {
-    fn models(&self) -> &[ModelInfo] {
-        &self.models
-    }
-
-    fn stream(&self, request: Request, cancellation: CancellationToken) -> ProviderStream {
+    fn generate(
+        &mut self,
+        request: Request,
+        cancellation: CancellationToken,
+    ) -> ProviderStream<'_> {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
+        let model = self.model.clone();
         let endpoint = format!("{}/v1/messages", self.base_url);
         Box::pin(stream! {
             if cancellation.is_cancelled() {
                 yield StreamEvent::Error(ProviderError::cancelled());
                 return;
             }
-            let body = match request_body(&request) {
+            let body = match request_body(&request, &model) {
                 Ok(body) => body,
                 Err(error) => {
                     yield StreamEvent::Error(error);
@@ -148,7 +191,7 @@ impl Provider for AnthropicProvider {
 
             let mut bytes = response.bytes_stream();
             let mut decoder = Decoder::new();
-            let mut assembler = ResponseAssembler::new(request.model.clone(), request.tools.clone());
+            let mut assembler = ResponseAssembler::new(model, request.tools.clone());
             let mut terminal = false;
             loop {
                 let next = tokio::select! {
@@ -245,7 +288,7 @@ impl Provider for AnthropicProvider {
 }
 
 /// Pure request projection used by the HTTP shell and fixture tests.
-pub fn request_body(request: &Request) -> Result<Value, ProviderError> {
+pub fn request_body(request: &Request, model: &ModelId) -> Result<Value, ProviderError> {
     if request.system.trim().is_empty() {
         return Err(invalid_request("system instructions must not be empty"));
     }
@@ -254,7 +297,7 @@ pub fn request_body(request: &Request) -> Result<Value, ProviderError> {
             "max_output_tokens must be greater than zero",
         ));
     }
-    if request.model.as_str() == "claude-fable-5" && request.thinking == ThinkingLevel::None {
+    if model.as_str() == "claude-fable-5" && request.thinking == ThinkingLevel::None {
         return Err(invalid_request(
             "claude-fable-5 does not support disabling adaptive thinking",
         ));
@@ -288,7 +331,7 @@ pub fn request_body(request: &Request) -> Result<Value, ProviderError> {
         })
         .collect::<Vec<_>>();
     let mut body = json!({
-        "model": request.model.as_str(),
+        "model": model.as_str(),
         "max_tokens": request.max_output_tokens,
         "system": request.system,
         "messages": messages,
@@ -445,6 +488,14 @@ fn invalid_request(message: impl Into<String>) -> ProviderError {
     }
 }
 
+fn authentication_error(error: rho_ai::CredentialError) -> ProviderError {
+    ProviderError {
+        retryable: false,
+        kind: ErrorKind::Authentication,
+        message: error.to_string(),
+    }
+}
+
 fn classify_transport_error(error: &reqwest::Error) -> ProviderError {
     ProviderError {
         retryable: error.is_timeout() || error.is_connect() || error.is_body(),
@@ -501,12 +552,11 @@ mod tests {
                 }),
             ],
             tools: Vec::new(),
-            model: ModelId::from("claude-sonnet-5"),
             max_output_tokens: 1024,
             thinking: ThinkingLevel::Medium,
         };
 
-        let body = request_body(&request).unwrap();
+        let body = request_body(&request, &ModelId::from("claude-sonnet-5")).unwrap();
         let encoded = body.to_string();
         assert!(encoded.contains("summary"));
         assert!(encoded.contains("call-1"));
@@ -516,7 +566,12 @@ mod tests {
 
     #[test]
     fn provider_debug_redacts_api_key() {
-        let provider = AnthropicProvider::new("secret-key").unwrap();
+        let provider = AnthropicProvider {
+            api_key: "secret-key".to_owned(),
+            base_url: "https://api.anthropic.com".to_owned(),
+            client: http_client().unwrap(),
+            model: ModelId::from("claude-sonnet-5"),
+        };
         let debug = format!("{provider:?}");
         assert!(!debug.contains("secret-key"));
         assert!(debug.contains("REDACTED"));
@@ -553,12 +608,11 @@ mod tests {
                 "Run a command.",
                 json!({"type": "object"}),
             )],
-            model: ModelId::from("claude-sonnet-5"),
             max_output_tokens: 100,
             thinking: ThinkingLevel::None,
         };
 
-        let body = request_body(&request).unwrap();
+        let body = request_body(&request, &ModelId::from("claude-sonnet-5")).unwrap();
         assert_eq!(body["messages"][0]["content"][0]["input"], json!({}));
         assert_eq!(body["messages"][1]["content"][0]["tool_use_id"], "toolu-1");
     }

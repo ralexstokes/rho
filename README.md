@@ -21,12 +21,14 @@ depend only on other cores; integrations point inward toward those cores.
 
 The provider boundary and walking skeleton are implemented:
 
-- `rho-ai` defines stateless requests, authoritative messages, streaming
-  events, cancellation, credentials, strict JSON-Schema argument validation,
-  and a deterministic `faux` provider.
+- `rho-ai` defines shared provider factories, live transcript-authoritative
+  sessions, authoritative messages, streaming events, cancellation,
+  credentials, strict JSON-Schema argument validation, and a deterministic
+  session-aware `faux` provider.
 - `rho-ai-openai` wraps the lower `nanocodex-oai-api` layer. Each request gets
-  a fresh session with the complete rho transcript and a one-attempt retry
-  budget. The adapter defaults to `gpt-5.6-luna` and also accepts
+  the complete rho transcript; the adapter continues its live Nanocodex
+  session after an acknowledged-prefix match and rebases otherwise, with a
+  one-attempt retry budget. The adapter defaults to `gpt-5.6-luna` and accepts
   `gpt-5.6-sol`. Its pinned Nanocodex revision does not expose the request's
   `max_output_tokens` field. The adapter handles provider-reported length
   truncation safely, but cannot yet enforce rho's requested hard output limit;

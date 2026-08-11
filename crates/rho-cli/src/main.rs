@@ -13,14 +13,15 @@ use std::{
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures_util::StreamExt as _;
 use rho_ai::{
-    AssistantMessage, CancellationToken, ContentBlock, Message, ModelId, Provider, ProviderId,
-    Request, StopReason, StreamEvent, ThinkingLevel, ToolCallId, ToolDefinition, ToolResult,
+    AssistantMessage, CancellationToken, ContentBlock, Message, ModelId, Provider, ProviderFactory,
+    Request, SessionConfig, StopReason, StreamEvent, ThinkingLevel, ToolCallId, ToolDefinition,
+    ToolResult,
 };
-use rho_ai_anthropic::AnthropicProvider;
-use rho_ai_openai::OpenAiProvider;
+use rho_ai_anthropic::AnthropicFactory;
+use rho_ai_openai::OpenAiFactory;
 use serde_json::{Value, json};
 
-use crate::credentials::resolve_credential;
+use crate::credentials::credential_source;
 
 const DEFAULT_MAX_MODEL_STEPS: usize = 32;
 
@@ -31,13 +32,6 @@ enum ProviderChoice {
 }
 
 impl ProviderChoice {
-    fn id(self) -> ProviderId {
-        match self {
-            Self::OpenAi => ProviderId::from("openai"),
-            Self::Anthropic => ProviderId::from("anthropic"),
-        }
-    }
-
     fn default_model(self) -> ModelId {
         match self {
             Self::OpenAi => ModelId::from("gpt-5.6-luna"),
@@ -59,11 +53,16 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = parse_args(env::args().skip(1))?;
-    let credential = resolve_credential(&cli.provider.id())?;
-    let provider: Box<dyn Provider> = match cli.provider {
-        ProviderChoice::OpenAi => Box::new(OpenAiProvider::new(credential.expose_api_key())?),
-        ProviderChoice::Anthropic => Box::new(AnthropicProvider::new(credential.expose_api_key())?),
+    let credentials = credential_source();
+    let factory: Box<dyn ProviderFactory> = match cli.provider {
+        ProviderChoice::OpenAi => Box::new(OpenAiFactory::new(credentials)),
+        ProviderChoice::Anthropic => Box::new(AnthropicFactory::new(credentials)?),
     };
+    let mut provider = factory
+        .open(SessionConfig {
+            model: cli.model.clone(),
+        })
+        .await?;
     let cancellation = CancellationToken::new();
     let signal = cancellation.clone();
     tokio::spawn(async move {
@@ -72,11 +71,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    run_turn(provider.as_ref(), &cli, cancellation).await
+    run_turn(provider.as_mut(), &cli, cancellation).await
 }
 
 async fn run_turn(
-    provider: &dyn Provider,
+    provider: &mut dyn Provider,
     cli: &Cli,
     cancellation: CancellationToken,
 ) -> Result<()> {
@@ -89,7 +88,6 @@ async fn run_turn(
         .to_owned(),
         messages: vec![Message::user(cli.prompt.clone())],
         tools: vec![bash_definition()],
-        model: cli.model.clone(),
         max_output_tokens: cli.max_output_tokens,
         thinking: cli.thinking,
     };
@@ -139,11 +137,11 @@ async fn run_turn(
 }
 
 async fn collect_message(
-    provider: &dyn Provider,
+    provider: &mut dyn Provider,
     request: Request,
     cancellation: CancellationToken,
 ) -> Result<(AssistantMessage, bool)> {
-    let mut stream = provider.stream(request, cancellation);
+    let mut stream = provider.generate(request, cancellation);
     let mut streamed_text = false;
     while let Some(event) = stream.next().await {
         match event {
@@ -370,8 +368,8 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use rho_ai::{
-        ModelInfo, Usage,
-        faux::{FauxProvider, Script},
+        ModelInfo, ProviderId, Usage,
+        faux::{FauxFactory, Script},
     };
 
     use super::*;
@@ -509,7 +507,6 @@ mod tests {
             .to_owned(),
             messages: vec![Message::user("hello")],
             tools: vec![bash_definition()],
-            model: ModelId::from("faux"),
             max_output_tokens: 100,
             thinking: ThinkingLevel::None,
         };
@@ -529,7 +526,7 @@ mod tests {
         };
         let mut continued = initial.clone();
         continued.messages.push(Message::Assistant(paused.clone()));
-        let provider = FauxProvider::new(
+        let factory = FauxFactory::new(
             vec![ModelInfo {
                 id: ModelId::from("faux"),
                 display_name: "Faux".to_owned(),
@@ -547,10 +544,16 @@ mod tests {
                 },
             ],
         );
-
-        run_turn(&provider, &cli, CancellationToken::new())
+        let mut provider = factory
+            .open(SessionConfig {
+                model: ModelId::from("faux"),
+            })
             .await
             .unwrap();
-        assert_eq!(provider.remaining(), 0);
+
+        run_turn(provider.as_mut(), &cli, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(factory.remaining(), 0);
     }
 }
