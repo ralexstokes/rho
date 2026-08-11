@@ -26,11 +26,12 @@ The provider boundary and walking skeleton are implemented:
   and a deterministic `faux` provider.
 - `rho-ai-openai` wraps the lower `nanocodex-oai-api` layer. Each request gets
   a fresh session with the complete rho transcript and a one-attempt retry
-  budget. Nanocodex 0.3 currently constrains this adapter to `gpt-5.6-sol` and
-  does not expose its request's `max_output_tokens` field. The adapter handles
-  provider-reported length truncation safely, but cannot yet enforce rho's
-  requested hard output limit; that requires an upstream hook or the fallback
-  hand-rolled transport described in the provider spec.
+  budget. The adapter defaults to `gpt-5.6-luna` and also accepts
+  `gpt-5.6-sol`. Its pinned Nanocodex revision does not expose the request's
+  `max_output_tokens` field. The adapter handles provider-reported length
+  truncation safely, but cannot yet enforce rho's requested hard output limit;
+  that requires an upstream hook or the fallback hand-rolled transport
+  described in the provider spec.
 - `rho-ai-anthropic` is a direct Messages HTTP/SSE adapter with a pure,
   incremental decoder and fixture-tested text, thinking, tool-use, usage, and
   stop-reason assembly.

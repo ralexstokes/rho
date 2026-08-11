@@ -10,7 +10,7 @@ use async_stream::stream;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::StreamExt as _;
 use nanocodex_oai_api::{
-    OpenAi, ResponseError, ResponseErrorKind, ResponseEvent as OpenAiEvent,
+    Model as OpenAiModel, OpenAi, ResponseError, ResponseErrorKind, ResponseEvent as OpenAiEvent,
     Thinking as OpenAiThinking,
     responses::{
         ContentItem, FunctionOutputBody, JsonSchema, MessageRole,
@@ -29,7 +29,8 @@ use rho_ai::{
 use serde::{Deserialize, Serialize};
 
 const PROVIDER: &str = "openai";
-const MODEL: &str = nanocodex_oai_api::MODEL;
+const MODEL: &str = OpenAiModel::Luna.as_str();
+const SOL_MODEL: &str = OpenAiModel::Sol.as_str();
 const ENCRYPTED_REASONING_KIND: &str = "encrypted_reasoning_v1";
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -72,12 +73,20 @@ impl OpenAiProvider {
         }
         Ok(Self {
             api_key,
-            models: vec![ModelInfo {
-                id: ModelId::from(MODEL),
-                display_name: "GPT-5.6 Sol".to_owned(),
-                context_tokens: Some(nanocodex_oai_api::CONTEXT_WINDOW_TOKENS),
-                max_output_tokens: None,
-            }],
+            models: vec![
+                ModelInfo {
+                    id: ModelId::from(MODEL),
+                    display_name: "GPT-5.6 Luna".to_owned(),
+                    context_tokens: Some(nanocodex_oai_api::CONTEXT_WINDOW_TOKENS),
+                    max_output_tokens: None,
+                },
+                ModelInfo {
+                    id: ModelId::from(SOL_MODEL),
+                    display_name: "GPT-5.6 Sol".to_owned(),
+                    context_tokens: Some(nanocodex_oai_api::CONTEXT_WINDOW_TOKENS),
+                    max_output_tokens: None,
+                },
+            ],
         })
     }
 }
@@ -94,13 +103,16 @@ impl Provider for OpenAiProvider {
                 yield StreamEvent::Error(ProviderError::cancelled());
                 return;
             }
-            if request.model.as_str() != MODEL {
-                yield StreamEvent::Error(invalid_request(format!(
-                    "nanocodex-oai-api 0.3.0 supports {MODEL}, not {}",
-                    request.model
-                )));
-                return;
-            }
+            let openai_model = match request.model.as_str() {
+                MODEL => OpenAiModel::Luna,
+                SOL_MODEL => OpenAiModel::Sol,
+                model => {
+                    yield StreamEvent::Error(invalid_request(format!(
+                        "OpenAI model {model:?} is unsupported; expected {MODEL} or {SOL_MODEL}"
+                    )));
+                    return;
+                }
+            };
             if request.system.trim().is_empty() {
                 yield StreamEvent::Error(invalid_request("system instructions must not be empty"));
                 return;
@@ -136,6 +148,7 @@ impl Provider for OpenAiProvider {
             };
             let tools = request.tools.iter().map(openai_tool).collect::<Vec<_>>();
             let openai = match OpenAi::builder(api_key)
+                .model(openai_model)
                 .max_attempts(NonZeroU32::MIN)
                 .store(false)
                 .history(ResponsesHistory::FullReplay)
@@ -179,7 +192,7 @@ impl Provider for OpenAiProvider {
                 let event = match next {
                     Ok(event) => event,
                     Err(error) => {
-                        match incomplete_message(&error, &request.tools) {
+                        match incomplete_message(&error, &request.tools, &request.model) {
                             Ok(Some(message)) => yield StreamEvent::Done(message),
                             Ok(None) => yield StreamEvent::Error(map_error(&error)),
                             Err(error) => yield StreamEvent::Error(error),
@@ -259,7 +272,7 @@ impl Provider for OpenAiProvider {
                     }
                 }
             };
-            match completed_message(&completed, &request.tools) {
+            match completed_message(&completed, &request.tools, &request.model) {
                 Ok(message) => yield StreamEvent::Done(message),
                 Err(error) => yield StreamEvent::Error(error),
             }
@@ -405,6 +418,7 @@ fn openai_tool(tool: &ToolDefinition) -> OpenAiToolDefinition {
 fn completed_message(
     completed: &nanocodex_oai_api::CompletedResponse,
     tools: &[ToolDefinition],
+    model: &ModelId,
 ) -> Result<AssistantMessage, ProviderError> {
     let mut blocks = Vec::new();
     for item in completed.output() {
@@ -442,7 +456,7 @@ fn completed_message(
         stop,
         usage,
         provider: ProviderId::from(PROVIDER),
-        model: ModelId::from(MODEL),
+        model: model.clone(),
     })
 }
 
@@ -489,6 +503,7 @@ struct IncompleteInputDetails {
 fn incomplete_message(
     error: &ResponseError,
     tools: &[ToolDefinition],
+    fallback_model: &ModelId,
 ) -> Result<Option<AssistantMessage>, ProviderError> {
     let Some(nanocodex_oai_api::transport::ResponsesError::Api { event }) = error.responses_error()
     else {
@@ -542,7 +557,7 @@ fn incomplete_message(
         .response
         .model
         .filter(|model| !model.trim().is_empty())
-        .unwrap_or_else(|| MODEL.to_owned());
+        .unwrap_or_else(|| fallback_model.as_str().to_owned());
     Ok(Some(AssistantMessage {
         blocks,
         stop,
@@ -1010,6 +1025,13 @@ mod tests {
     }
 
     #[test]
+    fn model_catalog_lists_luna_first_and_retains_sol() {
+        let provider = OpenAiProvider::new("secret-key").unwrap();
+        assert_eq!(provider.models()[0].id, ModelId::from(MODEL));
+        assert_eq!(provider.models()[1].id, ModelId::from(SOL_MODEL));
+    }
+
+    #[test]
     fn malformed_rejected_call_is_replayed_with_a_valid_output_pair() {
         let request = Request {
             system: "test".to_owned(),
@@ -1066,7 +1088,9 @@ mod tests {
         .to_string();
         let error =
             ResponseError::from(nanocodex_oai_api::transport::ResponsesError::Api { event });
-        let message = incomplete_message(&error, &[]).unwrap().unwrap();
+        let message = incomplete_message(&error, &[], &ModelId::from(MODEL))
+            .unwrap()
+            .unwrap();
         assert_eq!(message.stop, StopReason::Length);
         assert_eq!(message.usage.input_tokens, 8);
         assert!(matches!(

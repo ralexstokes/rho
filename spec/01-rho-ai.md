@@ -20,21 +20,23 @@ as an **optimization**, expressed as an optional provider capability, and only
 added when the stateless path is proven impractical or leaves real performance
 on the table. The trait must not bake stateful assumptions into its core shape.
 
-**Phase-1 spike resolution:** use `nanocodex-oai-api` 0.3 at its standalone
-`OpenAi -> Session -> Response` layer, not `nanocodex-agent`. The adapter
-creates a fresh Nanocodex session for every rho `Provider::stream` call and
-passes the complete rho transcript through `ResponseInput::items`. Provider
+**Phase-1 spike resolution:** use a pinned post-0.3 `nanocodex-oai-api`
+revision at its standalone `OpenAi -> Session -> Response` layer, not
+`nanocodex-agent`. The adapter creates a fresh Nanocodex session for every rho
+`Provider::stream` call and passes the complete rho transcript through
+`ResponseInput::items`. Provider
 checkpoint storage is disabled, history policy is `FullReplay`, and the
 Nanocodex request retry budget is one attempt. This preserves rho's
 stateless-transcript contract while reusing Nanocodex's typed Responses wire,
 auth, streaming transport, reconnect handling, and error taxonomy. The
-integration is quarantined in `rho-ai-openai`; its current fixed-model
-constraint (`gpt-5.6-sol`) does not leak into `rho-ai`.
+integration is quarantined in `rho-ai-openai`. Its closed model set currently
+contains `gpt-5.6-luna` (the CLI default) and `gpt-5.6-sol`; that policy does
+not leak into `rho-ai`.
 
-Adversarial review found one remaining limitation in that spike outcome:
-`nanocodex-oai-api` 0.3 does not expose `max_output_tokens` in its request
-profile, builder, session, or Tower attempt. The adapter validates the common
-field and maps provider-reported `max_output_tokens` incompletes to
+Adversarial review found one remaining limitation in that spike outcome: the
+pinned `nanocodex-oai-api` revision does not expose `max_output_tokens` in its
+request profile, builder, session, or Tower attempt. The adapter validates the
+common field and maps provider-reported `max_output_tokens` incompletes to
 `StopReason::Length`, so truncated tool calls remain non-executable, but it
 cannot transmit rho's requested hard limit. Closing this requires an upstream
 Nanocodex request hook or the already-defined fallback of a hand-rolled

@@ -903,8 +903,7 @@ dependencies = [
 [[package]]
 name = "nanocodex-oai-api"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ba9de4ec8a3bc051efb22462d5bd3357d16b8e25105026240b47794525b00b7"
+source = "git+https://github.com/gakonst/nanocodex.git?rev=e2f1effb4f6047d374aa0f83e374f919f7d1b241#e2f1effb4f6047d374aa0f83e374f919f7d1b241"
 dependencies = [
  "async-trait",
  "base64",

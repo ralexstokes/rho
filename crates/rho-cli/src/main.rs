@@ -40,7 +40,7 @@ impl ProviderChoice {
 
     fn default_model(self) -> ModelId {
         match self {
-            Self::OpenAi => ModelId::from("gpt-5.6-sol"),
+            Self::OpenAi => ModelId::from("gpt-5.6-luna"),
             Self::Anthropic => ModelId::from("claude-sonnet-5"),
         }
     }
@@ -392,6 +392,13 @@ mod tests {
         assert_eq!(cli.max_model_steps, DEFAULT_MAX_MODEL_STEPS);
         assert_eq!(cli.thinking, ThinkingLevel::Medium);
         assert_eq!(cli.prompt, "inspect the repo");
+    }
+
+    #[test]
+    fn openai_defaults_to_luna() {
+        let cli = parse_args(["inspect".to_owned()]).unwrap();
+        assert_eq!(cli.provider, ProviderChoice::OpenAi);
+        assert_eq!(cli.model, ModelId::from("gpt-5.6-luna"));
     }
 
     #[test]
