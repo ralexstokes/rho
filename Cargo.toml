@@ -1,14 +1,46 @@
 [workspace]
-default-members = [
-    "crates/hello",
-]
 members = [
-    "crates/hello",
+    "crates/rho-agent",
+    "crates/rho-ai",
+    "crates/rho-ai-anthropic",
+    "crates/rho-ai-openai",
+    "crates/rho-cli",
+    "crates/rho-codec-jsonl",
+    "crates/rho-core",
+    "crates/rho-ext",
+    "crates/rho-ext-wasm",
+    "crates/rho-rpc",
+    "crates/rho-shelterwood",
+    "crates/rho-store",
+    "crates/rho-tools",
 ]
 resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.1"
 
 # The flake reads `name` to label Nix derivations.
 [workspace.metadata]
 name = "rho"
 
 [workspace.dependencies]
+rho-agent = { path = "crates/rho-agent" }
+rho-ai = { path = "crates/rho-ai" }
+rho-ai-anthropic = { path = "crates/rho-ai-anthropic" }
+rho-ai-openai = { path = "crates/rho-ai-openai" }
+rho-codec-jsonl = { path = "crates/rho-codec-jsonl" }
+rho-core = { path = "crates/rho-core" }
+rho-ext = { path = "crates/rho-ext" }
+rho-ext-wasm = { path = "crates/rho-ext-wasm" }
+rho-rpc = { path = "crates/rho-rpc" }
+rho-shelterwood = { path = "crates/rho-shelterwood" }
+rho-store = { path = "crates/rho-store" }
+rho-tools = { path = "crates/rho-tools" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
