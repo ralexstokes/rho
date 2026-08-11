@@ -103,7 +103,7 @@ async fn run_turn(
 
         match stop {
             StopReason::ToolUse => {
-                let results = execute_tool_calls(&message, false).await;
+                let results = execute_tool_calls(&message, false, &cancellation).await?;
                 if results.is_empty() {
                     bail!("provider stopped for tool use without returning a tool call");
                 }
@@ -112,7 +112,7 @@ async fn run_turn(
                     .extend(results.into_iter().map(Message::ToolResult));
             }
             StopReason::Length => {
-                let results = execute_tool_calls(&message, true).await;
+                let results = execute_tool_calls(&message, true, &cancellation).await?;
                 if results.is_empty() {
                     bail!("provider output was truncated before completing the turn");
                 }
@@ -120,9 +120,10 @@ async fn run_turn(
                     .messages
                     .extend(results.into_iter().map(Message::ToolResult));
             }
-            StopReason::Stop | StopReason::Paused => {
+            StopReason::Stop => {
                 return Ok(());
             }
+            StopReason::Paused => {}
             StopReason::Refusal => bail!("provider refused the request"),
             StopReason::Error => bail!("provider ended the generation with an error"),
             StopReason::Aborted => bail!("provider request was aborted"),
@@ -164,15 +165,22 @@ async fn collect_message(
             }
             StreamEvent::Error(error) => return Err(error.into()),
             StreamEvent::Start | StreamEvent::Delta { .. } | StreamEvent::BlockDone { .. } => {}
-            _ => {}
+            _ => bail!("provider stream contained an unsupported event"),
         }
     }
     Err(anyhow!("provider stream ended without Done or Error"))
 }
 
-async fn execute_tool_calls(message: &AssistantMessage, truncated: bool) -> Vec<ToolResult> {
+async fn execute_tool_calls(
+    message: &AssistantMessage,
+    truncated: bool,
+    cancellation: &CancellationToken,
+) -> Result<Vec<ToolResult>> {
     let mut results = Vec::new();
     for block in &message.blocks {
+        if cancellation.is_cancelled() {
+            bail!("tool execution cancelled");
+        }
         match block {
             ContentBlock::ToolCall { id, .. } if truncated => {
                 results.push(ToolResult {
@@ -183,7 +191,7 @@ async fn execute_tool_calls(message: &AssistantMessage, truncated: bool) -> Vec<
                 });
             }
             ContentBlock::ToolCall { id, name, args } if name == "bash" => {
-                results.push(execute_bash(id, args).await);
+                results.push(execute_bash(id, args, cancellation).await?);
             }
             ContentBlock::ToolCall { id, name, .. } => results.push(ToolResult {
                 call_id: id.clone(),
@@ -198,23 +206,34 @@ async fn execute_tool_calls(message: &AssistantMessage, truncated: bool) -> Vec<
             _ => {}
         }
     }
-    results
+    Ok(results)
 }
 
-async fn execute_bash(call_id: &ToolCallId, arguments: &Value) -> ToolResult {
+async fn execute_bash(
+    call_id: &ToolCallId,
+    arguments: &Value,
+    cancellation: &CancellationToken,
+) -> Result<ToolResult> {
     let Some(command) = arguments.get("command").and_then(Value::as_str) else {
-        return ToolResult {
+        return Ok(ToolResult {
             call_id: call_id.clone(),
             content: "bash arguments were missing a string command".to_owned(),
             is_error: true,
-        };
+        });
     };
-    match tokio::process::Command::new("sh")
-        .arg("-lc")
-        .arg(command)
-        .output()
-        .await
-    {
+    if cancellation.is_cancelled() {
+        bail!("bash tool execution cancelled");
+    }
+    let mut process = tokio::process::Command::new("bash");
+    process.arg("-lc").arg(command).kill_on_drop(true);
+    let output = process.output();
+    tokio::pin!(output);
+    let output = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => bail!("bash tool execution cancelled"),
+        output = &mut output => output,
+    };
+    Ok(match output {
         Ok(output) => ToolResult {
             call_id: call_id.clone(),
             content: format_process_output(output.status, &output.stdout, &output.stderr),
@@ -225,7 +244,7 @@ async fn execute_bash(call_id: &ToolCallId, arguments: &Value) -> ToolResult {
             content: format!("failed to start shell: {error}"),
             is_error: true,
         },
-    }
+    })
 }
 
 fn format_process_output(status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> String {
@@ -238,7 +257,7 @@ fn bash_definition() -> ToolDefinition {
     ToolDefinition::new(
         "bash",
         concat!(
-            "Run one command using `sh -lc` in rho's current working directory. ",
+            "Run one command using `bash -lc` in rho's current working directory. ",
             "The command is not sandboxed by rho."
         ),
         json!({
@@ -326,13 +345,18 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Cli> {
 
 fn print_help() {
     println!(
-        "rho-cli [--provider openai|anthropic] [--model ID] \\\n+         [--max-output-tokens N] [--thinking LEVEL] PROMPT\n\n\\
-         Runs one agent turn with an unsandboxed bash tool. Credentials are read from \\\n+         OPENAI_API_KEY or ANTHROPIC_API_KEY, then from ~/.rho/credentials.json."
+        "rho-cli [--provider openai|anthropic] [--model ID] \\\n         [--max-output-tokens N] [--thinking LEVEL] PROMPT\n\n\\
+         Runs one agent turn with an unsandboxed bash tool. Credentials are read from \\\n         OPENAI_API_KEY or ANTHROPIC_API_KEY, then from ~/.rho/credentials.json."
     );
 }
 
 #[cfg(test)]
 mod tests {
+    use rho_ai::{
+        ModelInfo, Usage,
+        faux::{FauxProvider, Script},
+    };
+
     use super::*;
 
     #[test]
@@ -357,9 +381,130 @@ mod tests {
         let result = execute_bash(
             &ToolCallId::from("call-1"),
             &json!({"command": "printf phase1"}),
+            &CancellationToken::new(),
         )
-        .await;
+        .await
+        .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("phase1"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_prevents_bash_execution() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = execute_bash(
+            &ToolCallId::from("call-1"),
+            &json!({"command": "printf should-not-run"}),
+            &cancellation,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_in_flight_bash_execution() {
+        let cancellation = CancellationToken::new();
+        let signal = cancellation.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            signal.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = execute_bash(
+            &ToolCallId::from("call-1"),
+            &json!({"command": "sleep 5"}),
+            &cancellation,
+        )
+        .await
+        .unwrap_err();
+        canceller.join().unwrap();
+
+        assert!(error.to_string().contains("cancelled"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn length_terminated_tool_calls_are_failed_without_execution() {
+        let message = AssistantMessage {
+            blocks: vec![ContentBlock::ToolCall {
+                id: ToolCallId::from("call-1"),
+                name: "bash".to_owned(),
+                args: json!({"command": "exit 99"}),
+            }],
+            stop: StopReason::Length,
+            usage: rho_ai::Usage::default(),
+            provider: ProviderId::from("faux"),
+            model: ModelId::from("faux"),
+        };
+        let results = execute_tool_calls(&message, true, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_error);
+        assert!(results[0].content.contains("not executed"));
+    }
+
+    #[tokio::test]
+    async fn paused_provider_response_continues_the_same_logical_turn() {
+        let cli = Cli {
+            provider: ProviderChoice::OpenAi,
+            model: ModelId::from("faux"),
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::None,
+            prompt: "hello".to_owned(),
+        };
+        let initial = Request {
+            system: concat!(
+                "You are a concise coding assistant. Use the bash tool when you need to inspect or ",
+                "change the current workspace. Report what you did and whether it succeeded."
+            )
+            .to_owned(),
+            messages: vec![Message::user("hello")],
+            tools: vec![bash_definition()],
+            model: ModelId::from("faux"),
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::None,
+        };
+        let paused = AssistantMessage {
+            blocks: Vec::new(),
+            stop: StopReason::Paused,
+            usage: Usage::default(),
+            provider: ProviderId::from("faux"),
+            model: ModelId::from("faux"),
+        };
+        let done = AssistantMessage {
+            blocks: Vec::new(),
+            stop: StopReason::Stop,
+            usage: Usage::default(),
+            provider: ProviderId::from("faux"),
+            model: ModelId::from("faux"),
+        };
+        let mut continued = initial.clone();
+        continued.messages.push(Message::Assistant(paused.clone()));
+        let provider = FauxProvider::new(
+            vec![ModelInfo {
+                id: ModelId::from("faux"),
+                display_name: "Faux".to_owned(),
+                context_tokens: None,
+                max_output_tokens: None,
+            }],
+            [
+                Script {
+                    request: initial,
+                    events: vec![StreamEvent::Start, StreamEvent::Done(paused)],
+                },
+                Script {
+                    request: continued,
+                    events: vec![StreamEvent::Start, StreamEvent::Done(done)],
+                },
+            ],
+        );
+
+        run_turn(&provider, &cli, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(provider.remaining(), 0);
     }
 }

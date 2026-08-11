@@ -6,6 +6,8 @@
 pub mod decoder;
 mod response;
 
+use std::collections::BTreeSet;
+
 use async_stream::stream;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::StreamExt as _;
@@ -98,6 +100,10 @@ impl Provider for AnthropicProvider {
         let api_key = self.api_key.clone();
         let endpoint = format!("{}/v1/messages", self.base_url);
         Box::pin(stream! {
+            if cancellation.is_cancelled() {
+                yield StreamEvent::Error(ProviderError::cancelled());
+                return;
+            }
             let body = match request_body(&request) {
                 Ok(body) => body,
                 Err(error) => {
@@ -112,6 +118,7 @@ impl Provider for AnthropicProvider {
                 .json(&body)
                 .send();
             let response = tokio::select! {
+                biased;
                 () = cancellation.cancelled() => {
                     yield StreamEvent::Error(ProviderError::cancelled());
                     return;
@@ -128,6 +135,7 @@ impl Provider for AnthropicProvider {
             if !response.status().is_success() {
                 let status = response.status();
                 let text = tokio::select! {
+                    biased;
                     () = cancellation.cancelled() => {
                         yield StreamEvent::Error(ProviderError::cancelled());
                         return;
@@ -144,6 +152,7 @@ impl Provider for AnthropicProvider {
             let mut terminal = false;
             loop {
                 let next = tokio::select! {
+                    biased;
                     () = cancellation.cancelled() => {
                         yield StreamEvent::Error(ProviderError::cancelled());
                         return;
@@ -166,6 +175,10 @@ impl Provider for AnthropicProvider {
                     }
                 };
                 for event in decoded {
+                    if cancellation.is_cancelled() {
+                        yield StreamEvent::Error(ProviderError::cancelled());
+                        return;
+                    }
                     let events = match assembler.accept(event) {
                         Ok(events) => events,
                         Err(error) => {
@@ -174,6 +187,10 @@ impl Provider for AnthropicProvider {
                         }
                     };
                     for event in events {
+                        if cancellation.is_cancelled() {
+                            yield StreamEvent::Error(ProviderError::cancelled());
+                            return;
+                        }
                         terminal |= matches!(event, StreamEvent::Done(_) | StreamEvent::Error(_));
                         yield event;
                     }
@@ -183,6 +200,10 @@ impl Provider for AnthropicProvider {
                 }
             }
 
+            if cancellation.is_cancelled() {
+                yield StreamEvent::Error(ProviderError::cancelled());
+                return;
+            }
             let decoded = match decoder.finish() {
                 Ok(decoded) => decoded,
                 Err(error) => {
@@ -191,6 +212,10 @@ impl Provider for AnthropicProvider {
                 }
             };
             for event in decoded {
+                if cancellation.is_cancelled() {
+                    yield StreamEvent::Error(ProviderError::cancelled());
+                    return;
+                }
                 let events = match assembler.accept(event) {
                     Ok(events) => events,
                     Err(error) => {
@@ -199,8 +224,15 @@ impl Provider for AnthropicProvider {
                     }
                 };
                 for event in events {
+                    if cancellation.is_cancelled() {
+                        yield StreamEvent::Error(ProviderError::cancelled());
+                        return;
+                    }
                     terminal |= matches!(event, StreamEvent::Done(_) | StreamEvent::Error(_));
                     yield event;
+                    if terminal {
+                        return;
+                    }
                 }
             }
             if !terminal {
@@ -227,9 +259,16 @@ pub fn request_body(request: &Request) -> Result<Value, ProviderError> {
             "claude-fable-5 does not support disabling adaptive thinking",
         ));
     }
+    let mut tool_names = BTreeSet::new();
     for tool in &request.tools {
         validate_tool_definition(tool)
             .map_err(|error| invalid_request(format!("tool {}: {error}", tool.name)))?;
+        if !tool_names.insert(tool.name.as_str()) {
+            return Err(invalid_request(format!(
+                "duplicate tool definition {:?}",
+                tool.name
+            )));
+        }
     }
 
     let messages = request
@@ -289,8 +328,8 @@ fn message_value(message: &Message) -> Result<Value, ProviderError> {
             "content": message
                 .blocks
                 .iter()
-                .filter_map(assistant_content_value)
-                .collect::<Vec<_>>(),
+                .map(assistant_content_value)
+                .collect::<Result<Vec<_>, _>>()?,
         })),
         Message::ToolResult(result) => Ok(json!({
             "role": "user",
@@ -322,11 +361,11 @@ fn user_content_value(block: &ContentBlock) -> Result<Value, ProviderError> {
     }
 }
 
-fn assistant_content_value(block: &ContentBlock) -> Option<Value> {
+fn assistant_content_value(block: &ContentBlock) -> Result<Value, ProviderError> {
     match block {
-        ContentBlock::Text { text } => Some(json!({"type": "text", "text": text})),
-        ContentBlock::Thinking { text, opaque } => Some(anthropic_thinking_value(text, opaque)),
-        ContentBlock::ToolCall { id, name, args } => Some(json!({
+        ContentBlock::Text { text } => Ok(json!({"type": "text", "text": text})),
+        ContentBlock::Thinking { text, opaque } => Ok(anthropic_thinking_value(text, opaque)),
+        ContentBlock::ToolCall { id, name, args } => Ok(json!({
             "type": "tool_use",
             "id": id.as_str(),
             "name": name,
@@ -337,14 +376,29 @@ fn assistant_content_value(block: &ContentBlock) -> Option<Value> {
             name,
             args: Some(args),
             ..
-        } => Some(json!({
+        } => Ok(json!({
             "type": "tool_use",
             "id": id.as_str(),
             "name": name,
             "input": args,
         })),
-        ContentBlock::RejectedToolCall { args: None, .. } | ContentBlock::Image { .. } => None,
-        _ => None,
+        ContentBlock::RejectedToolCall {
+            id,
+            name,
+            args: None,
+            ..
+        } => Ok(json!({
+            "type": "tool_use",
+            "id": id.as_str(),
+            "name": name,
+            "input": {},
+        })),
+        ContentBlock::Image { .. } => Err(invalid_request(
+            "Anthropic assistant history cannot contain image blocks",
+        )),
+        _ => Err(invalid_request(
+            "unsupported assistant content block variant",
+        )),
     }
 }
 
@@ -416,7 +470,7 @@ fn classify_http_error(status: StatusCode, body: String) -> ProviderError {
 
 #[cfg(test)]
 mod tests {
-    use rho_ai::{AssistantMessage, StopReason, ToolCallId, ToolResult, Usage};
+    use rho_ai::{AssistantMessage, StopReason, ToolCallId, ToolDefinition, ToolResult, Usage};
 
     use super::*;
 
@@ -466,5 +520,46 @@ mod tests {
         let debug = format!("{provider:?}");
         assert!(!debug.contains("secret-key"));
         assert!(debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn malformed_rejected_call_is_replayed_with_a_valid_tool_pair() {
+        let request = Request {
+            system: "test".to_owned(),
+            messages: vec![
+                Message::Assistant(AssistantMessage {
+                    blocks: vec![ContentBlock::RejectedToolCall {
+                        id: ToolCallId::from("toolu-1"),
+                        name: "bash".to_owned(),
+                        args: None,
+                        error: rho_ai::ToolArgumentError {
+                            kind: "json_parse".to_owned(),
+                            message: "bad JSON".to_owned(),
+                        },
+                    }],
+                    stop: StopReason::ToolUse,
+                    usage: Usage::default(),
+                    provider: ProviderId::from(PROVIDER),
+                    model: ModelId::from("claude-sonnet-5"),
+                }),
+                Message::ToolResult(ToolResult {
+                    call_id: ToolCallId::from("toolu-1"),
+                    content: "tool arguments rejected".to_owned(),
+                    is_error: true,
+                }),
+            ],
+            tools: vec![ToolDefinition::new(
+                "bash",
+                "Run a command.",
+                json!({"type": "object"}),
+            )],
+            model: ModelId::from("claude-sonnet-5"),
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::None,
+        };
+
+        let body = request_body(&request).unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["input"], json!({}));
+        assert_eq!(body["messages"][1]["content"][0]["tool_use_id"], "toolu-1");
     }
 }

@@ -124,6 +124,17 @@ mod tests {
         };
         let debug = format!("{stored:?}");
         assert!(!debug.contains("stored-secret"));
+
+        let mut store = CredentialStore::default();
+        store.insert(
+            ProviderId::from("test"),
+            StoredCredential::ApiKey {
+                api_key: "nested-secret".to_owned(),
+            },
+        );
+        let debug = format!("{store:?}");
+        assert!(!debug.contains("nested-secret"));
+        assert!(debug.contains("REDACTED"));
     }
 
     #[test]

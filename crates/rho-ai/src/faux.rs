@@ -79,7 +79,7 @@ impl Provider for FauxProvider {
 struct FauxStream {
     events: VecDeque<StreamEvent>,
     cancellation: CancellationToken,
-    cancellation_emitted: bool,
+    terminal_emitted: bool,
 }
 
 impl FauxStream {
@@ -90,7 +90,7 @@ impl FauxStream {
         Self {
             events: events.into_iter().collect(),
             cancellation,
-            cancellation_emitted: false,
+            terminal_emitted: false,
         }
     }
 }
@@ -99,15 +99,24 @@ impl Stream for FauxStream {
     type Item = StreamEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.terminal_emitted {
+            return Poll::Ready(None);
+        }
         if self.cancellation.is_cancelled() {
             self.events.clear();
-            if self.cancellation_emitted {
-                return Poll::Ready(None);
-            }
-            self.cancellation_emitted = true;
+            self.terminal_emitted = true;
             return Poll::Ready(Some(StreamEvent::Error(ProviderError::cancelled())));
         }
-        Poll::Ready(self.events.pop_front())
+        let event = self.events.pop_front().unwrap_or_else(|| {
+            StreamEvent::Error(ProviderError::invalid_response(
+                "faux provider script ended without Done or Error",
+            ))
+        });
+        if matches!(event, StreamEvent::Done(_) | StreamEvent::Error(_)) {
+            self.events.clear();
+            self.terminal_emitted = true;
+        }
+        Poll::Ready(Some(event))
     }
 }
 
@@ -178,6 +187,60 @@ mod tests {
             stream.as_mut().poll_next(&mut context),
             Poll::Ready(Some(StreamEvent::Error(ProviderError {
                 kind: crate::ErrorKind::Cancelled,
+                ..
+            })))
+        ));
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut context),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[test]
+    fn a_scripted_terminal_event_is_final_even_if_cancelled_later() {
+        let provider = FauxProvider::new(
+            Vec::new(),
+            [Script {
+                request: request(),
+                events: vec![StreamEvent::Error(ProviderError::invalid_response("stop"))],
+            }],
+        );
+        let cancellation = CancellationToken::new();
+        let mut stream = pin!(provider.stream(request(), cancellation.clone()));
+        let waker = std::task::Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut context),
+            Poll::Ready(Some(StreamEvent::Error(_)))
+        ));
+
+        cancellation.cancel();
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut context),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[test]
+    fn an_unterminated_script_becomes_a_terminal_boundary_error() {
+        let provider = FauxProvider::new(
+            Vec::new(),
+            [Script {
+                request: request(),
+                events: vec![StreamEvent::Start],
+            }],
+        );
+        let mut stream = pin!(provider.stream(request(), CancellationToken::new()));
+        let waker = std::task::Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut context),
+            Poll::Ready(Some(StreamEvent::Start))
+        ));
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut context),
+            Poll::Ready(Some(StreamEvent::Error(ProviderError {
+                kind: crate::ErrorKind::InvalidResponse,
                 ..
             })))
         ));

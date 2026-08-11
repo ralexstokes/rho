@@ -31,6 +31,16 @@ auth, streaming transport, reconnect handling, and error taxonomy. The
 integration is quarantined in `rho-ai-openai`; its current fixed-model
 constraint (`gpt-5.6-sol`) does not leak into `rho-ai`.
 
+Adversarial review found one remaining limitation in that spike outcome:
+`nanocodex-oai-api` 0.3 does not expose `max_output_tokens` in its request
+profile, builder, session, or Tower attempt. The adapter validates the common
+field and maps provider-reported `max_output_tokens` incompletes to
+`StopReason::Length`, so truncated tool calls remain non-executable, but it
+cannot transmit rho's requested hard limit. Closing this requires an upstream
+Nanocodex request hook or the already-defined fallback of a hand-rolled
+Responses transport within `rho-ai-openai`; silently claiming the limit is
+enforced is not acceptable.
+
 ### 1.2 Validation: langsec at the boundary (DECIDED)
 
 **If it doesn't parse, the library doesn't see it.** Every input from a
@@ -143,3 +153,10 @@ Rules carried over from the overview:
 2. Thinking-level compatibility policy for older Anthropic models that require
    fixed-budget thinking rather than the current adaptive-thinking API.
 3. Whether `ModelInfo` carries cost tables in v1 (usage display) or later.
+4. Add a Nanocodex request hook (or take the quarantined hand-rolled fallback)
+   so the OpenAI adapter can transmit the common hard output-token limit.
+5. `jsonschema` currently reaches `getrandom` through `ahash` even with its
+   own default features disabled. Validation results and diagnostics are
+   normalized deterministically, but removing ambient randomness from the
+   pure dependency graph requires a deterministic upstream map configuration,
+   a patched dependency, or a replacement validator.

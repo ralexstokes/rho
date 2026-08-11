@@ -86,18 +86,26 @@ impl Decoder {
 }
 
 fn find_frame(bytes: &[u8]) -> Option<(usize, usize)> {
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| (index, 4));
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|index| (index, 2));
-    match (crlf, lf) {
-        (Some(crlf), Some(lf)) => Some(if crlf.0 <= lf.0 { crlf } else { lf }),
-        (Some(frame), None) | (None, Some(frame)) => Some(frame),
-        (None, None) => None,
+    let mut index = 0;
+    while index < bytes.len() {
+        let Some(first_len) = line_ending_len(bytes, index) else {
+            index += 1;
+            continue;
+        };
+        let second = index + first_len;
+        if let Some(second_len) = line_ending_len(bytes, second) {
+            return Some((index, first_len + second_len));
+        }
+        index = second;
+    }
+    None
+}
+
+fn line_ending_len(bytes: &[u8], index: usize) -> Option<usize> {
+    match bytes.get(index) {
+        Some(b'\r') if bytes.get(index + 1) == Some(&b'\n') => Some(2),
+        Some(b'\r' | b'\n') => Some(1),
+        _ => None,
     }
 }
 
@@ -105,8 +113,7 @@ fn decode_frame(bytes: &[u8]) -> Result<Option<DecodedEvent>, DecodeError> {
     let text = std::str::from_utf8(bytes)?;
     let mut event = None;
     let mut data = Vec::new();
-    for raw_line in text.lines() {
-        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+    for line in text.split(['\r', '\n']) {
         if line.is_empty() || line.starts_with(':') {
             continue;
         }
@@ -203,5 +210,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn decodes_all_sse_line_endings_across_chunk_boundaries() {
+        let mut decoder = Decoder::new();
+        assert!(
+            decoder
+                .feed(b"event: ping\rdata: {\"type\":\"ping\"}\r")
+                .unwrap()
+                .is_empty()
+        );
+        let events = decoder
+            .feed(
+                b"\revent: ping\r\ndata: {\"type\":\"ping\"}\r\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\r\n",
+            )
+            .unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| event.event == "ping"));
     }
 }

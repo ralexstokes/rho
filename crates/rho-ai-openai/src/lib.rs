@@ -4,7 +4,7 @@
 //! request and supplies the complete transcript as typed input. Nanocodex's
 //! agent loop and retained-history API never cross this crate boundary.
 
-use std::num::NonZeroU32;
+use std::{collections::BTreeSet, num::NonZeroU32};
 
 use async_stream::stream;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -26,6 +26,7 @@ use rho_ai::{
     StopReason, StreamEvent, ThinkingLevel, ToolArgumentError, ToolCallId, ToolDefinition, Usage,
     validate_tool_arguments, validate_tool_definition,
 };
+use serde::Deserialize;
 
 const PROVIDER: &str = "openai";
 const MODEL: &str = nanocodex_oai_api::MODEL;
@@ -82,6 +83,10 @@ impl Provider for OpenAiProvider {
     fn stream(&self, request: Request, cancellation: CancellationToken) -> ProviderStream {
         let api_key = self.api_key.clone();
         Box::pin(stream! {
+            if cancellation.is_cancelled() {
+                yield StreamEvent::Error(ProviderError::cancelled());
+                return;
+            }
             if request.model.as_str() != MODEL {
                 yield StreamEvent::Error(invalid_request(format!(
                     "nanocodex-oai-api 0.3.0 supports {MODEL}, not {}",
@@ -99,10 +104,18 @@ impl Provider for OpenAiProvider {
                 ));
                 return;
             }
+            let mut tool_names = BTreeSet::new();
             for tool in &request.tools {
                 if let Err(error) = validate_tool_definition(tool) {
                     yield StreamEvent::Error(invalid_request(format!(
                         "tool {}: {error}", tool.name
+                    )));
+                    return;
+                }
+                if !tool_names.insert(tool.name.as_str()) {
+                    yield StreamEvent::Error(invalid_request(format!(
+                        "duplicate tool definition {:?}",
+                        tool.name
                     )));
                     return;
                 }
@@ -148,6 +161,7 @@ impl Provider for OpenAiProvider {
             let mut block_index = 0usize;
             loop {
                 let next = tokio::select! {
+                    biased;
                     () = cancellation.cancelled() => {
                         yield StreamEvent::Error(ProviderError::cancelled());
                         return;
@@ -158,10 +172,18 @@ impl Provider for OpenAiProvider {
                 let event = match next {
                     Ok(event) => event,
                     Err(error) => {
-                        yield StreamEvent::Error(map_error(&error));
+                        match incomplete_message(&error, &request.tools) {
+                            Ok(Some(message)) => yield StreamEvent::Done(message),
+                            Ok(None) => yield StreamEvent::Error(map_error(&error)),
+                            Err(error) => yield StreamEvent::Error(error),
+                        }
                         return;
                     }
                 };
+                if cancellation.is_cancelled() {
+                    yield StreamEvent::Error(ProviderError::cancelled());
+                    return;
+                }
                 match event {
                     OpenAiEvent::Created => yield StreamEvent::Start,
                     OpenAiEvent::OutputTextDelta(delta) => yield StreamEvent::Delta {
@@ -193,6 +215,10 @@ impl Provider for OpenAiProvider {
                             }
                         };
                         for block in blocks {
+                            if cancellation.is_cancelled() {
+                                yield StreamEvent::Error(ProviderError::cancelled());
+                                return;
+                            }
                             yield StreamEvent::BlockDone {
                                 index: block_index,
                                 block,
@@ -204,14 +230,26 @@ impl Provider for OpenAiProvider {
                     | OpenAiEvent::ReasoningSummaryDone { .. }
                     | OpenAiEvent::ReasoningSummaryPartAdded { .. }
                     | OpenAiEvent::Completed { .. } => {}
-                    _ => {}
+                    _ => {
+                        yield StreamEvent::Error(ProviderError::invalid_response(
+                            "nanocodex returned an unsupported response event",
+                        ));
+                        return;
+                    }
                 }
             }
-            let completed = match response.await {
-                Ok(completed) => completed,
-                Err(error) => {
-                    yield StreamEvent::Error(map_error(&error));
+            let completed = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    yield StreamEvent::Error(ProviderError::cancelled());
                     return;
+                }
+                completed = response => match completed {
+                    Ok(completed) => completed,
+                    Err(error) => {
+                        yield StreamEvent::Error(map_error(&error));
+                        return;
+                    }
                 }
             };
             match completed_message(&completed, &request.tools) {
@@ -275,7 +313,16 @@ fn request_items(request: &Request) -> Result<Vec<ResponseItem>, ProviderError> 
                             args: Some(args),
                             ..
                         } => items.push(function_call_item(id, name, args)),
-                        ContentBlock::RejectedToolCall { args: None, .. } => {}
+                        ContentBlock::RejectedToolCall {
+                            id,
+                            name,
+                            args: None,
+                            ..
+                        } => items.push(function_call_item(
+                            id,
+                            name,
+                            &serde_json::Value::Object(serde_json::Map::new()),
+                        )),
                         ContentBlock::Image { .. } => {
                             return Err(invalid_request(
                                 "OpenAI assistant history cannot contain image blocks",
@@ -380,6 +427,112 @@ fn completed_message(
     })
 }
 
+#[derive(Deserialize)]
+struct IncompleteEnvelope {
+    #[serde(rename = "type")]
+    event_type: String,
+    response: IncompleteResponse,
+}
+
+#[derive(Deserialize)]
+struct IncompleteResponse {
+    #[serde(default)]
+    model: Option<String>,
+    output: Vec<ResponseItem>,
+    incomplete_details: IncompleteDetails,
+    #[serde(default)]
+    usage: Option<IncompleteUsage>,
+}
+
+#[derive(Deserialize)]
+struct IncompleteDetails {
+    reason: String,
+}
+
+#[derive(Default, Deserialize)]
+struct IncompleteUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    input_tokens_details: Option<IncompleteInputDetails>,
+}
+
+#[derive(Default, Deserialize)]
+struct IncompleteInputDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+    #[serde(default)]
+    cache_write_tokens: u64,
+}
+
+fn incomplete_message(
+    error: &ResponseError,
+    tools: &[ToolDefinition],
+) -> Result<Option<AssistantMessage>, ProviderError> {
+    let Some(nanocodex_oai_api::transport::ResponsesError::Api { event }) = error.responses_error()
+    else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_str(event).map_err(|source| {
+        ProviderError::invalid_response(format!("OpenAI returned an invalid error event: {source}"))
+    })?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("response.incomplete") {
+        return Ok(None);
+    }
+    let incomplete: IncompleteEnvelope = serde_json::from_value(value).map_err(|source| {
+        ProviderError::invalid_response(format!(
+            "OpenAI returned an invalid incomplete response: {source}"
+        ))
+    })?;
+    if incomplete.event_type != "response.incomplete" {
+        return Err(ProviderError::invalid_response(
+            "OpenAI incomplete response carried a mismatched event type",
+        ));
+    }
+    let stop = match incomplete.response.incomplete_details.reason.as_str() {
+        "max_output_tokens" | "model_context_window_exceeded" => StopReason::Length,
+        "content_filter" => StopReason::Refusal,
+        reason => {
+            return Err(ProviderError::invalid_response(format!(
+                "unsupported OpenAI incomplete reason {reason:?}"
+            )));
+        }
+    };
+    let mut blocks = Vec::new();
+    for item in &incomplete.response.output {
+        blocks.extend(response_item_blocks(item, tools)?);
+    }
+    let usage = incomplete
+        .response
+        .usage
+        .map_or_else(Usage::default, |usage| Usage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage
+                .input_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.cached_tokens),
+            cache_write_tokens: usage
+                .input_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.cache_write_tokens),
+        });
+    let model = incomplete
+        .response
+        .model
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| MODEL.to_owned());
+    Ok(Some(AssistantMessage {
+        blocks,
+        stop,
+        usage,
+        provider: ProviderId::from(PROVIDER),
+        model: ModelId::from(model),
+    }))
+}
+
 fn response_item_blocks(
     item: &ResponseItem,
     tools: &[ToolDefinition],
@@ -391,11 +544,15 @@ fn response_item_blocks(
             ..
         } => content
             .iter()
-            .filter_map(|content| match content {
-                ContentItem::OutputText { text, .. } => Some(Ok(ContentBlock::Text {
+            .map(|content| match content {
+                ContentItem::OutputText { text, .. } => Ok(ContentBlock::Text {
                     text: text.to_string(),
-                })),
-                _ => None,
+                }),
+                ContentItem::InputText { .. }
+                | ContentItem::InputImage { .. }
+                | ContentItem::InputAudio { .. } => Err(ProviderError::invalid_response(
+                    "OpenAI assistant output contained an input-only content item",
+                )),
             })
             .collect(),
         ResponseItem::Reasoning {
@@ -438,13 +595,21 @@ fn response_item_blocks(
             call_id,
             ..
         } => {
-            let arguments: serde_json::Value =
-                serde_json::from_str(arguments).map_err(|error| {
-                    ProviderError::invalid_response(format!(
-                        "tool {name} emitted malformed arguments: {error}"
-                    ))
-                })?;
             let id = ToolCallId::from(call_id.as_ref());
+            let arguments: serde_json::Value = match serde_json::from_str(arguments) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    return Ok(vec![ContentBlock::RejectedToolCall {
+                        id,
+                        name: name.to_string(),
+                        args: None,
+                        error: ToolArgumentError {
+                            kind: "json_parse".to_owned(),
+                            message: format!("provider emitted malformed JSON: {error}"),
+                        },
+                    }]);
+                }
+            };
             let Some(tool) = tools.iter().find(|tool| tool.name == name.as_ref()) else {
                 return Ok(vec![ContentBlock::RejectedToolCall {
                     id,
@@ -470,9 +635,9 @@ fn response_item_blocks(
                 }]),
             }
         }
-        ResponseItem::Other(value) => Err(ProviderError::invalid_response(format!(
-            "OpenAI returned an unknown output item: {value:?}"
-        ))),
+        ResponseItem::Other(_) => Err(ProviderError::invalid_response(
+            "OpenAI returned an unknown output item type",
+        )),
         ResponseItem::AdditionalTools { .. }
         | ResponseItem::Message { .. }
         | ResponseItem::AgentMessage { .. }
@@ -486,7 +651,9 @@ fn response_item_blocks(
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::Compaction { .. }
         | ResponseItem::CompactionTrigger {}
-        | ResponseItem::ContextCompaction { .. } => Ok(Vec::new()),
+        | ResponseItem::ContextCompaction { .. } => Err(ProviderError::invalid_response(
+            "OpenAI returned an unsupported output item type",
+        )),
     }
 }
 
@@ -494,30 +661,82 @@ fn map_error(error: &ResponseError) -> ProviderError {
     let (kind, retryable) = match error.kind() {
         ResponseErrorKind::ContextWindowExceeded => (ErrorKind::ContextWindowExceeded, false),
         ResponseErrorKind::Protocol => (ErrorKind::InvalidResponse, false),
-        ResponseErrorKind::Service => {
-            let retryable = error
-                .responses_error()
-                .and_then(nanocodex_oai_api::transport::ResponsesError::retry_advice)
-                .is_some();
-            let kind = error
-                .responses_error()
-                .map_or(ErrorKind::Transport, |error| match error.class() {
-                    "authorization" | "invalid_authorization" => ErrorKind::Authentication,
-                    "https_rate_limit" | "handshake_rate_limit" => ErrorKind::RateLimited,
-                    "context_window_exceeded" => ErrorKind::ContextWindowExceeded,
-                    "invalid_json" | "invalid_payload" | "invalid_sse_utf8" => {
-                        ErrorKind::InvalidResponse
-                    }
-                    _ => ErrorKind::Transport,
-                });
-            (kind, retryable)
-        }
+        ResponseErrorKind::Service => error
+            .responses_error()
+            .map_or((ErrorKind::Transport, false), classify_responses_error),
         _ => (ErrorKind::Other, false),
     };
     ProviderError {
         retryable,
         kind,
         message: error.to_string(),
+    }
+}
+
+fn classify_responses_error(
+    error: &nanocodex_oai_api::transport::ResponsesError,
+) -> (ErrorKind, bool) {
+    use nanocodex_oai_api::transport::ResponsesError;
+
+    let retry_class = error.retry_advice().map(|advice| advice.class);
+    match error {
+        ResponsesError::Authorization { .. } | ResponsesError::InvalidAuthorization { .. } => {
+            (ErrorKind::Authentication, false)
+        }
+        ResponsesError::ContextWindowExceeded { .. } => (ErrorKind::ContextWindowExceeded, false),
+        ResponsesError::InvalidJson(_)
+        | ResponsesError::InvalidPayload { .. }
+        | ResponsesError::InvalidSseUtf8 { .. }
+        | ResponsesError::UnexpectedBinary => (ErrorKind::InvalidResponse, false),
+        ResponsesError::InvalidUrl { .. }
+        | ResponsesError::InvalidSessionId { .. }
+        | ResponsesError::EncodeRequest(_)
+        | ResponsesError::InvalidImageRequest { .. } => (ErrorKind::InvalidRequest, false),
+        ResponsesError::Api { event } => classify_api_event(event, retry_class.is_some()),
+        ResponsesError::HandshakeRejected { status, .. }
+        | ResponsesError::HttpRejected { status, .. }
+            if matches!(status, 401 | 403) =>
+        {
+            (ErrorKind::Authentication, false)
+        }
+        _ if matches!(
+            retry_class,
+            Some("https_rate_limit" | "handshake_rate_limit")
+        ) =>
+        {
+            (ErrorKind::RateLimited, true)
+        }
+        _ => (ErrorKind::Transport, retry_class.is_some()),
+    }
+}
+
+fn classify_api_event(event: &str, upstream_retryable: bool) -> (ErrorKind, bool) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(event) else {
+        return (ErrorKind::InvalidResponse, false);
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("response.incomplete") {
+        // Incompletes are terminal response states, not transport failures. The
+        // stream path projects supported reasons to an authoritative `Done`.
+        return (ErrorKind::InvalidResponse, false);
+    }
+    let detail = value
+        .get("error")
+        .or_else(|| value.pointer("/response/error"));
+    let discriminator = detail
+        .and_then(|detail| detail.get("code").or_else(|| detail.get("type")))
+        .and_then(serde_json::Value::as_str);
+    match discriminator {
+        Some("authentication_error" | "invalid_api_key" | "insufficient_quota") => {
+            (ErrorKind::Authentication, false)
+        }
+        Some("rate_limit_exceeded") => (ErrorKind::RateLimited, true),
+        Some("server_is_overloaded" | "slow_down") => (ErrorKind::Overloaded, true),
+        Some("context_length_exceeded") => (ErrorKind::ContextWindowExceeded, false),
+        Some("invalid_prompt" | "invalid_request_error" | "invalid_image") => {
+            (ErrorKind::InvalidRequest, false)
+        }
+        Some("server_error" | "websocket_connection_limit_reached") => (ErrorKind::Transport, true),
+        _ => (ErrorKind::Other, upstream_retryable),
     }
 }
 
@@ -594,6 +813,43 @@ mod tests {
     }
 
     #[test]
+    fn recorded_malformed_call_is_a_structured_rejection() {
+        let item: ResponseItem = serde_json::from_value(json!({
+            "type": "function_call",
+            "name": "bash",
+            "arguments": "{\"command\":",
+            "call_id": "call-1"
+        }))
+        .unwrap();
+        let blocks = response_item_blocks(&item, &[bash_tool()]).unwrap();
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::RejectedToolCall { args: None, error, .. }
+                if error.kind == "json_parse"
+        ));
+    }
+
+    #[test]
+    fn unsupported_typed_output_is_rejected_instead_of_dropped() {
+        let item: ResponseItem = serde_json::from_value(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "input_text", "text": "not output"}]
+        }))
+        .unwrap();
+        let error = response_item_blocks(&item, &[]).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidResponse);
+
+        let item: ResponseItem = serde_json::from_value(json!({
+            "type": "web_search_call",
+            "status": "completed"
+        }))
+        .unwrap();
+        let error = response_item_blocks(&item, &[]).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidResponse);
+    }
+
+    #[test]
     fn fresh_session_input_contains_complete_transcript_and_drops_foreign_opaque() {
         let request = Request {
             system: "test".to_owned(),
@@ -633,5 +889,88 @@ mod tests {
         let debug = format!("{provider:?}");
         assert!(!debug.contains("secret-key"));
         assert!(debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn malformed_rejected_call_is_replayed_with_a_valid_output_pair() {
+        let request = Request {
+            system: "test".to_owned(),
+            messages: vec![
+                Message::Assistant(AssistantMessage {
+                    blocks: vec![ContentBlock::RejectedToolCall {
+                        id: ToolCallId::from("call-1"),
+                        name: "bash".to_owned(),
+                        args: None,
+                        error: ToolArgumentError {
+                            kind: "json_parse".to_owned(),
+                            message: "bad JSON".to_owned(),
+                        },
+                    }],
+                    stop: StopReason::ToolUse,
+                    usage: Usage::default(),
+                    provider: ProviderId::from(PROVIDER),
+                    model: ModelId::from(MODEL),
+                }),
+                Message::ToolResult(rho_ai::ToolResult {
+                    call_id: ToolCallId::from("call-1"),
+                    content: "tool arguments rejected".to_owned(),
+                    is_error: true,
+                }),
+            ],
+            tools: vec![bash_tool()],
+            model: ModelId::from(MODEL),
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::None,
+        };
+
+        let encoded = serde_json::to_value(request_items(&request).unwrap()).unwrap();
+        assert_eq!(encoded[0]["arguments"], "{}");
+        assert_eq!(encoded[0]["call_id"], "call-1");
+        assert_eq!(encoded[1]["call_id"], "call-1");
+    }
+
+    #[test]
+    fn incomplete_response_is_authoritative_length_not_a_retryable_error() {
+        let event = json!({
+            "type": "response.incomplete",
+            "response": {
+                "model": MODEL,
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "partial"}],
+                    "status": "incomplete"
+                }],
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"input_tokens": 8, "output_tokens": 3}
+            }
+        })
+        .to_string();
+        let error =
+            ResponseError::from(nanocodex_oai_api::transport::ResponsesError::Api { event });
+        let message = incomplete_message(&error, &[]).unwrap().unwrap();
+        assert_eq!(message.stop, StopReason::Length);
+        assert_eq!(message.usage.input_tokens, 8);
+        assert!(matches!(
+            &message.blocks[0],
+            ContentBlock::Text { text } if text == "partial"
+        ));
+        assert!(!map_error(&error).retryable);
+    }
+
+    #[test]
+    fn adapter_owns_openai_error_classification_but_not_retries() {
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "error": {"code": "server_is_overloaded", "message": "busy"}
+            }
+        })
+        .to_string();
+        let error =
+            ResponseError::from(nanocodex_oai_api::transport::ResponsesError::Api { event });
+        let mapped = map_error(&error);
+        assert_eq!(mapped.kind, ErrorKind::Overloaded);
+        assert!(mapped.retryable);
     }
 }

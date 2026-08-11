@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use rho_ai::{
     AssistantMessage, ContentBlock, DeltaKind, ErrorKind, ModelId, OpaqueBlob, ProviderError,
@@ -15,7 +15,7 @@ const PROVIDER: &str = "anthropic";
 pub(crate) struct ResponseAssembler {
     requested_model: ModelId,
     actual_model: Option<ModelId>,
-    tools: HashMap<String, ToolDefinition>,
+    tools: BTreeMap<String, ToolDefinition>,
     open: BTreeMap<usize, PartialBlock>,
     complete: BTreeMap<usize, ContentBlock>,
     usage: Usage,
@@ -58,7 +58,9 @@ impl ResponseAssembler {
             "message_stop" => self.message_stop(),
             "error" => Err(api_error(event.data)),
             "ping" => Ok(Vec::new()),
-            _ => Ok(Vec::new()),
+            event => Err(invalid(format!(
+                "unsupported Anthropic SSE event {event:?}"
+            ))),
         }
     }
 
@@ -67,6 +69,9 @@ impl ResponseAssembler {
             return Err(invalid("received duplicate message_start"));
         }
         let event: MessageStart = parse(data, "message_start")?;
+        if event.message.model.trim().is_empty() {
+            return Err(invalid("message_start carried an empty model id"));
+        }
         self.started = true;
         self.actual_model = Some(ModelId::from(event.message.model));
         self.usage.input_tokens = event.message.usage.input_tokens;
@@ -99,7 +104,12 @@ impl ResponseAssembler {
                 partial_json: String::new(),
                 saw_delta: false,
             },
-            StartBlock::Unknown => PartialBlock::Unknown,
+            StartBlock::Unknown => {
+                return Err(invalid(format!(
+                    "unsupported content block type at index {}",
+                    event.index
+                )));
+            }
         };
         self.open.insert(event.index, block);
         Ok(Vec::new())
@@ -156,7 +166,12 @@ impl ResponseAssembler {
                     delta,
                 })
             }
-            (PartialBlock::Unknown, _) | (_, BlockDelta::Unknown) => None,
+            (_, BlockDelta::Unknown) => {
+                return Err(invalid(format!(
+                    "unsupported delta type for content block {}",
+                    event.index
+                )));
+            }
             _ => {
                 return Err(invalid(format!(
                     "delta type did not match content block {}",
@@ -189,14 +204,19 @@ impl ResponseAssembler {
     fn finish_block(&self, block: PartialBlock) -> Result<Option<ContentBlock>, ProviderError> {
         match block {
             PartialBlock::Text(text) => Ok(Some(ContentBlock::Text { text })),
-            PartialBlock::Thinking { text, signature } => Ok(Some(ContentBlock::Thinking {
-                text,
-                opaque: signature.map(|data| OpaqueBlob {
-                    provider: ProviderId::from(PROVIDER),
-                    kind: "signature".to_owned(),
-                    data,
-                }),
-            })),
+            PartialBlock::Thinking { text, signature } => {
+                let signature = signature
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| invalid("Anthropic thinking block ended without a signature"))?;
+                Ok(Some(ContentBlock::Thinking {
+                    text,
+                    opaque: Some(OpaqueBlob {
+                        provider: ProviderId::from(PROVIDER),
+                        kind: "signature".to_owned(),
+                        data: signature,
+                    }),
+                }))
+            }
             PartialBlock::RedactedThinking(data) => Ok(Some(ContentBlock::Thinking {
                 text: String::new(),
                 opaque: Some(OpaqueBlob {
@@ -213,9 +233,20 @@ impl ResponseAssembler {
                 saw_delta,
             } => {
                 let arguments = if saw_delta {
-                    serde_json::from_str(&partial_json).map_err(|error| {
-                        invalid(format!("tool {name} emitted malformed arguments: {error}"))
-                    })?
+                    match serde_json::from_str(&partial_json) {
+                        Ok(arguments) => arguments,
+                        Err(error) => {
+                            return Ok(Some(ContentBlock::RejectedToolCall {
+                                id: ToolCallId::from(id),
+                                name,
+                                args: None,
+                                error: ToolArgumentError {
+                                    kind: "json_parse".to_owned(),
+                                    message: format!("provider emitted malformed JSON: {error}"),
+                                },
+                            }));
+                        }
+                    }
                 } else {
                     initial_input
                 };
@@ -244,7 +275,6 @@ impl ResponseAssembler {
                     })),
                 }
             }
-            PartialBlock::Unknown => Ok(None),
         }
     }
 
@@ -252,7 +282,11 @@ impl ResponseAssembler {
         self.require_started("message_delta")?;
         let event: MessageDelta = parse(data, "message_delta")?;
         if let Some(stop_reason) = event.delta.stop_reason {
-            self.stop = Some(stop_reason_value(&stop_reason));
+            let stop = stop_reason_value(&stop_reason)?;
+            if self.stop.is_some_and(|previous| previous != stop) {
+                return Err(invalid("received conflicting Anthropic stop reasons"));
+            }
+            self.stop = Some(stop);
         }
         self.usage.input_tokens = self.usage.input_tokens.max(event.usage.input_tokens);
         self.usage.output_tokens = event.usage.output_tokens;
@@ -311,7 +345,6 @@ enum PartialBlock {
         partial_json: String,
         saw_delta: bool,
     },
-    Unknown,
 }
 
 #[derive(Deserialize)]
@@ -322,15 +355,12 @@ struct MessageStart {
 #[derive(Deserialize)]
 struct StartMessage {
     model: String,
-    #[serde(default)]
-    usage: WireUsage,
+    usage: StartUsage,
 }
 
-#[derive(Default, Deserialize)]
-struct WireUsage {
-    #[serde(default)]
+#[derive(Deserialize)]
+struct StartUsage {
     input_tokens: u64,
-    #[serde(default)]
     output_tokens: u64,
     #[serde(default)]
     cache_read_input_tokens: u64,
@@ -397,8 +427,18 @@ struct ContentBlockStop {
 #[derive(Deserialize)]
 struct MessageDelta {
     delta: TopLevelDelta,
+    usage: DeltaUsage,
+}
+
+#[derive(Deserialize)]
+struct DeltaUsage {
+    output_tokens: u64,
     #[serde(default)]
-    usage: WireUsage,
+    input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -438,14 +478,16 @@ fn api_error(value: Value) -> ProviderError {
     }
 }
 
-fn stop_reason_value(reason: &str) -> StopReason {
+fn stop_reason_value(reason: &str) -> Result<StopReason, ProviderError> {
     match reason {
-        "tool_use" => StopReason::ToolUse,
-        "max_tokens" | "model_context_window_exceeded" => StopReason::Length,
-        "pause_turn" => StopReason::Paused,
-        "refusal" => StopReason::Refusal,
-        "end_turn" | "stop_sequence" => StopReason::Stop,
-        _ => StopReason::Error,
+        "tool_use" => Ok(StopReason::ToolUse),
+        "max_tokens" | "model_context_window_exceeded" => Ok(StopReason::Length),
+        "pause_turn" => Ok(StopReason::Paused),
+        "refusal" => Ok(StopReason::Refusal),
+        "end_turn" | "stop_sequence" => Ok(StopReason::Stop),
+        _ => Err(invalid(format!(
+            "unsupported Anthropic stop reason {reason:?}"
+        ))),
     }
 }
 
@@ -566,8 +608,74 @@ data: {"type":"message_stop"}
     }
 
     #[test]
-    fn malformed_tool_json_never_crosses_boundary() {
+    fn malformed_tool_json_becomes_a_structured_rejection() {
         let frames = fixture().replace(r#"{\"command\":\"pwd\"}"#, r#"{\"command\":"#);
+        let mut decoder = Decoder::new();
+        let events = decoder.feed(frames.as_bytes()).unwrap();
+        let mut assembler =
+            ResponseAssembler::new(ModelId::from("claude-sonnet-5"), vec![bash_tool()]);
+        let output = events
+            .into_iter()
+            .flat_map(|event| assembler.accept(event).unwrap())
+            .collect::<Vec<_>>();
+        let StreamEvent::Done(message) = output.last().unwrap() else {
+            panic!("fixture must end in Done");
+        };
+        assert!(matches!(
+            &message.blocks[1],
+            ContentBlock::RejectedToolCall { args: None, error, .. }
+                if error.kind == "json_parse"
+        ));
+    }
+
+    #[test]
+    fn unknown_wire_variants_are_rejected_instead_of_dropped() {
+        let mut assembler = ResponseAssembler::new(ModelId::from("requested"), Vec::new());
+        assembler
+            .accept(DecodedEvent {
+                event: "message_start".to_owned(),
+                data: json!({
+                    "type": "message_start",
+                    "message": {
+                        "model": "claude-sonnet-5",
+                        "usage": {"input_tokens": 0, "output_tokens": 0}
+                    }
+                }),
+            })
+            .unwrap();
+
+        let error = assembler
+            .accept(DecodedEvent {
+                event: "content_block_start".to_owned(),
+                data: json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "future_block"}
+                }),
+            })
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidResponse);
+
+        let mut assembler = ResponseAssembler::new(ModelId::from("requested"), Vec::new());
+        let error = assembler
+            .accept(DecodedEvent {
+                event: "future_event".to_owned(),
+                data: json!({"type": "future_event"}),
+            })
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidResponse);
+    }
+
+    #[test]
+    fn thinking_without_opaque_signature_is_rejected() {
+        let frames = fixture().replace(
+            concat!(
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,",
+                "\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-1\"}}\n\n"
+            ),
+            "",
+        );
         let mut decoder = Decoder::new();
         let events = decoder.feed(frames.as_bytes()).unwrap();
         let mut assembler =
@@ -575,7 +683,22 @@ data: {"type":"message_stop"}
         let error = events
             .into_iter()
             .find_map(|event| assembler.accept(event).err())
-            .expect("malformed arguments must be rejected");
+            .expect("missing thinking signature must fail the response");
+        assert_eq!(error.kind, ErrorKind::InvalidResponse);
+    }
+
+    #[test]
+    fn missing_required_usage_is_rejected_instead_of_defaulted() {
+        let mut assembler = ResponseAssembler::new(ModelId::from("requested"), Vec::new());
+        let error = assembler
+            .accept(DecodedEvent {
+                event: "message_start".to_owned(),
+                data: json!({
+                    "type": "message_start",
+                    "message": {"model": "claude-sonnet-5"}
+                }),
+            })
+            .unwrap_err();
         assert_eq!(error.kind, ErrorKind::InvalidResponse);
     }
 }

@@ -48,10 +48,14 @@ pub fn validate_tool_arguments(
             kind: "invalid_schema".to_owned(),
             message: error.to_string(),
         })?;
-    let errors = validator
+    let mut errors = validator
         .iter_errors(arguments)
         .map(|error| error.to_string())
         .collect::<Vec<_>>();
+    // `jsonschema` uses hash-backed internal indexes. Error ordering is not part
+    // of validation semantics, so normalize it before it crosses the pure
+    // boundary or becomes journal-visible provider output.
+    errors.sort_unstable();
     if errors.is_empty() {
         Ok(())
     } else {
@@ -108,5 +112,14 @@ mod tests {
             json!({"$schema": "https://example.com/custom", "type": "object"}),
         );
         assert!(validate_tool_definition(&definition).is_err());
+    }
+
+    #[test]
+    fn multiple_validation_errors_have_stable_order() {
+        let error =
+            validate_tool_arguments(&count_tool(), &json!({"count": -1, "unexpected": true}))
+                .unwrap_err();
+        let messages = error.message.split("; ").collect::<Vec<_>>();
+        assert!(messages.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 }

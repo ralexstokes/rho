@@ -1347,6 +1347,7 @@ dependencies = [
  "futures-util",
  "nanocodex-oai-api",
  "rho-ai",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
