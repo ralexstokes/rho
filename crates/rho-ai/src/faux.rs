@@ -363,6 +363,70 @@ mod tests {
     }
 
     #[test]
+    fn continue_and_rebase_are_authoritatively_equivalent() {
+        let initial = request(vec![Message::user("hello")]);
+        let first_done = done("first");
+        let mut target_messages = initial.messages.clone();
+        target_messages.push(Message::Assistant(first_done.clone()));
+        target_messages.push(Message::user("continue"));
+        let target = request(target_messages);
+        let target_done = done("same authoritative result");
+        let factory = FauxFactory::new(
+            vec![model()],
+            [
+                Script {
+                    request: initial.clone(),
+                    events: vec![StreamEvent::Done(first_done)],
+                },
+                Script {
+                    request: target.clone(),
+                    events: vec![StreamEvent::Done(target_done.clone())],
+                },
+                Script {
+                    request: target.clone(),
+                    events: vec![StreamEvent::Done(target_done)],
+                },
+            ],
+        );
+
+        let mut continued_provider = factory.open_session(config()).unwrap();
+        {
+            let mut stream = pin!(continued_provider.generate(initial, CancellationToken::new()));
+            assert!(matches!(
+                poll_event(&mut stream),
+                Poll::Ready(Some(StreamEvent::Done(_)))
+            ));
+        }
+        let continued_done = {
+            let mut stream =
+                pin!(continued_provider.generate(target.clone(), CancellationToken::new()));
+            match poll_event(&mut stream) {
+                Poll::Ready(Some(StreamEvent::Done(message))) => message,
+                event => panic!("expected continued Done, received {event:?}"),
+            }
+        };
+
+        let mut rebased_provider = factory.open_session(config()).unwrap();
+        let rebased_done = {
+            let mut stream = pin!(rebased_provider.generate(target, CancellationToken::new()));
+            match poll_event(&mut stream) {
+                Poll::Ready(Some(StreamEvent::Done(message))) => message,
+                event => panic!("expected rebased Done, received {event:?}"),
+            }
+        };
+
+        assert_eq!(continued_done, rebased_done);
+        assert_eq!(
+            factory.decisions(),
+            [
+                SessionDecision::Rebase,
+                SessionDecision::Continue,
+                SessionDecision::Rebase,
+            ]
+        );
+    }
+
+    #[test]
     fn cancellation_poisoning_forces_the_next_generation_to_rebase() {
         let initial = request(vec![Message::user("hello")]);
         let retry = request(vec![Message::user("retry")]);

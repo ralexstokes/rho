@@ -101,9 +101,7 @@ impl ProviderFactory for OpenAiFactory {
                 api_key: credential.expose_api_key().to_owned(),
                 model: config.model,
                 session: None,
-                shape: None,
-                acknowledged: Vec::new(),
-                poisoned: false,
+                continuation: ContinuationState::default(),
             }) as Box<dyn Provider>)
         })();
         Box::pin(async move { result })
@@ -127,14 +125,71 @@ impl From<&Request> for SessionShape {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenerationPlan {
+    Continue { start: usize },
+    Rebase,
+}
+
+impl GenerationPlan {
+    fn input(self, messages: &[Message]) -> &[Message] {
+        match self {
+            Self::Continue { start } => &messages[start..],
+            Self::Rebase => messages,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ContinuationState {
+    shape: Option<SessionShape>,
+    acknowledged: Vec<Message>,
+    poisoned: bool,
+}
+
+impl ContinuationState {
+    fn begin(
+        &mut self,
+        has_session: bool,
+        requested_shape: &SessionShape,
+        messages: &[Message],
+    ) -> GenerationPlan {
+        let plan = if !self.poisoned
+            && has_session
+            && self.shape.as_ref() == Some(requested_shape)
+            && messages.starts_with(&self.acknowledged)
+        {
+            GenerationPlan::Continue {
+                start: self.acknowledged.len(),
+            }
+        } else {
+            GenerationPlan::Rebase
+        };
+        // A generation is ambiguous until its authoritative Done has been
+        // assembled and acknowledged. This also covers a never-polled or
+        // dropped stream.
+        self.poisoned = true;
+        plan
+    }
+
+    fn installed_rebase(&mut self, shape: SessionShape) {
+        self.shape = Some(shape);
+        self.acknowledged.clear();
+    }
+
+    fn acknowledge(&mut self, messages: &[Message], message: &AssistantMessage) {
+        self.acknowledged = messages.to_vec();
+        self.acknowledged.push(Message::Assistant(message.clone()));
+        self.poisoned = false;
+    }
+}
+
 /// One live logical OpenAI model session.
 struct OpenAiProvider {
     api_key: String,
     model: ModelId,
     session: Option<NativeSession>,
-    shape: Option<SessionShape>,
-    acknowledged: Vec<Message>,
-    poisoned: bool,
+    continuation: ContinuationState,
 }
 
 impl std::fmt::Debug for OpenAiProvider {
@@ -144,9 +199,12 @@ impl std::fmt::Debug for OpenAiProvider {
             .field("api_key", &"[REDACTED]")
             .field("model", &self.model)
             .field("has_native_session", &self.session.is_some())
-            .field("shape", &self.shape)
-            .field("acknowledged_messages", &self.acknowledged.len())
-            .field("poisoned", &self.poisoned)
+            .field("shape", &self.continuation.shape)
+            .field(
+                "acknowledged_messages",
+                &self.continuation.acknowledged.len(),
+            )
+            .field("poisoned", &self.continuation.poisoned)
             .finish()
     }
 }
@@ -157,10 +215,10 @@ impl Provider for OpenAiProvider {
         request: Request,
         cancellation: CancellationToken,
     ) -> ProviderStream<'_> {
-        let was_poisoned = self.poisoned;
-        // Any stream that is dropped, cancelled, or fails before a complete
-        // Done leaves the native continuation ambiguous.
-        self.poisoned = true;
+        let shape = SessionShape::from(&request);
+        let plan = self
+            .continuation
+            .begin(self.session.is_some(), &shape, &request.messages);
         Box::pin(stream! {
             if cancellation.is_cancelled() {
                 yield StreamEvent::Error(ProviderError::cancelled());
@@ -170,18 +228,7 @@ impl Provider for OpenAiProvider {
                 yield StreamEvent::Error(error);
                 return;
             }
-
-            let shape = SessionShape::from(&request);
-            let continuation = continuation_start(
-                was_poisoned,
-                self.session.is_some(),
-                self.shape.as_ref(),
-                &shape,
-                &self.acknowledged,
-                &request.messages,
-            );
-            let input_messages = continuation
-                .map_or(request.messages.as_slice(), |start| &request.messages[start..]);
+            let input_messages = plan.input(&request.messages);
             let items = match request_items(input_messages) {
                 Ok(items) => items,
                 Err(error) => {
@@ -189,18 +236,15 @@ impl Provider for OpenAiProvider {
                     return;
                 }
             };
-            if continuation.is_none() {
+            if plan == GenerationPlan::Rebase {
                 self.session = match build_session(&self.api_key, &self.model, &request) {
                     Ok(session) => Some(session),
                     Err(error) => {
-                        self.shape = None;
-                        self.acknowledged.clear();
                         yield StreamEvent::Error(error);
                         return;
                     }
                 };
-                self.shape = Some(shape);
-                self.acknowledged.clear();
+                self.continuation.installed_rebase(shape);
             }
 
             let Some(session) = self.session.as_mut() else {
@@ -307,31 +351,14 @@ impl Provider for OpenAiProvider {
             };
             match completed_message(&completed, &request.tools, &self.model) {
                 Ok(message) => {
-                    let mut acknowledged = request.messages.clone();
-                    acknowledged.push(Message::Assistant(message.clone()));
-                    self.acknowledged = acknowledged;
-                    self.poisoned = false;
+                    self.continuation
+                        .acknowledge(&request.messages, &message);
                     yield StreamEvent::Done(message);
                 }
                 Err(error) => yield StreamEvent::Error(error),
             }
         })
     }
-}
-
-fn continuation_start(
-    poisoned: bool,
-    has_session: bool,
-    current_shape: Option<&SessionShape>,
-    requested_shape: &SessionShape,
-    acknowledged: &[Message],
-    messages: &[Message],
-) -> Option<usize> {
-    (!poisoned
-        && has_session
-        && current_shape == Some(requested_shape)
-        && messages.starts_with(acknowledged))
-    .then_some(acknowledged.len())
 }
 
 fn validate_request(request: &Request) -> Result<(), ProviderError> {
@@ -949,6 +976,58 @@ mod tests {
         )
     }
 
+    fn session_request(messages: Vec<Message>) -> Request {
+        Request {
+            system: "test".to_owned(),
+            messages,
+            tools: vec![bash_tool()],
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::High,
+        }
+    }
+
+    fn recorded_done(text: &str) -> AssistantMessage {
+        let item: ResponseItem = serde_json::from_value(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}]
+        }))
+        .unwrap();
+        AssistantMessage {
+            blocks: response_item_blocks(&item, &[bash_tool()]).unwrap(),
+            stop: StopReason::Stop,
+            usage: Usage {
+                input_tokens: 8,
+                output_tokens: 3,
+                ..Usage::default()
+            },
+            provider: ProviderId::from(PROVIDER),
+            model: ModelId::from(MODEL),
+        }
+    }
+
+    fn recorded_generation(
+        native_history: &mut Vec<Message>,
+        input: &[Message],
+        authoritative: &[Message],
+    ) -> AssistantMessage {
+        native_history.extend_from_slice(input);
+        assert_eq!(native_history, authoritative);
+        recorded_done(&format!("fixture saw {} messages", native_history.len()))
+    }
+
+    fn acknowledged_state(request: &Request, message: &AssistantMessage) -> ContinuationState {
+        let shape = SessionShape::from(request);
+        let mut state = ContinuationState::default();
+        assert_eq!(
+            state.begin(false, &shape, &request.messages),
+            GenerationPlan::Rebase
+        );
+        state.installed_rebase(shape);
+        state.acknowledge(&request.messages, message);
+        state
+    }
+
     #[test]
     fn recorded_function_call_is_parsed_and_schema_validated() {
         let item: ResponseItem = serde_json::from_value(json!({
@@ -1054,60 +1133,88 @@ mod tests {
     }
 
     #[test]
-    fn continuation_requires_a_clean_exact_acknowledged_prefix_and_compatible_shape() {
-        let request = Request {
-            system: "test".to_owned(),
-            messages: vec![Message::user("first"), Message::user("second")],
-            tools: vec![bash_tool()],
-            max_output_tokens: 100,
-            thinking: ThinkingLevel::High,
-        };
+    fn continue_and_rebase_are_authoritatively_equivalent_on_recorded_fixture() {
+        let initial = session_request(vec![Message::user("first")]);
+        let initial_done = recorded_done("first answer");
+        let mut continued_state = acknowledged_state(&initial, &initial_done);
+        let mut messages = initial.messages.clone();
+        messages.push(Message::Assistant(initial_done));
+        messages.push(Message::user("second"));
+        let request = session_request(messages);
         let shape = SessionShape::from(&request);
-        let acknowledged = &request.messages[..1];
 
-        assert_eq!(
-            continuation_start(
-                false,
-                true,
-                Some(&shape),
-                &shape,
-                acknowledged,
-                &request.messages,
-            ),
-            Some(1)
+        let continue_plan = continued_state.begin(true, &shape, &request.messages);
+        let mut fresh_state = ContinuationState::default();
+        let rebase_plan = fresh_state.begin(false, &shape, &request.messages);
+        assert_eq!(continue_plan, GenerationPlan::Continue { start: 2 });
+        assert_eq!(rebase_plan, GenerationPlan::Rebase);
+
+        // The continued fixture starts with the acknowledged native prefix
+        // and receives only the suffix; the rebased fixture starts empty and
+        // receives the full transcript. Both reconstruct the same logical
+        // input and therefore cross the authoritative boundary identically.
+        let mut continued_native = request.messages[..2].to_vec();
+        let continued_done = recorded_generation(
+            &mut continued_native,
+            continue_plan.input(&request.messages),
+            &request.messages,
         );
+        let mut rebased_native = Vec::new();
+        let rebased_done = recorded_generation(
+            &mut rebased_native,
+            rebase_plan.input(&request.messages),
+            &request.messages,
+        );
+        assert_eq!(continued_done, rebased_done);
+    }
+
+    #[test]
+    fn failed_generation_poisons_the_next_openai_continuation() {
+        let initial = session_request(vec![Message::user("first")]);
+        let initial_done = recorded_done("first answer");
+        let mut state = acknowledged_state(&initial, &initial_done);
+        let mut messages = initial.messages.clone();
+        messages.push(Message::Assistant(initial_done));
+        messages.push(Message::user("second"));
+        let request = session_request(messages);
+        let shape = SessionShape::from(&request);
+
+        assert!(matches!(
+            state.begin(true, &shape, &request.messages),
+            GenerationPlan::Continue { .. }
+        ));
+        // No acknowledge call models an error, cancellation, or dropped
+        // stream. The retry must replay the authoritative transcript.
         assert_eq!(
-            continuation_start(
-                true,
-                true,
-                Some(&shape),
-                &shape,
-                acknowledged,
-                &request.messages,
-            ),
-            None
+            state.begin(true, &shape, &request.messages),
+            GenerationPlan::Rebase
+        );
+    }
+
+    #[test]
+    fn branch_and_incompatible_shape_rebase_openai_session() {
+        let initial = session_request(vec![Message::user("first")]);
+        let initial_done = recorded_done("first answer");
+        let mut branched_state = acknowledged_state(&initial, &initial_done);
+        let branch = session_request(vec![Message::user("branched")]);
+        assert_eq!(
+            branched_state.begin(true, &SessionShape::from(&branch), &branch.messages),
+            GenerationPlan::Rebase
         );
 
-        let branch = vec![Message::user("branched")];
+        let mut incompatible_state = acknowledged_state(&initial, &initial_done);
+        let mut messages = initial.messages.clone();
+        messages.push(Message::Assistant(initial_done));
+        messages.push(Message::user("second"));
+        let mut incompatible = session_request(messages);
+        incompatible.thinking = ThinkingLevel::Low;
         assert_eq!(
-            continuation_start(false, true, Some(&shape), &shape, acknowledged, &branch,),
-            None
-        );
-
-        let incompatible = SessionShape {
-            thinking: ThinkingLevel::Low,
-            ..shape.clone()
-        };
-        assert_eq!(
-            continuation_start(
-                false,
+            incompatible_state.begin(
                 true,
-                Some(&shape),
-                &incompatible,
-                acknowledged,
-                &request.messages,
+                &SessionShape::from(&incompatible),
+                &incompatible.messages,
             ),
-            None
+            GenerationPlan::Rebase
         );
     }
 
@@ -1193,9 +1300,7 @@ mod tests {
             api_key: "secret-key".to_owned(),
             model: ModelId::from(MODEL),
             session: None,
-            shape: None,
-            acknowledged: Vec::new(),
-            poisoned: false,
+            continuation: ContinuationState::default(),
         };
         let debug = format!("{provider:?}");
         assert!(!debug.contains("secret-key"));

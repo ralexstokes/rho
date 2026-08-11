@@ -525,6 +525,38 @@ mod tests {
 
     use super::*;
 
+    fn recorded_done() -> AssistantMessage {
+        let fixture = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-5\",",
+            "\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,",
+            "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,",
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},",
+            "\"usage\":{\"output_tokens\":3}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut decoder = Decoder::new();
+        let mut assembler = ResponseAssembler::new(ModelId::from("claude-sonnet-5"), Vec::new());
+        let mut done = None;
+        for event in decoder.feed(fixture.as_bytes()).unwrap() {
+            for event in assembler.accept(event).unwrap() {
+                if let StreamEvent::Done(message) = event {
+                    done = Some(message);
+                }
+            }
+        }
+        done.expect("recorded fixture must produce Done")
+    }
+
     #[test]
     fn request_contains_full_transcript_and_drops_foreign_opaque_state() {
         let request = Request {
@@ -562,6 +594,51 @@ mod tests {
         assert!(encoded.contains("call-1"));
         assert!(!encoded.contains("secret-provider-state"));
         assert_eq!(body["output_config"]["effort"], "medium");
+    }
+
+    #[test]
+    fn always_rebase_is_equivalent_for_the_same_authoritative_transcript() {
+        let request = Request {
+            system: "test".to_owned(),
+            messages: vec![Message::user("first"), Message::user("second")],
+            tools: Vec::new(),
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::Medium,
+        };
+        let model = ModelId::from("claude-sonnet-5");
+
+        // Anthropic has no native continuation state: every projection is the
+        // rebase path, so identical authoritative inputs are structurally
+        // identical before the recorded response assembler runs.
+        assert_eq!(
+            request_body(&request, &model).unwrap(),
+            request_body(&request, &model).unwrap()
+        );
+        assert_eq!(recorded_done(), recorded_done());
+    }
+
+    #[test]
+    fn always_rebase_prevents_failed_or_branched_state_from_leaking() {
+        let model = ModelId::from("claude-sonnet-5");
+        let failed = Request {
+            system: "test".to_owned(),
+            messages: vec![Message::user("failed transcript")],
+            tools: Vec::new(),
+            max_output_tokens: 0,
+            thinking: ThinkingLevel::Medium,
+        };
+        assert!(request_body(&failed, &model).is_err());
+
+        let branch = Request {
+            system: "test".to_owned(),
+            messages: vec![Message::user("branched transcript")],
+            tools: Vec::new(),
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::Medium,
+        };
+        let encoded = request_body(&branch, &model).unwrap().to_string();
+        assert!(encoded.contains("branched transcript"));
+        assert!(!encoded.contains("failed transcript"));
     }
 
     #[test]
