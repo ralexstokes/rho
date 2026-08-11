@@ -219,8 +219,10 @@ Resume semantics (executed by rho-agent, not storage):
 2. Open tools: `replay: Safe` → re-execute from `effective_args`;
    `replay: Never` → synthesize a failed `ToolResult` ("interrupted; not safe
    to re-run") and let the model react.
-3. `stream_in_flight` → re-issue `StreamAssistant` (streaming is read-only at
-   the provider, hence always replay-safe; record a new `Step`).
+3. `stream_in_flight` → re-issue `StreamAssistant` (record a new `Step`).
+   Always replay-safe: the new incarnation's provider session rebases from
+   the transcript (spec/01 §1.1), so nothing provider-side is resumed or
+   double-appended.
 4. Resume-injected work runs with `origin: Replay` so journaling middleware
    can distinguish it (the double-execution hazard from shelterwood's spec).
 

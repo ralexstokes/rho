@@ -87,7 +87,7 @@ Determinism rules for the core, enforced (§5):
   `Input`/`ActionOutcome`, or via a `Stamps` value (a pre-minted id/timestamp
   batch) supplied per step. The core treats them as opaque.
 - No async in core crates. `Future` appears only in shell crates and in
-  boundary traits (`Provider`, `Session`).
+  boundary traits (`Provider`, `ProviderFactory`, `Session`).
 - No `unsafe` in core crates (`#![forbid(unsafe_code)]`).
 
 ## 3. Crate layout
@@ -102,7 +102,8 @@ rho/
     # ---- pure cores (no tokio, no fs/net, no clock/rand, forbid(unsafe)) ----
     rho-ai/                  # boundary types: Message, ContentBlock, StreamEvent,
                              #   Usage, StopReason, OpaqueBlob, ProviderError;
-                             #   Provider trait (async signature, no impls);
+                             #   Provider + ProviderFactory traits (async
+                             #   signatures, no impls);
                              #   pure validation (schema parse-or-reject)
     rho-core/                # session model types (Entry, Record, facts),
                              #   SessionMachine + Step/Effect/Action/Outcome,

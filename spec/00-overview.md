@@ -85,9 +85,9 @@ embeddable, host-agnostic core. Hosts wrap it:
                         │              │
             ┌───────────▼───┐   ┌──────▼──────────────────┐
             │    rho-ai     │   │  rho-tools              │
-            │ Provider trait│   │ fs/shell built-ins,     │
-            │ + boundary    │   │ MCP client              │
-            │   types       │   └─────────────────────────┘
+            │ Provider +    │   │ fs/shell built-ins,     │
+            │ Factory traits│   │ MCP client              │
+            │ + bound. types│   └─────────────────────────┘
             └───┬───────┬───┘
                 │       │
         nanocodex     anthropic adapter      ← backends: existing crate for
@@ -125,10 +125,14 @@ struct AssistantMessage { blocks: Vec<ContentBlock>, stop: StopReason,
 enum StreamEvent { Start, Delta { index, kind, delta }, BlockDone(..),
                    Done(AssistantMessage), Error(ProviderError) }
 
-trait Provider {
+trait ProviderFactory {   // shared: credentials, model catalog, opening sessions
     fn models(&self) -> &[ModelInfo];
-    fn stream(&self, req: Request, cancel: CancellationToken)
-        -> impl Stream<Item = StreamEvent>;
+    async fn open(&self, config: SessionConfig) -> Result<Box<dyn Provider>, ProviderError>;
+}
+
+trait Provider {          // one live logical model session, owned by a rho session
+    fn generate(&mut self, req: Request, cancel: CancellationToken)
+        -> impl Stream<Item = StreamEvent> + Send + '_;
 }
 ```
 
@@ -142,16 +146,26 @@ Design rules:
   extension ABI if a real need appears. Don't build a model-catalog subsystem;
   a static table + config file entry per model is enough.
 
-**Decided** (details in spec/01-rho-ai.md): the trait is **stateless-first** —
-rho-agent owns the transcript and sends full context; server-side context
-(Responses chains, nanocodex's native regime) is a later optional optimization.
-Validation is **langsec-style**: parse-or-reject at the adapter boundary, no
-coercion in the harness — provider quirks are handled by per-provider tool
-conformance suites, not harness code. Auth v1 = env vars + credentials file
-behind one trait. Retry has exactly one owner (loop-level policy; adapters only
-classify). Still open: which nanocodex layer supports stateless use — resolve
-by a timeboxed spike, fallback is hand-rolling the Responses adapter on top of
-nanocodex's auth/wire types.
+**Decided** (details in spec/01-rho-ai.md): the boundary is
+**transcript-authoritative provider sessions** (revised 2026-08-11,
+superseding the earlier stateless-first shape after the phase-1 spike). A
+`Provider` is one live logical model session opened by a shared
+`ProviderFactory`; rho-agent still passes the full authoritative transcript on
+every generation, and the adapter either continues its native session (prefix
+match) or **rebases** from the transcript (restart, branch, error, doubt).
+Provider checkpoints / external session ids are acceleration only — the rho
+transcript and journal remain the sole durable truth, so durability,
+branching, and deterministic replay are unchanged, and "always rebase" is the
+degenerate stateless implementation. A failed or cancelled generation poisons
+the native continuation (the next generation rebases); tool execution stays in
+rho; model or incompatible config change = reopen via the factory. Validation
+is **langsec-style**: parse-or-reject at the adapter boundary, no coercion in
+the harness — provider quirks are handled by per-provider tool conformance
+suites, not harness code. Auth v1 = env vars + credentials file behind one
+trait, consumed by the factory. Retry has exactly one owner (loop-level
+policy; adapters only classify). The nanocodex-layer question is settled by
+the phase-1 spike: the standalone `OpenAi -> Session -> Response` layer,
+quarantined in `rho-ai-openai`.
 
 ### 2.2 `rho-agent` — the harness (the real correctness core)
 
@@ -296,9 +310,10 @@ the integration instead of maintaining a second concurrency structure.
 
 ## 3. Phasing
 
-1. **`rho-ai` + walking skeleton**: boundary types, `Provider` trait, nanocodex
-   adapter (settle open question 2.1), hand-rolled anthropic adapter; a `faux`
-   provider for tests; minimal binary that runs one turn with a bash tool.
+1. **`rho-ai` + walking skeleton**: boundary types, `ProviderFactory` +
+   `Provider` traits, nanocodex adapter, hand-rolled anthropic adapter; a
+   `faux` provider for tests; minimal binary that runs one turn with a bash
+   tool.
 2. **`rho-agent`**: session tree + lanes + JSONL/memory backends + conformance
    suite; turn loop as driven state machine + automatic driver; queues + hooks;
    compaction; `resume()` from the journal (§2.6 makes this core, not optional).
@@ -316,9 +331,12 @@ the integration instead of maintaining a second concurrency structure.
 
 Decided (details in the linked specs):
 
-- rho-ai: stateless-first context regime; langsec parse-or-reject validation
-  with per-provider conformance suites; env/file credentials behind a trait;
-  single-owner retry. → spec/01-rho-ai.md
+- rho-ai: transcript-authoritative provider sessions — `ProviderFactory` +
+  live `Provider`, full transcript on every generation, rebase on doubt,
+  poison-on-ambiguity (revised 2026-08-11 from stateless-first; the phase-1
+  spike settled the nanocodex layer); langsec parse-or-reject validation
+  with per-provider conformance suites; env/file credentials behind a trait
+  consumed by the factory; single-owner retry. → spec/01-rho-ai.md
 - Loop actions are message-level; deterministic golden-session replay is the
   regression-testing strategy. (§2.2)
 - Compaction v1: simple summarize-and-truncate; entry format retained-tail
@@ -343,9 +361,7 @@ Decided (details in the linked specs):
 
 Open:
 
-1. nanocodex integration layer under the stateless constraint — timeboxed
-   spike (spec/01 §4).
-2. RPC protocol doc — **deferred until phase 3 starts** (it is a thin
+1. RPC protocol doc — **deferred until phase 3 starts** (it is a thin
    projection of rho-agent's command/event enums, which phase 2 produces).
    Guardrails already binding: owned `Send + serde` command/event types;
    snapshot-authoritative rule; versioning-from-v1 when written.
@@ -353,19 +369,20 @@ Open:
    block with timeout, crash-resume semantics for a pending ask) is core loop
    design and belongs to phase 2 / spec/02, not to the RPC doc.
    → spec/03-rpc.md (unwritten)
-3. WIT ABI — **deferred until after the phase-3 milestone** (no-gating
+2. WIT ABI — **deferred until after the phase-3 milestone** (no-gating
    decision removed the only v1 consumer; project-config trust already lands
    with it; toolchain maturity is a phase-4 risk). Binding phase-2 design
    rule that makes deferral safe: **hook payloads/results are plain owned
    serde data — no handles, borrows, or callbacks — async request/response**;
    hooks are journaled actions, so ABI extensions inherit deterministic
    replay. → spec/04-ext-abi.md (unwritten)
-4. Session entry + lane journal schema — **drafted** → spec/02-session.md
+3. Session entry + lane journal schema — **drafted** → spec/02-session.md
    (its §10 tracks remaining sub-questions: fsync default, queued-message
    payloads, compaction-as-operation, export format).
-5. Thinking-level / model-switch mid-session semantics (keep pi's per-turn
-   swap point?).
-6. MCP wiring: server config location (user-level per config decision),
+4. Thinking-level / model-switch mid-session semantics. The provider side is
+   now settled (spec/01 §1.1: switch = reopen via the factory); still open is
+   the loop side — keep pi's per-turn swap point?
+5. MCP wiring: server config location (user-level per config decision),
    collision handling, process supervision (possibly the first real
    shelterwood use inside rho).
-7. Workspace/naming: binary `rho`, crate prefix `rho-` — confirm and scaffold.
+6. Workspace/naming: binary `rho`, crate prefix `rho-` — confirm and scaffold.

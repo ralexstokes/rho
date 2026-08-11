@@ -100,7 +100,9 @@ struct SessionArgs {
     repo: Arc<dyn SessionRepo>,          // durable store — the real state
     events: broadcast::Sender<AgentEvent>, // survives restarts (in Args)
     cancel_flag: Arc<AtomicBool>,          // abort lane (§2.4)
-    providers: Arc<ProviderSet>,
+    factories: Arc<ProviderFactorySet>,   // shared; the live Provider session is
+                                          // incarnation state — reopened (and
+                                          // rebased from the transcript) on restart
 }
 ```
 
