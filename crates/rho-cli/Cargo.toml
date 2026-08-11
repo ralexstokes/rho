@@ -1,0 +1,16 @@
+[package]
+name = "rho-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rho-agent.workspace = true
+rho-ai-anthropic.workspace = true
+rho-ai-openai.workspace = true
+rho-rpc.workspace = true
+rho-store.workspace = true
+rho-tools.workspace = true

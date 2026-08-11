@@ -1,0 +1,12 @@
+[package]
+name = "rho-ext-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rho-core.workspace = true
+rho-ext.workspace = true

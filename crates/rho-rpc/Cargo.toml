@@ -1,0 +1,12 @@
+[package]
+name = "rho-rpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rho-agent.workspace = true
+rho-core.workspace = true

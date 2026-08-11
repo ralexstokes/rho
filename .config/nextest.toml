@@ -1,0 +1,4 @@
+# Without a terminate timeout, a single hung test stalls `just ci` and
+# `nix flake check` indefinitely.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 2 }

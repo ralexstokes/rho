@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # Ordinary pull requests run the fast lane (`just ci` against a cached
+      # cargo target dir). Pushes to main and any change touching the Nix or
+      # toolchain files run the authoritative clean lane (`nix flake check`).
+      - name: Select CI lane
+        id: lane
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            full=true
+            reason="push to main"
+          elif git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
+            flake.nix flake.lock nix rust-toolchain.toml; then
+            full=false
+            reason="ordinary pull request"
+          else
+            full=true
+            reason="Nix or Rust toolchain change"
+          fi
+
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "CI lane: $([[ "$full" == "true" ]] && echo full || echo fast) ($reason)" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Enable shared Nix cache
+        uses: cachix/cachix-action@v17
+        with:
+          name: ralexstokes
+          skipPush: true
+
+      - name: Restore pull request Cargo target cache
+        if: steps.lane.outputs.full != 'true'
+        uses: actions/cache@v5
+        with:
+          path: |
+            target
+            !target/debug/incremental/**
+            !target/doc/**
+            !target/tests/trybuild/**
+          # GitHub caches are immutable. Keep one cache per PR and dependency
+          # set so later commits get an exact hit. A new PR falls back to the
+          # trusted cache produced for its base commit on main.
+          key: cargo-target-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'rust-toolchain.toml') }}-pr-${{ github.event.pull_request.number }}
+          restore-keys: |
+            cargo-target-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'rust-toolchain.toml') }}-main-${{ github.event.pull_request.base.sha }}
+            cargo-target-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'rust-toolchain.toml') }}-main-
+            cargo-target-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'rust-toolchain.toml') }}-
+
+      - name: Restore shared Cargo target cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: shared-cargo-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            target
+            !target/debug/incremental/**
+            !target/doc/**
+            !target/tests/trybuild/**
+          key: cargo-target-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'rust-toolchain.toml') }}-main-${{ github.sha }}
+          restore-keys: |
+            cargo-target-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'rust-toolchain.toml') }}-main-
+
+      - name: Validate flake
+        if: steps.lane.outputs.full != 'true'
+        run: nix flake check --no-build --no-update-lock-file
+
+      - name: Run fast CI
+        if: steps.lane.outputs.full != 'true'
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: nix develop --command just ci
+
+      - name: Run full flake checks
+        if: steps.lane.outputs.full == 'true'
+        run: nix flake check --no-update-lock-file
+
+      - name: Seed shared Cargo target cache
+        if: >-
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          steps.shared-cargo-cache.outputs.cache-hit != 'true' &&
+          success()
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: nix develop --command just ci
+
+      - name: Save shared Cargo target cache
+        if: >-
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          steps.shared-cargo-cache.outputs.cache-hit != 'true' &&
+          success()
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            target
+            !target/debug/incremental/**
+            !target/doc/**
+            !target/tests/trybuild/**
+          key: cargo-target-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'rust-toolchain.toml') }}-main-${{ github.sha }}
+
+      # Requires a CACHIX_AUTH_TOKEN repository secret; the step is skipped
+      # noisily (auth failure) rather than silently if it is missing.
+      - name: Publish development shell to Cachix
+        if: >-
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          success()
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          nix develop \
+            --profile "$RUNNER_TEMP/dev-shell" \
+            --command true
+          cachix push \
+            ralexstokes \
+            "$RUNNER_TEMP/dev-shell"
