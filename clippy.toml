@@ -1,0 +1,11 @@
+disallowed-methods = [
+  { path = "std::env::var", reason = "pure cores must receive environment data from a shell" },
+  { path = "std::env::var_os", reason = "pure cores must receive environment data from a shell" },
+  { path = "std::time::Instant::now", reason = "pure cores must receive time stamps from a shell" },
+  { path = "std::time::SystemTime::now", reason = "pure cores must receive time stamps from a shell" },
+  { path = "rand::thread_rng", reason = "pure cores must receive randomness from a shell", allow-invalid = true },
+  { path = "rand::rng", reason = "pure cores must receive randomness from a shell" },
+  { path = "uuid::Uuid::new_v4", reason = "pure cores must receive identifiers from a shell", allow-invalid = true },
+  { path = "uuid::Uuid::new_v7", reason = "pure cores must receive identifiers from a shell", allow-invalid = true },
+  { path = "uuid::Uuid::now_v7", reason = "pure cores must receive identifiers from a shell" },
+]

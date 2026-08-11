@@ -17,6 +17,56 @@ The workspace follows the pure-core/mutable-shell split in
 Internal dependencies are declared once at the workspace root. Core crates
 depend only on other cores; integrations point inward toward those cores.
 
+## Phase 1
+
+The provider boundary and walking skeleton are implemented:
+
+- `rho-ai` defines shared provider factories, live transcript-authoritative
+  sessions, authoritative messages, streaming events, cancellation,
+  credentials, strict JSON-Schema argument validation, and a deterministic
+  session-aware `faux` provider.
+- `rho-ai-openai` wraps the lower `nanocodex-oai-api` layer. Each request gets
+  the complete rho transcript; the adapter continues its live Nanocodex
+  session after an acknowledged-prefix match and rebases otherwise, with a
+  one-attempt retry budget. The adapter accepts `gpt-5.6-luna` and
+  `gpt-5.6-sol`; the CLI defaults to Luna. Its pinned Nanocodex revision does
+  not expose the request's `max_output_tokens` field. The adapter handles
+  provider-reported length truncation safely, but cannot yet enforce rho's
+  requested hard output limit; that requires an upstream hook or the fallback
+  hand-rolled transport described in the provider spec.
+- `rho-ai-anthropic` is a direct Messages HTTP/SSE adapter with a pure,
+  incremental decoder and fixture-tested text, thinking, tool-use, usage, and
+  stop-reason assembly.
+- `rho-cli` runs one logical turn with a `bash` tool, continuing through tool
+  calls until the provider completes the turn. It defaults to a 32-model-step
+  safety cap; use `--max-model-steps N` to choose a different positive limit.
+
+Run the walking skeleton with an environment credential:
+
+```sh
+export OPENAI_API_KEY=...
+./tools/dev cargo run -p rho-cli -- "inspect this repository"
+
+export ANTHROPIC_API_KEY=...
+./tools/dev cargo run -p rho-cli -- \
+  --provider anthropic "inspect this repository"
+```
+
+Environment variables take precedence over `~/.rho/credentials.json` (or the
+path in `RHO_CREDENTIALS_FILE`). The file shape is:
+
+```json
+{
+  "openai": { "type": "api_key", "api_key": "..." },
+  "anthropic": { "type": "api_key", "api_key": "..." }
+}
+```
+
+The Phase-1 `bash` tool runs `bash -lc` in the current directory without rho
+permission prompts or sandboxing. Run it only inside an execution environment
+whose filesystem, process, and network access you are willing to grant to the
+model.
+
 ## Getting started
 
 All tooling comes from the Nix devshell — see `AGENTS.md` for the contract.

@@ -8,9 +8,15 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
 rho-agent.workspace = true
+rho-ai.workspace = true
 rho-ai-anthropic.workspace = true
 rho-ai-openai.workspace = true
 rho-rpc.workspace = true
 rho-store.workspace = true
 rho-tools.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
