@@ -20,11 +20,16 @@ as an **optimization**, expressed as an optional provider capability, and only
 added when the stateless path is proven impractical or leaves real performance
 on the table. The trait must not bake stateful assumptions into its core shape.
 
-Consequence for the nanocodex adapter (still open, needs the phase-1 spike):
-integrate at whatever layer of nanocodex permits stateless use
-(`nanocodex-oai-api` if possible). If nanocodex only works agentically /
-statefully, the adapter shrinks to what we can use (auth, transport, wire
-types) and we write the request layer ourselves.
+**Phase-1 spike resolution:** use `nanocodex-oai-api` 0.3 at its standalone
+`OpenAi -> Session -> Response` layer, not `nanocodex-agent`. The adapter
+creates a fresh Nanocodex session for every rho `Provider::stream` call and
+passes the complete rho transcript through `ResponseInput::items`. Provider
+checkpoint storage is disabled, history policy is `FullReplay`, and the
+Nanocodex request retry budget is one attempt. This preserves rho's
+stateless-transcript contract while reusing Nanocodex's typed Responses wire,
+auth, streaming transport, reconnect handling, and error taxonomy. The
+integration is quarantined in `rho-ai-openai`; its current fixed-model
+constraint (`gpt-5.6-sol`) does not leak into `rho-ai`.
 
 ### 1.2 Validation: langsec at the boundary (DECIDED)
 
@@ -71,6 +76,11 @@ Double-retry is a design error. The contract:
   with internal retries (nanocodex) must disable or bound them and declare it.
 - rho-agent's loop-level policy is the **only** place a request is re-invoked.
 - Aborts are terminal and never retried.
+
+Phase 1 follows this rule directly: the Anthropic adapter performs no retries,
+and the OpenAI adapter configures Nanocodex for one total request attempt.
+Both project retryability into `ProviderError`; the future rho-agent loop is
+the only component allowed to act on that classification.
 
 ## 2. Boundary types (sketch)
 
@@ -126,9 +136,10 @@ Rules carried over from the overview:
 
 ## 4. Open
 
-1. nanocodex integration layer under the stateless constraint (§1.1) — resolve
-   by spike; timebox it, with the fallback being a hand-rolled Responses
-   adapter reusing nanocodex's auth/wire types only.
-2. `Request` shape details: system prompt representation, tool definitions,
-   thinking-level mapping per provider, cache-hint pass-through.
+1. `Request` shape details beyond phase 1: cache-hint pass-through and any
+   provider-specific advanced tool-definition fields. Phase 1 settles the
+   common shape as system text, a complete typed transcript, JSON-Schema
+   function tools, model id, output limit, and thinking effort.
+2. Thinking-level compatibility policy for older Anthropic models that require
+   fixed-budget thinking rather than the current adaptive-thinking API.
 3. Whether `ModelInfo` carries cost tables in v1 (usage display) or later.

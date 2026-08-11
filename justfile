@@ -27,9 +27,12 @@ doc-check:
 nixfmt-check:
     git ls-files -z '*.nix' | xargs -0 nixfmt --check
 
+pure-deps:
+    ./tools/check-pure-deps
+
 # Fast local CI mirror — reuses the local cargo cache and incremental builds.
 # The clean Nix lane retains the explicit all-target build for non-test codegen coverage.
-ci: fmt lint test doc-check nixfmt-check
+ci: fmt lint test doc-check nixfmt-check pure-deps
 
 # Full clean Nix CI lane; use before pushing or when touching Nix files.
 ci-nix:

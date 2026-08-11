@@ -8,4 +8,11 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+async-stream.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+nanocodex-oai-api.workspace = true
 rho-ai.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

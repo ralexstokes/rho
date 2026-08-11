@@ -26,6 +26,15 @@ rust-version = "1.97.1"
 name = "rho"
 
 [workspace.dependencies]
+anyhow = "1.0.100"
+async-stream = "0.3.6"
+base64 = "0.22.1"
+futures-core = "0.3.31"
+futures-util = "0.3.31"
+jsonschema = { version = "0.49.2", default-features = false }
+nanocodex-oai-api = "=0.3.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
+rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 rho-agent = { path = "crates/rho-agent" }
 rho-ai = { path = "crates/rho-ai" }
 rho-ai-anthropic = { path = "crates/rho-ai-anthropic" }
@@ -38,6 +47,11 @@ rho-rpc = { path = "crates/rho-rpc" }
 rho-shelterwood = { path = "crates/rho-shelterwood" }
 rho-store = { path = "crates/rho-store" }
 rho-tools = { path = "crates/rho-tools" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["macros", "process", "rt-multi-thread", "signal"] }
+webpki-root-certs = "1.0.9"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

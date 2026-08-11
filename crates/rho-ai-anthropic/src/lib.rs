@@ -1,3 +1,470 @@
-//! Anthropic provider adapter.
+//! Anthropic Messages provider adapter.
 //!
-//! The transport shell will wrap an incremental, pure SSE decoder.
+//! HTTP lives in the provider shell while [`decoder`] and response assembly
+//! remain deterministic byte/value transformations with fixture-driven tests.
+
+pub mod decoder;
+mod response;
+
+use async_stream::stream;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use futures_util::StreamExt as _;
+use reqwest::StatusCode;
+use rho_ai::{
+    CancellationToken, ContentBlock, ErrorKind, Message, ModelId, ModelInfo, OpaqueBlob, Provider,
+    ProviderError, ProviderId, ProviderStream, Request, StreamEvent, ThinkingLevel,
+    validate_tool_definition,
+};
+use serde_json::{Value, json};
+
+use crate::{decoder::Decoder, response::ResponseAssembler};
+
+const PROVIDER: &str = "anthropic";
+const API_VERSION: &str = "2023-06-01";
+
+/// Anthropic adapter construction failure.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildError {
+    /// API key was empty.
+    #[error("Anthropic API key must not be empty")]
+    EmptyApiKey,
+    /// HTTP client construction failed.
+    #[error("failed to build Anthropic HTTP client: {0}")]
+    Http(#[from] reqwest::Error),
+}
+
+/// Stateless Anthropic Messages API adapter.
+#[derive(Clone)]
+pub struct AnthropicProvider {
+    api_key: String,
+    base_url: String,
+    client: reqwest::Client,
+    models: Vec<ModelInfo>,
+}
+
+impl std::fmt::Debug for AnthropicProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnthropicProvider")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("models", &self.models)
+            .finish()
+    }
+}
+
+impl AnthropicProvider {
+    /// Creates an adapter for the public Anthropic API.
+    pub fn new(api_key: impl Into<String>) -> Result<Self, BuildError> {
+        Self::with_base_url(api_key, "https://api.anthropic.com")
+    }
+
+    /// Creates an adapter with a custom base URL, primarily for compatible gateways and tests.
+    pub fn with_base_url(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Result<Self, BuildError> {
+        let api_key = api_key.into();
+        if api_key.is_empty() {
+            return Err(BuildError::EmptyApiKey);
+        }
+        Ok(Self {
+            api_key,
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
+            client: http_client()?,
+            models: current_models(),
+        })
+    }
+}
+
+fn http_client() -> Result<reqwest::Client, reqwest::Error> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().cloned());
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .build()
+}
+
+impl Provider for AnthropicProvider {
+    fn models(&self) -> &[ModelInfo] {
+        &self.models
+    }
+
+    fn stream(&self, request: Request, cancellation: CancellationToken) -> ProviderStream {
+        let client = self.client.clone();
+        let api_key = self.api_key.clone();
+        let endpoint = format!("{}/v1/messages", self.base_url);
+        Box::pin(stream! {
+            let body = match request_body(&request) {
+                Ok(body) => body,
+                Err(error) => {
+                    yield StreamEvent::Error(error);
+                    return;
+                }
+            };
+            let send = client
+                .post(endpoint)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", API_VERSION)
+                .json(&body)
+                .send();
+            let response = tokio::select! {
+                () = cancellation.cancelled() => {
+                    yield StreamEvent::Error(ProviderError::cancelled());
+                    return;
+                }
+                response = send => match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        yield StreamEvent::Error(classify_transport_error(&error));
+                        return;
+                    }
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = tokio::select! {
+                    () = cancellation.cancelled() => {
+                        yield StreamEvent::Error(ProviderError::cancelled());
+                        return;
+                    }
+                    text = response.text() => text.unwrap_or_else(|error| error.to_string()),
+                };
+                yield StreamEvent::Error(classify_http_error(status, text));
+                return;
+            }
+
+            let mut bytes = response.bytes_stream();
+            let mut decoder = Decoder::new();
+            let mut assembler = ResponseAssembler::new(request.model.clone(), request.tools.clone());
+            let mut terminal = false;
+            loop {
+                let next = tokio::select! {
+                    () = cancellation.cancelled() => {
+                        yield StreamEvent::Error(ProviderError::cancelled());
+                        return;
+                    }
+                    next = bytes.next() => next,
+                };
+                let Some(next) = next else { break };
+                let chunk = match next {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        yield StreamEvent::Error(classify_transport_error(&error));
+                        return;
+                    }
+                };
+                let decoded = match decoder.feed(&chunk) {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        yield StreamEvent::Error(ProviderError::invalid_response(error.to_string()));
+                        return;
+                    }
+                };
+                for event in decoded {
+                    let events = match assembler.accept(event) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            yield StreamEvent::Error(error);
+                            return;
+                        }
+                    };
+                    for event in events {
+                        terminal |= matches!(event, StreamEvent::Done(_) | StreamEvent::Error(_));
+                        yield event;
+                    }
+                    if terminal {
+                        return;
+                    }
+                }
+            }
+
+            let decoded = match decoder.finish() {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    yield StreamEvent::Error(ProviderError::invalid_response(error.to_string()));
+                    return;
+                }
+            };
+            for event in decoded {
+                let events = match assembler.accept(event) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        yield StreamEvent::Error(error);
+                        return;
+                    }
+                };
+                for event in events {
+                    terminal |= matches!(event, StreamEvent::Done(_) | StreamEvent::Error(_));
+                    yield event;
+                }
+            }
+            if !terminal {
+                yield StreamEvent::Error(ProviderError::invalid_response(
+                    "Anthropic stream ended before message_stop",
+                ));
+            }
+        })
+    }
+}
+
+/// Pure request projection used by the HTTP shell and fixture tests.
+pub fn request_body(request: &Request) -> Result<Value, ProviderError> {
+    if request.system.trim().is_empty() {
+        return Err(invalid_request("system instructions must not be empty"));
+    }
+    if request.max_output_tokens == 0 {
+        return Err(invalid_request(
+            "max_output_tokens must be greater than zero",
+        ));
+    }
+    if request.model.as_str() == "claude-fable-5" && request.thinking == ThinkingLevel::None {
+        return Err(invalid_request(
+            "claude-fable-5 does not support disabling adaptive thinking",
+        ));
+    }
+    for tool in &request.tools {
+        validate_tool_definition(tool)
+            .map_err(|error| invalid_request(format!("tool {}: {error}", tool.name)))?;
+    }
+
+    let messages = request
+        .messages
+        .iter()
+        .map(message_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    let tools = request
+        .tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.parameters,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut body = json!({
+        "model": request.model.as_str(),
+        "max_tokens": request.max_output_tokens,
+        "system": request.system,
+        "messages": messages,
+        "tools": tools,
+        "stream": true,
+    });
+    let object = body.as_object_mut().expect("JSON object literal");
+    match request.thinking {
+        ThinkingLevel::None => {
+            object.insert("thinking".to_owned(), json!({"type": "disabled"}));
+        }
+        level => {
+            object.insert(
+                "thinking".to_owned(),
+                json!({"type": "adaptive", "display": "summarized"}),
+            );
+            object.insert(
+                "output_config".to_owned(),
+                json!({"effort": level.as_str()}),
+            );
+        }
+    }
+    Ok(body)
+}
+
+fn message_value(message: &Message) -> Result<Value, ProviderError> {
+    match message {
+        Message::User { content } => Ok(json!({
+            "role": "user",
+            "content": content
+                .iter()
+                .map(user_content_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        })),
+        Message::Assistant(message) => Ok(json!({
+            "role": "assistant",
+            "content": message
+                .blocks
+                .iter()
+                .filter_map(assistant_content_value)
+                .collect::<Vec<_>>(),
+        })),
+        Message::ToolResult(result) => Ok(json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": result.call_id.as_str(),
+                "content": result.content,
+                "is_error": result.is_error,
+            }],
+        })),
+        _ => Err(invalid_request("unsupported transcript message variant")),
+    }
+}
+
+fn user_content_value(block: &ContentBlock) -> Result<Value, ProviderError> {
+    match block {
+        ContentBlock::Text { text } => Ok(json!({"type": "text", "text": text})),
+        ContentBlock::Image { data, mime } => Ok(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": mime,
+                "data": BASE64.encode(data),
+            }
+        })),
+        _ => Err(invalid_request(
+            "user messages may contain only text and image blocks",
+        )),
+    }
+}
+
+fn assistant_content_value(block: &ContentBlock) -> Option<Value> {
+    match block {
+        ContentBlock::Text { text } => Some(json!({"type": "text", "text": text})),
+        ContentBlock::Thinking { text, opaque } => Some(anthropic_thinking_value(text, opaque)),
+        ContentBlock::ToolCall { id, name, args } => Some(json!({
+            "type": "tool_use",
+            "id": id.as_str(),
+            "name": name,
+            "input": args,
+        })),
+        ContentBlock::RejectedToolCall {
+            id,
+            name,
+            args: Some(args),
+            ..
+        } => Some(json!({
+            "type": "tool_use",
+            "id": id.as_str(),
+            "name": name,
+            "input": args,
+        })),
+        ContentBlock::RejectedToolCall { args: None, .. } | ContentBlock::Image { .. } => None,
+        _ => None,
+    }
+}
+
+fn anthropic_thinking_value(text: &str, opaque: &Option<OpaqueBlob>) -> Value {
+    match opaque {
+        Some(opaque)
+            if opaque.provider == ProviderId::from(PROVIDER)
+                && opaque.kind == "redacted_thinking" =>
+        {
+            json!({"type": "redacted_thinking", "data": opaque.data})
+        }
+        Some(opaque)
+            if opaque.provider == ProviderId::from(PROVIDER) && opaque.kind == "signature" =>
+        {
+            json!({"type": "thinking", "thinking": text, "signature": opaque.data})
+        }
+        _ => json!({"type": "text", "text": text}),
+    }
+}
+
+fn current_models() -> Vec<ModelInfo> {
+    [
+        ("claude-fable-5", "Claude Fable 5", 1_000_000, 128_000),
+        ("claude-opus-5", "Claude Opus 5", 1_000_000, 128_000),
+        ("claude-sonnet-5", "Claude Sonnet 5", 1_000_000, 128_000),
+    ]
+    .into_iter()
+    .map(
+        |(id, display_name, context_tokens, max_output_tokens)| ModelInfo {
+            id: ModelId::from(id),
+            display_name: display_name.to_owned(),
+            context_tokens: Some(context_tokens),
+            max_output_tokens: Some(max_output_tokens),
+        },
+    )
+    .collect()
+}
+
+fn invalid_request(message: impl Into<String>) -> ProviderError {
+    ProviderError {
+        retryable: false,
+        kind: ErrorKind::InvalidRequest,
+        message: message.into(),
+    }
+}
+
+fn classify_transport_error(error: &reqwest::Error) -> ProviderError {
+    ProviderError {
+        retryable: error.is_timeout() || error.is_connect() || error.is_body(),
+        kind: ErrorKind::Transport,
+        message: error.to_string(),
+    }
+}
+
+fn classify_http_error(status: StatusCode, body: String) -> ProviderError {
+    let (kind, retryable) = match status.as_u16() {
+        401 | 403 => (ErrorKind::Authentication, false),
+        408 | 409 | 429 => (ErrorKind::RateLimited, true),
+        529 => (ErrorKind::Overloaded, true),
+        500..=599 => (ErrorKind::Transport, true),
+        _ => (ErrorKind::InvalidRequest, false),
+    };
+    ProviderError {
+        retryable,
+        kind,
+        message: format!("Anthropic HTTP {status}: {body}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rho_ai::{AssistantMessage, StopReason, ToolCallId, ToolResult, Usage};
+
+    use super::*;
+
+    #[test]
+    fn request_contains_full_transcript_and_drops_foreign_opaque_state() {
+        let request = Request {
+            system: "Use tools carefully.".to_owned(),
+            messages: vec![
+                Message::user("hello"),
+                Message::Assistant(AssistantMessage {
+                    blocks: vec![ContentBlock::Thinking {
+                        text: "summary".to_owned(),
+                        opaque: Some(OpaqueBlob {
+                            provider: ProviderId::from("openai"),
+                            kind: "encrypted_content".to_owned(),
+                            data: "secret-provider-state".to_owned(),
+                        }),
+                    }],
+                    stop: StopReason::ToolUse,
+                    usage: Usage::default(),
+                    provider: ProviderId::from("openai"),
+                    model: ModelId::from("gpt-5.6-sol"),
+                }),
+                Message::ToolResult(ToolResult {
+                    call_id: ToolCallId::from("call-1"),
+                    content: "ok".to_owned(),
+                    is_error: false,
+                }),
+            ],
+            tools: Vec::new(),
+            model: ModelId::from("claude-sonnet-5"),
+            max_output_tokens: 1024,
+            thinking: ThinkingLevel::Medium,
+        };
+
+        let body = request_body(&request).unwrap();
+        let encoded = body.to_string();
+        assert!(encoded.contains("summary"));
+        assert!(encoded.contains("call-1"));
+        assert!(!encoded.contains("secret-provider-state"));
+        assert_eq!(body["output_config"]["effort"], "medium");
+    }
+
+    #[test]
+    fn provider_debug_redacts_api_key() {
+        let provider = AnthropicProvider::new("secret-key").unwrap();
+        let debug = format!("{provider:?}");
+        assert!(!debug.contains("secret-key"));
+        assert!(debug.contains("REDACTED"));
+    }
+}
