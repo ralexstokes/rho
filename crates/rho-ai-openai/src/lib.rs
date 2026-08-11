@@ -14,7 +14,7 @@ use nanocodex_oai_api::{
     Thinking as OpenAiThinking,
     responses::{
         ContentItem, FunctionOutputBody, JsonSchema, MessageRole,
-        ReasoningContent as OpenAiReasoningContent, ReasoningSummary, ResponseItem,
+        ReasoningContent as OpenAiReasoningContent, ReasoningSummary, ResponseItem, ResponseItemId,
         ToolDefinition as OpenAiToolDefinition,
     },
     session::ResponseInput,
@@ -26,10 +26,17 @@ use rho_ai::{
     StopReason, StreamEvent, ThinkingLevel, ToolArgumentError, ToolCallId, ToolDefinition, Usage,
     validate_tool_arguments, validate_tool_definition,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const PROVIDER: &str = "openai";
 const MODEL: &str = nanocodex_oai_api::MODEL;
+const ENCRYPTED_REASONING_KIND: &str = "encrypted_reasoning_v1";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct EncryptedReasoningState {
+    item_id: ResponseItemId,
+    encrypted_content: Box<str>,
+}
 
 /// OpenAI adapter construction failure.
 #[derive(Debug, thiserror::Error)]
@@ -279,12 +286,24 @@ fn request_items(request: &Request) -> Result<Vec<ResponseItem>, ProviderError> 
                             [ContentItem::output_text(text.clone())],
                         )),
                         ContentBlock::Thinking { text, opaque } => {
-                            if let Some(opaque) = opaque.as_ref().filter(|opaque| {
+                            let state = opaque.as_ref().filter(|opaque| {
                                 opaque.provider == ProviderId::from(PROVIDER)
-                                    && opaque.kind == "encrypted_content"
-                            }) {
+                                    && opaque.kind == ENCRYPTED_REASONING_KIND
+                            });
+                            if let Some(opaque) = state {
+                                let state: EncryptedReasoningState =
+                                    serde_json::from_str(&opaque.data).map_err(|error| {
+                                        invalid_request(format!(
+                                            "invalid OpenAI encrypted reasoning state: {error}"
+                                        ))
+                                    })?;
+                                if !state.item_id.is_prefixed() {
+                                    return Err(invalid_request(
+                                        "OpenAI encrypted reasoning state has an invalid item id",
+                                    ));
+                                }
                                 items.push(ResponseItem::Reasoning {
-                                    id: None,
+                                    id: Some(state.item_id),
                                     summary: if text.is_empty() {
                                         Vec::new()
                                     } else {
@@ -293,7 +312,7 @@ fn request_items(request: &Request) -> Result<Vec<ResponseItem>, ProviderError> 
                                         }]
                                     },
                                     content: None,
-                                    encrypted_content: Some(opaque.data.clone().into_boxed_str()),
+                                    encrypted_content: Some(state.encrypted_content),
                                     status: None,
                                     internal_chat_message_metadata_passthrough: None,
                                 });
@@ -556,6 +575,7 @@ fn response_item_blocks(
             })
             .collect(),
         ResponseItem::Reasoning {
+            id,
             summary,
             content,
             encrypted_content,
@@ -580,14 +600,34 @@ fn response_item_blocks(
                     text.push_str(value);
                 }
             }
-            Ok(vec![ContentBlock::Thinking {
-                text,
-                opaque: encrypted_content.as_ref().map(|data| OpaqueBlob {
-                    provider: ProviderId::from(PROVIDER),
-                    kind: "encrypted_content".to_owned(),
-                    data: data.to_string(),
-                }),
-            }])
+            let opaque = encrypted_content
+                .as_ref()
+                .map(|encrypted_content| {
+                    let item_id = id
+                        .as_ref()
+                        .filter(|item_id| item_id.is_prefixed())
+                        .ok_or_else(|| {
+                            ProviderError::invalid_response(
+                                "OpenAI encrypted reasoning output lacked a replayable item id",
+                            )
+                        })?;
+                    let state = EncryptedReasoningState {
+                        item_id: item_id.clone(),
+                        encrypted_content: encrypted_content.clone(),
+                    };
+                    let data = serde_json::to_string(&state).map_err(|error| {
+                        ProviderError::invalid_response(format!(
+                            "could not preserve OpenAI encrypted reasoning state: {error}"
+                        ))
+                    })?;
+                    Ok(OpaqueBlob {
+                        provider: ProviderId::from(PROVIDER),
+                        kind: ENCRYPTED_REASONING_KIND.to_owned(),
+                        data,
+                    })
+                })
+                .transpose()?;
+            Ok(vec![ContentBlock::Thinking { text, opaque }])
         }
         ResponseItem::FunctionCall {
             name,
@@ -881,6 +921,84 @@ mod tests {
         assert!(encoded.contains("second"));
         assert!(encoded.contains("summary"));
         assert!(!encoded.contains("foreign-secret"));
+    }
+
+    #[test]
+    fn encrypted_reasoning_round_trips_with_its_provider_item_id() {
+        let item: ResponseItem = serde_json::from_value(json!({
+            "type": "reasoning",
+            "id": "rs_original-item",
+            "summary": [{"type": "summary_text", "text": "summary"}],
+            "encrypted_content": "bound-ciphertext"
+        }))
+        .unwrap();
+        let blocks = response_item_blocks(&item, &[]).unwrap();
+        let ContentBlock::Thinking {
+            opaque: Some(opaque),
+            ..
+        } = &blocks[0]
+        else {
+            panic!("expected encrypted reasoning state");
+        };
+        assert_eq!(opaque.kind, ENCRYPTED_REASONING_KIND);
+
+        let request = Request {
+            system: "test".to_owned(),
+            messages: vec![Message::Assistant(AssistantMessage {
+                blocks,
+                stop: StopReason::Stop,
+                usage: Usage::default(),
+                provider: ProviderId::from(PROVIDER),
+                model: ModelId::from(MODEL),
+            })],
+            tools: Vec::new(),
+            model: ModelId::from(MODEL),
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::High,
+        };
+        let replay = serde_json::to_value(request_items(&request).unwrap()).unwrap();
+        assert_eq!(replay[0]["id"], "rs_original-item");
+        assert_eq!(replay[0]["encrypted_content"], "bound-ciphertext");
+    }
+
+    #[test]
+    fn encrypted_reasoning_without_a_replayable_id_is_rejected() {
+        let item: ResponseItem = serde_json::from_value(json!({
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "orphaned-ciphertext"
+        }))
+        .unwrap();
+        let error = response_item_blocks(&item, &[]).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidResponse);
+        assert!(error.message.contains("item id"));
+    }
+
+    #[test]
+    fn malformed_encrypted_reasoning_state_is_rejected_before_transport() {
+        let request = Request {
+            system: "test".to_owned(),
+            messages: vec![Message::Assistant(AssistantMessage {
+                blocks: vec![ContentBlock::Thinking {
+                    text: "summary".to_owned(),
+                    opaque: Some(OpaqueBlob {
+                        provider: ProviderId::from(PROVIDER),
+                        kind: ENCRYPTED_REASONING_KIND.to_owned(),
+                        data: "not-json".to_owned(),
+                    }),
+                }],
+                stop: StopReason::Stop,
+                usage: Usage::default(),
+                provider: ProviderId::from(PROVIDER),
+                model: ModelId::from(MODEL),
+            })],
+            tools: Vec::new(),
+            model: ModelId::from(MODEL),
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::High,
+        };
+        let error = request_items(&request).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidRequest);
     }
 
     #[test]
