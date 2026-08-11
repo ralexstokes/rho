@@ -35,7 +35,8 @@ The provider boundary and walking skeleton are implemented:
   incremental decoder and fixture-tested text, thinking, tool-use, usage, and
   stop-reason assembly.
 - `rho-cli` runs one logical turn with a `bash` tool, continuing through tool
-  calls until the provider completes the turn.
+  calls until the provider completes the turn. It defaults to a 32-model-step
+  safety cap; use `--max-model-steps N` to choose a different positive limit.
 
 Run the walking skeleton with an environment credential:
 
@@ -58,7 +59,7 @@ path in `RHO_CREDENTIALS_FILE`). The file shape is:
 }
 ```
 
-The Phase-1 `bash` tool runs `sh -lc` in the current directory without rho
+The Phase-1 `bash` tool runs `bash -lc` in the current directory without rho
 permission prompts or sandboxing. Run it only inside an execution environment
 whose filesystem, process, and network access you are willing to grant to the
 model.

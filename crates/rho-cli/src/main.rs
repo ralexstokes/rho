@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 use crate::credentials::resolve_credential;
 
-const MAX_MODEL_STEPS: usize = 8;
+const DEFAULT_MAX_MODEL_STEPS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderChoice {
@@ -51,6 +51,7 @@ struct Cli {
     provider: ProviderChoice,
     model: ModelId,
     max_output_tokens: u64,
+    max_model_steps: usize,
     thinking: ThinkingLevel,
     prompt: String,
 }
@@ -82,7 +83,8 @@ async fn run_turn(
     let mut request = Request {
         system: concat!(
             "You are a concise coding assistant. Use the bash tool when you need to inspect or ",
-            "change the current workspace. Report what you did and whether it succeeded."
+            "change the current workspace. Batch independent shell operations into as few tool ",
+            "calls as practical. Report what you did and whether it succeeded."
         )
         .to_owned(),
         messages: vec![Message::user(cli.prompt.clone())],
@@ -92,7 +94,7 @@ async fn run_turn(
         thinking: cli.thinking,
     };
 
-    for _ in 0..MAX_MODEL_STEPS {
+    for _ in 0..cli.max_model_steps {
         let (message, had_text) =
             collect_message(provider, request.clone(), cancellation.clone()).await?;
         let stop = message.stop;
@@ -130,7 +132,10 @@ async fn run_turn(
             _ => bail!("provider returned an unsupported stop reason"),
         }
     }
-    bail!("turn exceeded the limit of {MAX_MODEL_STEPS} model steps")
+    bail!(
+        "turn reached the --max-model-steps limit of {}; rerun with a larger limit if the tool loop was making progress",
+        cli.max_model_steps
+    )
 }
 
 async fn collect_message(
@@ -278,6 +283,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Cli> {
     let mut provider = ProviderChoice::OpenAi;
     let mut model = None;
     let mut max_output_tokens = 16_384;
+    let mut max_model_steps = DEFAULT_MAX_MODEL_STEPS;
     let mut thinking = ThinkingLevel::High;
     let mut prompt = Vec::new();
     let mut arguments = arguments.into_iter();
@@ -304,6 +310,16 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Cli> {
                     .context("--max-output-tokens requires a value")?
                     .parse()
                     .context("--max-output-tokens must be an integer")?;
+            }
+            "--max-model-steps" => {
+                max_model_steps = arguments
+                    .next()
+                    .context("--max-model-steps requires a value")?
+                    .parse()
+                    .context("--max-model-steps must be an integer")?;
+                if max_model_steps == 0 {
+                    bail!("--max-model-steps must be greater than zero");
+                }
             }
             "--thinking" => {
                 thinking = match arguments.next().as_deref() {
@@ -338,6 +354,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Cli> {
         provider,
         model: model.unwrap_or_else(|| provider.default_model()),
         max_output_tokens,
+        max_model_steps,
         thinking,
         prompt: prompt.join(" "),
     })
@@ -345,7 +362,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Cli> {
 
 fn print_help() {
     println!(
-        "rho-cli [--provider openai|anthropic] [--model ID] \\\n         [--max-output-tokens N] [--thinking LEVEL] PROMPT\n\n\\
+        "rho-cli [--provider openai|anthropic] [--model ID] \\\n         [--max-output-tokens N] [--max-model-steps N] [--thinking LEVEL] PROMPT\n\n\\
          Runs one agent turn with an unsandboxed bash tool. Credentials are read from \\\n         OPENAI_API_KEY or ANTHROPIC_API_KEY, then from ~/.rho/credentials.json."
     );
 }
@@ -372,8 +389,28 @@ mod tests {
         .unwrap();
         assert_eq!(cli.provider, ProviderChoice::Anthropic);
         assert_eq!(cli.model, ModelId::from("claude-sonnet-5"));
+        assert_eq!(cli.max_model_steps, DEFAULT_MAX_MODEL_STEPS);
         assert_eq!(cli.thinking, ThinkingLevel::Medium);
         assert_eq!(cli.prompt, "inspect the repo");
+    }
+
+    #[test]
+    fn model_step_limit_is_configurable_and_must_be_positive() {
+        let cli = parse_args([
+            "--max-model-steps".to_owned(),
+            "64".to_owned(),
+            "inspect".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(cli.max_model_steps, 64);
+
+        let error = parse_args([
+            "--max-model-steps".to_owned(),
+            "0".to_owned(),
+            "inspect".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("greater than zero"));
     }
 
     #[tokio::test]
@@ -452,13 +489,15 @@ mod tests {
             provider: ProviderChoice::OpenAi,
             model: ModelId::from("faux"),
             max_output_tokens: 100,
+            max_model_steps: DEFAULT_MAX_MODEL_STEPS,
             thinking: ThinkingLevel::None,
             prompt: "hello".to_owned(),
         };
         let initial = Request {
             system: concat!(
                 "You are a concise coding assistant. Use the bash tool when you need to inspect or ",
-                "change the current workspace. Report what you did and whether it succeeded."
+                "change the current workspace. Batch independent shell operations into as few tool ",
+                "calls as practical. Report what you did and whether it succeeded."
             )
             .to_owned(),
             messages: vec![Message::user("hello")],
