@@ -1,0 +1,14 @@
+[workspace]
+default-members = [
+    "crates/hello",
+]
+members = [
+    "crates/hello",
+]
+resolver = "3"
+
+# The flake reads `name` to label Nix derivations.
+[workspace.metadata]
+name = "rho"
+
+[workspace.dependencies]
