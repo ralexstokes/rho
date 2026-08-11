@@ -10,3 +10,9 @@ workspace = true
 [dependencies]
 rho-codec-jsonl.workspace = true
 rho-core.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

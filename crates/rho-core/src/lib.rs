@@ -3,8 +3,24 @@
 //! This crate is the pure decision-making core. Hosts execute the effects and
 //! actions it emits and feed their outcomes back into the state machine.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn core_crate_links_without_a_shell() {}
-}
+mod context;
+mod machine;
+mod model;
+mod recovery;
+
+pub use context::{
+    AssembledContext, CompactionPlan, ContextError, SessionSettings, assemble_context,
+    plan_compaction,
+};
+pub use machine::{
+    Action, ActionOutcome, AgentEvent, Effect, EntryStamp, HookInvocation, Input,
+    InteractionAnswer, InteractionRequest, MachineConfig, MachineError, PreparedToolCall,
+    SessionMachine, Step, ToolSpec,
+};
+pub use model::{
+    CorruptionReason, Entry, EntryBody, EntryId, FORMAT_VERSION, Fact, ForkParent, HostInfo, Item,
+    LaneName, LaneStatus, ModelRef, NewEntry, NewFact, NewRecord, OpId, OpIntent, OpOutcome,
+    OpenTool, Origin, QueueChange, QueueId, QueueKind, Record, RecordBody, ReplaySafety,
+    SessionHeader, SessionId, SessionMessage, SuspendedOp, Timestamp,
+};
+pub use recovery::reduce_lane_status;
