@@ -252,8 +252,9 @@ Our own protocol, informed by pi's but not compatible. v1 choices (bias: simple,
 debuggable, evolvable):
 - JSON Lines over stdio and unix socket. (CBOR/framing can come with the remote
   stack later; don't optimize bytes now.)
-- Requests: `{id, method, params}`; responses `{id, ok, result|error}`;
-  events `{event, ...}`. Methods ≈ session lifecycle (create/open/list/fork),
+- Every frame carries `v: 1`. Requests: `{v,id,method,params}`; responses
+  `{v,id,ok,result|error}`; events `{v,event,data}`. Methods cover session
+  lifecycle (create/open/list/fork/delete),
   prompt/steer/abort, get_snapshot, set_model/thinking, tool-permission answers,
   extension pass-throughs.
 - **Snapshot-authoritative rule** (idea 7): `get_snapshot` and snapshot events
@@ -384,14 +385,10 @@ Decided (details in the linked specs):
 
 Open:
 
-1. RPC protocol doc — **deferred until phase 3 starts** (it is a thin
-   projection of rho-agent's command/event enums, which phase 2 produces).
-   Guardrails already binding: owned `Send + serde` command/event types;
-   snapshot-authoritative rule; versioning-from-v1 when written.
-   **Carve-out**: the interaction request/answer primitive (ask-the-client,
-   block with timeout, crash-resume semantics for a pending ask) is core loop
-   design and belongs to phase 2 / spec/02, not to the RPC doc.
-   → spec/03-rpc.md (unwritten)
+1. RPC protocol doc — **written**. It is a thin versioned projection of
+   rho-agent's command/event enums, with explicit response-vs-completion
+   semantics, snapshot authority, and server→client interaction requests.
+   → spec/03-rpc.md
 2. WIT ABI — **deferred until after the phase-3 milestone** (no-gating
    decision removed the only v1 consumer; project-config trust already lands
    with it; toolchain maturity is a phase-4 risk). Binding phase-2 design

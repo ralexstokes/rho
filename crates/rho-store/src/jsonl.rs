@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::{
     CreateOptions, ForkPoint, RepoFuture, Session, SessionError, SessionMeta, SessionRepo,
-    append_entry_to_items, branch_from_items, checked_next_seq, derive_leaf,
-    reject_incomplete_tool_turn, session_meta, stamp,
+    SessionSnapshot, append_entry_to_items, branch_from_items, checked_next_seq, derive_leaf,
+    reject_incomplete_tool_turn, session_meta, session_snapshot, stamp,
 };
 
 /// Durability policy for successful appends.
@@ -213,6 +213,13 @@ impl SessionRepo for JsonlRepo {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
                 Err(error) => Err(error.into()),
             }
+        })
+    }
+
+    fn inspect(&self, id: SessionId) -> RepoFuture<'_, SessionSnapshot> {
+        Box::pin(async move {
+            let (header, items) = self.read_snapshot(&id)?;
+            Ok(session_snapshot(header, items))
         })
     }
 

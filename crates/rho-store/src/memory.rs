@@ -11,8 +11,8 @@ use serde_json::Value;
 
 use crate::{
     CreateOptions, ForkPoint, RepoFuture, Session, SessionError, SessionMeta, SessionRepo,
-    append_entry_to_items, branch_from_items, checked_next_seq, derive_leaf,
-    reject_incomplete_tool_turn, session_meta, stamp,
+    SessionSnapshot, append_entry_to_items, branch_from_items, checked_next_seq, derive_leaf,
+    reject_incomplete_tool_turn, session_meta, session_snapshot, stamp,
 };
 
 /// Process-local reference repository with writer-lock semantics.
@@ -87,6 +87,16 @@ impl SessionRepo for MemoryRepo {
                 .values()
                 .map(|file| session_meta(file.header.clone(), &file.items))
                 .collect())
+        })
+    }
+
+    fn inspect(&self, id: SessionId) -> RepoFuture<'_, SessionSnapshot> {
+        Box::pin(async move {
+            let files = self.inner.lock().map_err(poisoned)?;
+            let file = files
+                .get(&id)
+                .ok_or_else(|| SessionError::NotFound(id.clone()))?;
+            Ok(session_snapshot(file.header.clone(), file.items.clone()))
         })
     }
 
