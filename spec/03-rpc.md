@@ -20,6 +20,9 @@ The server has a bounded 256-message outbound queue. Producers await capacity,
 so a slow client applies backpressure instead of causing unbounded memory use.
 Method handlers run concurrently; response and event ordering across distinct
 requests is intentionally unspecified. IDs provide correlation.
+On clean input EOF, the server finishes every already accepted handler and
+flushes its queued output before closing; this makes finite stdio pipelines
+reliable. A malformed frame or transport failure still closes immediately.
 
 ## 2. Envelopes and versioning
 
@@ -51,8 +54,8 @@ client answers with the ordinary response envelope; it does not call a second
 method:
 
 ```json
-{"v":1,"id":"permission-7","method":"interaction.answer","params":{"session_id":"…","prompt":"continue?","timeout_ms":30000}}
-{"v":1,"id":"permission-7","ok":true,"result":{"answer":"approved"}}
+{"v":1,"id":"session-id:permission-7","method":"interaction.answer","params":{"session_id":"session-id","prompt":"continue?","timeout_ms":30000}}
+{"v":1,"id":"session-id:permission-7","ok":true,"result":{"answer":"approved"}}
 ```
 
 A client failure response is durably normalized to `declined`; no response by

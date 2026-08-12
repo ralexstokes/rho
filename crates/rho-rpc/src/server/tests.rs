@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use serde_json::{Value, json};
-use tokio::io::BufReader;
+use tokio::io::{AsyncReadExt as _, BufReader};
 
 use super::*;
 use crate::{ResponsePayload, RpcId};
@@ -121,6 +121,34 @@ async fn malformed_or_oversized_frames_close_the_connection() {
         read_frame(&mut oversized).await,
         Err(ServeError::Codec(_))
     ));
+}
+
+#[tokio::test]
+async fn eof_drains_responses_for_every_accepted_request() {
+    let handler = Arc::new(TestHandler::default());
+    let (client, server) = tokio::io::duplex(16 * 1024);
+    let (server_read, server_write) = tokio::io::split(server);
+    let task = tokio::spawn(serve(server_read, server_write, handler));
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+
+    client_write
+        .write_all(b"{\"v\":1,\"id\":\"last\",\"method\":\"echo\",\"params\":{}}\n")
+        .await
+        .unwrap();
+    client_write.shutdown().await.unwrap();
+
+    let mut output = String::new();
+    client_read.read_to_string(&mut output).await.unwrap();
+    task.await.unwrap().unwrap();
+    let messages = output
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 2);
+    assert!(messages.iter().any(|line| line.get("event").is_some()));
+    assert!(messages.iter().any(|line| {
+        line.get("id") == Some(&json!("last")) && line.get("ok") == Some(&json!(true))
+    }));
 }
 
 #[test]

@@ -1456,6 +1456,7 @@ dependencies = [
  "rho-ai",
  "rho-ai-anthropic",
  "rho-ai-openai",
+ "rho-core",
  "rho-rpc",
  "rho-store",
  "rho-tools",
