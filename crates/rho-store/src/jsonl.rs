@@ -256,6 +256,7 @@ impl SessionRepo for JsonlRepo {
                 .map(|(index, mut entry)| {
                     entry.seq = u64::try_from(index).unwrap_or(u64::MAX) + 1;
                     entry.op = None;
+                    entry.source_queue = None;
                     Item::Entry(entry)
                 })
                 .collect();

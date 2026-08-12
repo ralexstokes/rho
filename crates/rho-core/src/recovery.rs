@@ -4,8 +4,64 @@ use rho_ai::ToolCallId;
 
 use crate::{
     CompactionWork, CompletedCompaction, CorruptionReason, Item, LaneName, LaneStatus, OpId,
-    OpIntent, OpenTool, RecordBody, SessionMessage, SuspendedCompaction, SuspendedOp,
+    OpIntent, OpenTool, QueueChange, QueueError, QueuedInput, RecordBody, SessionMessage,
+    SuspendedCompaction, SuspendedOp,
 };
+
+/// Reconstructs pending steering and follow-up input in enqueue order.
+pub fn reduce_queue(items: &[Item], lane: &LaneName) -> Result<Vec<QueuedInput>, QueueError> {
+    let mut seen = BTreeSet::new();
+    let mut pending = Vec::<QueuedInput>::new();
+    for item in items {
+        match item {
+            Item::Record(record) if &record.lane == lane => {
+                let RecordBody::QueueChanged { change, .. } = &record.body else {
+                    continue;
+                };
+                match change {
+                    QueueChange::Enqueued { id, kind, message } => {
+                        if !seen.insert(id.clone()) {
+                            return Err(QueueError::DuplicateId { id: id.clone() });
+                        }
+                        if !matches!(message, SessionMessage::User { .. }) {
+                            return Err(QueueError::InvalidMessage { id: id.clone() });
+                        }
+                        pending.push(QueuedInput {
+                            id: id.clone(),
+                            kind: *kind,
+                            message: message.clone(),
+                        });
+                    }
+                    QueueChange::Cancelled { id } => {
+                        let Some(position) = pending.iter().position(|item| &item.id == id) else {
+                            return Err(QueueError::UnknownCancellation { id: id.clone() });
+                        };
+                        pending.remove(position);
+                    }
+                }
+            }
+            Item::Entry(entry) if &entry.lane == lane => {
+                let Some(id) = &entry.source_queue else {
+                    continue;
+                };
+                let Some(position) = pending.iter().position(|item| &item.id == id) else {
+                    return Err(QueueError::UnknownSource { id: id.clone() });
+                };
+                let matches_source = matches!(
+                    &entry.body,
+                    crate::EntryBody::Message { message }
+                        if entry.op.is_some() && message == &pending[position].message
+                );
+                if !matches_source {
+                    return Err(QueueError::SourceMismatch { id: id.clone() });
+                }
+                pending.remove(position);
+            }
+            Item::Entry(_) | Item::Record(_) | Item::Fact(_) => {}
+        }
+    }
+    Ok(pending)
+}
 
 #[derive(Debug)]
 struct OperationState {
@@ -381,8 +437,8 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        Entry, EntryBody, Item, LaneStatus, NewRecord, OpOutcome, Origin, Record, ReplaySafety,
-        SessionMessage, Timestamp,
+        Entry, EntryBody, Item, LaneStatus, NewRecord, OpOutcome, Origin, QueueId, QueueKind,
+        Record, ReplaySafety, SessionMessage, Timestamp,
     };
 
     use super::*;
@@ -403,6 +459,7 @@ mod tests {
             parent: None,
             lane: LaneName::main(),
             op: op.map(OpId::from),
+            source_queue: None,
             at: Timestamp::from("t"),
             body: EntryBody::Message { message },
         })
@@ -445,6 +502,7 @@ mod tests {
             parent: None,
             lane: LaneName::main(),
             op: Some(OpId::from(op)),
+            source_queue: None,
             at: Timestamp::from("t"),
             body: EntryBody::Compaction {
                 summary: "summary".to_owned(),
@@ -452,6 +510,35 @@ mod tests {
                 retained_tail: Vec::new(),
                 tokens_before: 100,
                 usage: Usage::default(),
+            },
+        })
+    }
+
+    fn queued(seq: u64, id: &str, kind: QueueKind, message: &str) -> Item {
+        record(
+            seq,
+            RecordBody::QueueChanged {
+                op: None,
+                change: QueueChange::Enqueued {
+                    id: QueueId::from(id),
+                    kind,
+                    message: SessionMessage::user(message),
+                },
+            },
+        )
+    }
+
+    fn queued_entry(seq: u64, id: &str, message: &str) -> Item {
+        Item::Entry(Entry {
+            seq,
+            id: format!("e{seq}").into(),
+            parent: None,
+            lane: LaneName::main(),
+            op: Some(OpId::from("op")),
+            source_queue: Some(QueueId::from(id)),
+            at: Timestamp::from("t"),
+            body: EntryBody::Message {
+                message: SessionMessage::user(message),
             },
         })
     }
@@ -543,6 +630,121 @@ mod tests {
         assert_eq!(
             reduce_lane_status(&closed, &LaneName::main()),
             LaneStatus::Idle
+        );
+    }
+
+    #[test]
+    fn queue_recovery_tracks_consumption_cancellation_and_invalid_ids() {
+        let items = vec![
+            queued(1, "steer", QueueKind::Steer, "adjust"),
+            queued(2, "follow", QueueKind::FollowUp, "next"),
+        ];
+        assert_eq!(
+            reduce_queue(&items, &LaneName::main()).unwrap(),
+            [
+                QueuedInput {
+                    id: QueueId::from("steer"),
+                    kind: QueueKind::Steer,
+                    message: SessionMessage::user("adjust"),
+                },
+                QueuedInput {
+                    id: QueueId::from("follow"),
+                    kind: QueueKind::FollowUp,
+                    message: SessionMessage::user("next"),
+                },
+            ]
+        );
+
+        let mut consumed = items.clone();
+        consumed.push(queued_entry(3, "steer", "adjust"));
+        assert_eq!(
+            reduce_queue(&consumed, &LaneName::main()).unwrap(),
+            [QueuedInput {
+                id: QueueId::from("follow"),
+                kind: QueueKind::FollowUp,
+                message: SessionMessage::user("next"),
+            }]
+        );
+        consumed.push(record(
+            4,
+            RecordBody::QueueChanged {
+                op: None,
+                change: QueueChange::Cancelled {
+                    id: QueueId::from("follow"),
+                },
+            },
+        ));
+        assert!(
+            reduce_queue(&consumed, &LaneName::main())
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(
+            reduce_queue(
+                &[
+                    queued(1, "same", QueueKind::Steer, "one"),
+                    queued(2, "same", QueueKind::FollowUp, "two"),
+                ],
+                &LaneName::main(),
+            ),
+            Err(QueueError::DuplicateId {
+                id: QueueId::from("same"),
+            })
+        );
+        assert_eq!(
+            reduce_queue(
+                &[record(
+                    1,
+                    RecordBody::QueueChanged {
+                        op: None,
+                        change: QueueChange::Cancelled {
+                            id: QueueId::from("missing"),
+                        },
+                    },
+                )],
+                &LaneName::main(),
+            ),
+            Err(QueueError::UnknownCancellation {
+                id: QueueId::from("missing"),
+            })
+        );
+        assert_eq!(
+            reduce_queue(&[queued_entry(1, "missing", "x")], &LaneName::main()),
+            Err(QueueError::UnknownSource {
+                id: QueueId::from("missing"),
+            })
+        );
+        assert_eq!(
+            reduce_queue(
+                &[record(
+                    1,
+                    RecordBody::QueueChanged {
+                        op: None,
+                        change: QueueChange::Enqueued {
+                            id: QueueId::from("assistant"),
+                            kind: QueueKind::Steer,
+                            message: assistant(),
+                        },
+                    },
+                )],
+                &LaneName::main(),
+            ),
+            Err(QueueError::InvalidMessage {
+                id: QueueId::from("assistant"),
+            })
+        );
+        assert_eq!(
+            reduce_queue(
+                &[
+                    queued(1, "mismatch", QueueKind::FollowUp, "expected"),
+                    queued_entry(2, "mismatch", "different"),
+                ],
+                &LaneName::main(),
+            ),
+            Err(QueueError::SourceMismatch {
+                id: QueueId::from("mismatch"),
+            })
         );
     }
 

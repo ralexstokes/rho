@@ -15,7 +15,8 @@ use rho_ai::{
 };
 use rho_core::{
     Action, ActionOutcome, AgentEvent, Effect, EntryId, EntryStamp, Input, MachineError, ModelRef,
-    OpId, Origin, SessionMachine, SessionMessage, Step, Timestamp,
+    OpId, Origin, QueueError, QueueId, QueueKind, SessionControl, SessionMachine, SessionMessage,
+    Step, Timestamp,
 };
 use rho_store::{Session, SessionError};
 use rho_tools::{ToolOutput, ToolSet};
@@ -40,6 +41,70 @@ impl EventSink for NoopEventSink {
         Box::pin(async {})
     }
 }
+
+/// Sending side of a session's live control plane.
+#[derive(Clone)]
+pub struct ControlSender {
+    inner: tokio::sync::mpsc::UnboundedSender<SessionControl>,
+}
+
+/// Receiving side owned by exactly one automatic driver.
+pub struct ControlReceiver {
+    inner: tokio::sync::mpsc::UnboundedReceiver<SessionControl>,
+}
+
+/// Creates an unbounded in-process control channel.
+#[must_use]
+pub fn control_channel() -> (ControlSender, ControlReceiver) {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    (
+        ControlSender { inner: sender },
+        ControlReceiver { inner: receiver },
+    )
+}
+
+impl ControlSender {
+    /// Queues steering for the active run and returns its durable identity.
+    pub fn steer(&self, message: SessionMessage) -> Result<QueueId, ControlClosed> {
+        self.enqueue(QueueKind::Steer, message)
+    }
+
+    /// Queues a message for the next run and returns its durable identity.
+    pub fn follow_up(&self, message: SessionMessage) -> Result<QueueId, ControlClosed> {
+        self.enqueue(QueueKind::FollowUp, message)
+    }
+
+    fn enqueue(&self, kind: QueueKind, message: SessionMessage) -> Result<QueueId, ControlClosed> {
+        let id = QueueId::from(Uuid::now_v7().to_string());
+        self.inner
+            .send(SessionControl::Enqueue {
+                id: id.clone(),
+                kind,
+                message,
+            })
+            .map_err(|_| ControlClosed)?;
+        Ok(id)
+    }
+
+    /// Cancels one pending steering or follow-up item.
+    pub fn cancel(&self, id: QueueId) -> Result<(), ControlClosed> {
+        self.inner
+            .send(SessionControl::Cancel { id })
+            .map_err(|_| ControlClosed)
+    }
+
+    /// Requests cooperative cancellation of the active operation.
+    pub fn abort(&self) -> Result<(), ControlClosed> {
+        self.inner
+            .send(SessionControl::Abort)
+            .map_err(|_| ControlClosed)
+    }
+}
+
+/// The session driver no longer accepts control-plane commands.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("session control channel is closed")]
+pub struct ControlClosed;
 
 /// A live provider session bound to the provider/model used to open it.
 ///
@@ -131,7 +196,7 @@ pub enum DriverError {
     /// Provider stream violated the terminal-event contract.
     #[error("provider stream ended without Done or Error")]
     UnterminatedProviderStream,
-    /// This first driver slice does not yet host hooks, interactions, or compaction.
+    /// The automatic driver does not yet host hooks or interactions.
     #[error("automatic driver does not support action {0}")]
     UnsupportedAction(&'static str),
     /// Recovery found work that requires explicit resume choreography.
@@ -154,6 +219,9 @@ pub enum DriverError {
         /// Provider/model to which the live provider session is bound.
         actual: ModelRef,
     },
+    /// Durable queue history was internally inconsistent.
+    #[error("invalid durable queue history: {0:?}")]
+    Queue(QueueError),
 }
 
 /// Mutable shell resources used to execute deterministic machine steps.
@@ -164,6 +232,7 @@ pub struct Driver<'driver> {
     stamps: &'driver mut dyn StampSource,
     cancellation: CancellationToken,
     events: &'driver mut dyn EventSink,
+    commands: Option<&'driver mut ControlReceiver>,
 }
 
 impl<'driver> Driver<'driver> {
@@ -183,20 +252,30 @@ impl<'driver> Driver<'driver> {
             stamps,
             cancellation,
             events,
+            commands: None,
         }
+    }
+
+    /// Attaches the live control plane polled before and during actions.
+    #[must_use]
+    pub fn with_controls(mut self, commands: &'driver mut ControlReceiver) -> Self {
+        self.commands = Some(commands);
+        self
     }
 
     /// Runs one prompt to a terminal state using the same machine exposed for
     /// manual drive and deterministic replay.
     pub async fn run_prompt(
         &mut self,
-        machine: SessionMachine,
+        mut machine: SessionMachine,
         message: SessionMessage,
         origin: Origin,
         host: Option<rho_core::HostInfo>,
     ) -> Result<SessionMachine, DriverError> {
         validate_binding(&machine, self.session)?;
         validate_provider(&machine, self.provider)?;
+        self.hydrate_queue(&mut machine)?;
+        self.drain_ready_controls(&mut machine).await?;
         let status = self.session.lane_status()?;
         if status != rho_core::LaneStatus::Idle {
             return Err(DriverError::LaneNotIdle {
@@ -209,6 +288,8 @@ impl<'driver> Driver<'driver> {
             stamp: self.stamps.entry(),
             origin,
             host: host.clone(),
+            queue: None,
+            steer_stamps: self.steer_stamps(&machine),
         };
         let (machine, step) = machine.handle(input)?;
         let machine = self.drive(machine, step).await?;
@@ -220,12 +301,18 @@ impl<'driver> Driver<'driver> {
     }
 
     /// Resumes the single suspended operation described by the durable journal.
-    pub async fn resume(&mut self, machine: SessionMachine) -> Result<SessionMachine, DriverError> {
+    pub async fn resume(
+        &mut self,
+        mut machine: SessionMachine,
+    ) -> Result<SessionMachine, DriverError> {
         validate_binding(&machine, self.session)?;
+        self.hydrate_queue(&mut machine)?;
         let status = self.session.lane_status()?;
+        let steer_stamps = self.steer_stamps(&machine);
         let (machine, step) = machine.handle(Input::Resume {
             status,
             at: self.stamps.timestamp(),
+            steer_stamps,
         })?;
         self.drive(machine, step).await
     }
@@ -233,12 +320,13 @@ impl<'driver> Driver<'driver> {
     /// Runs one explicit compaction operation to a terminal state.
     pub async fn compact(
         &mut self,
-        machine: SessionMachine,
+        mut machine: SessionMachine,
         origin: Origin,
         host: Option<rho_core::HostInfo>,
     ) -> Result<SessionMachine, DriverError> {
         validate_binding(&machine, self.session)?;
         validate_provider(&machine, self.provider)?;
+        self.hydrate_queue(&mut machine)?;
         let status = self.session.lane_status()?;
         if status != rho_core::LaneStatus::Idle {
             return Err(DriverError::LaneNotIdle {
@@ -264,24 +352,114 @@ impl<'driver> Driver<'driver> {
                 Step::Do { effects, action } => {
                     apply_effects(self.session, self.events, effects).await?;
                     let Some(action) = action else {
+                        let (next_machine, next_step) = self.start_queued_run(machine).await?;
+                        machine = next_machine;
+                        if let Some(next_step) = next_step {
+                            step = next_step;
+                            continue;
+                        }
                         return Ok(machine);
                     };
+                    self.drain_ready_controls(&mut machine).await?;
+                    let steer_stamps = if matches!(&action, Action::StreamAssistant { .. }) {
+                        self.steer_stamps(&machine)
+                    } else {
+                        Vec::new()
+                    };
+                    let (effects, action) = machine.prepare_action(action, steer_stamps)?;
+                    apply_effects(self.session, self.events, effects).await?;
                     let outcome = execute_action(
                         action,
-                        self.provider,
-                        self.tools,
-                        self.stamps,
-                        self.cancellation.clone(),
-                        self.events,
+                        ActionShell {
+                            machine: &mut machine,
+                            session: self.session,
+                            provider: self.provider,
+                            tools: self.tools,
+                            stamps: self.stamps,
+                            cancellation: self.cancellation.clone(),
+                            events: self.events,
+                            commands: self.commands.as_deref_mut(),
+                        },
                     )
                     .await?;
                     (machine, step) = machine.resolve(outcome)?;
                 }
-                Step::Idle => return Ok(machine),
+                Step::Idle => {
+                    let (next_machine, next_step) = self.start_queued_run(machine).await?;
+                    machine = next_machine;
+                    if let Some(next_step) = next_step {
+                        step = next_step;
+                    } else {
+                        return Ok(machine);
+                    }
+                }
                 Step::AwaitingOutcome => return Err(DriverError::Suspended),
                 _ => return Err(DriverError::UnsupportedAction("future step variant")),
             }
         }
+    }
+
+    fn hydrate_queue(&mut self, machine: &mut SessionMachine) -> Result<(), DriverError> {
+        let items = self.session.log(0, usize::MAX)?;
+        let queued = rho_core::reduce_queue(&items, &rho_core::LaneName::main())
+            .map_err(DriverError::Queue)?;
+        machine.hydrate_queue(queued)?;
+        Ok(())
+    }
+
+    fn steer_stamps(&mut self, machine: &SessionMachine) -> Vec<EntryStamp> {
+        (0..machine.pending_steers())
+            .map(|_| self.stamps.entry())
+            .collect()
+    }
+
+    async fn drain_ready_controls(
+        &mut self,
+        machine: &mut SessionMachine,
+    ) -> Result<(), DriverError> {
+        loop {
+            let command = match self.commands.as_deref_mut() {
+                Some(commands) => match commands.inner.try_recv() {
+                    Ok(command) => command,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return Ok(()),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        self.commands = None;
+                        return Ok(());
+                    }
+                },
+                None => return Ok(()),
+            };
+            let abort = matches!(command, SessionControl::Abort);
+            let effects = machine.accept_control(command, self.stamps.timestamp())?;
+            apply_effects(self.session, self.events, effects).await?;
+            if abort {
+                self.cancellation.cancel();
+            }
+        }
+    }
+
+    async fn start_queued_run(
+        &mut self,
+        mut machine: SessionMachine,
+    ) -> Result<(SessionMachine, Option<Step>), DriverError> {
+        if self.cancellation.is_cancelled() {
+            return Ok((machine, None));
+        }
+        self.drain_ready_controls(&mut machine).await?;
+        let Some(item) = machine.pop_queued_input() else {
+            return Ok((machine, None));
+        };
+        let input = Input::Prompt {
+            message: item.message,
+            op: self.stamps.op_id(),
+            stamp: self.stamps.entry(),
+            origin: Origin::External,
+            host: None,
+            queue: Some(item.id),
+            steer_stamps: self.steer_stamps(&machine),
+        };
+        let (machine, step) = machine.handle(input)?;
+        Ok((machine, Some(step)))
     }
 }
 
@@ -293,6 +471,7 @@ fn validate_binding(machine: &SessionMachine, session: &dyn Session) -> Result<(
                 && left.parent == right.parent
                 && left.lane == right.lane
                 && left.op == right.op
+                && left.source_queue == right.source_queue
                 && left.at == right.at
                 && left.body == right.body
         });
@@ -337,14 +516,31 @@ async fn apply_effects(
     Ok(())
 }
 
+struct ActionShell<'shell> {
+    machine: &'shell mut SessionMachine,
+    session: &'shell mut dyn Session,
+    provider: &'shell mut BoundProvider,
+    tools: &'shell ToolSet,
+    stamps: &'shell mut dyn StampSource,
+    cancellation: CancellationToken,
+    events: &'shell mut dyn EventSink,
+    commands: Option<&'shell mut ControlReceiver>,
+}
+
 async fn execute_action(
     action: Action,
-    provider: &mut BoundProvider,
-    tools: &ToolSet,
-    stamps: &mut dyn StampSource,
-    cancellation: CancellationToken,
-    events: &mut dyn EventSink,
+    shell: ActionShell<'_>,
 ) -> Result<ActionOutcome, DriverError> {
+    let ActionShell {
+        machine,
+        session,
+        provider,
+        tools,
+        stamps,
+        cancellation,
+        events,
+        mut commands,
+    } = shell;
     match action {
         Action::StreamAssistant { request, model, .. } => {
             if model != provider.model {
@@ -353,8 +549,18 @@ async fn execute_action(
                     actual: provider.model.clone(),
                 });
             }
-            let mut stream = provider.provider.generate(request, cancellation);
-            while let Some(event) = stream.next().await {
+            let mut stream = provider.provider.generate(request, cancellation.clone());
+            while let Some(event) = next_provider_event(
+                &mut stream,
+                &mut commands,
+                machine,
+                session,
+                stamps,
+                &cancellation,
+                events,
+            )
+            .await?
+            {
                 events
                     .emit(AgentEvent::ProviderStream {
                         event: event.clone(),
@@ -365,12 +571,14 @@ async fn execute_action(
                         return Ok(ActionOutcome::Assistant {
                             result: Ok(message),
                             stamp: stamps.entry(),
+                            steer_stamps: mint_steer_stamps(machine, stamps),
                         });
                     }
                     StreamEvent::Error(error) => {
                         return Ok(ActionOutcome::Assistant {
                             result: Err(error),
                             stamp: stamps.entry(),
+                            steer_stamps: mint_steer_stamps(machine, stamps),
                         });
                     }
                     StreamEvent::Start
@@ -385,7 +593,30 @@ async fn execute_action(
             let output = if let Some(error) = call.precomputed_error {
                 ToolOutput::error(error)
             } else if let Some(tool) = tools.get(&call.name) {
-                tool.execute(call.effective_args, cancellation).await
+                let mut execution = tool.execute(call.effective_args, cancellation.clone());
+                loop {
+                    let Some(receiver) = commands.as_deref_mut() else {
+                        break execution.await;
+                    };
+                    tokio::select! {
+                        biased;
+                        command = receiver.inner.recv() => {
+                            let Some(command) = command else {
+                                commands = None;
+                                continue;
+                            };
+                            accept_live_control(
+                                command,
+                                machine,
+                                session,
+                                stamps,
+                                &cancellation,
+                                events,
+                            ).await?;
+                        }
+                        output = &mut execution => break output,
+                    }
+                }
             } else {
                 ToolOutput::error(format!("unknown tool {:?}", call.name))
             };
@@ -395,6 +626,7 @@ async fn execute_action(
                 is_error: output.is_error,
                 details: output.details,
                 stamp: stamps.entry(),
+                steer_stamps: mint_steer_stamps(machine, stamps),
             })
         }
         Action::Summarize { request, model, .. } => {
@@ -404,8 +636,18 @@ async fn execute_action(
                     actual: provider.model.clone(),
                 });
             }
-            let mut stream = provider.provider.generate(request, cancellation);
-            while let Some(event) = stream.next().await {
+            let mut stream = provider.provider.generate(request, cancellation.clone());
+            while let Some(event) = next_provider_event(
+                &mut stream,
+                &mut commands,
+                machine,
+                session,
+                stamps,
+                &cancellation,
+                events,
+            )
+            .await?
+            {
                 events
                     .emit(AgentEvent::ProviderStream {
                         event: event.clone(),
@@ -472,6 +714,63 @@ async fn execute_action(
     }
 }
 
+async fn next_provider_event(
+    stream: &mut rho_ai::ProviderStream<'_>,
+    commands: &mut Option<&mut ControlReceiver>,
+    machine: &mut SessionMachine,
+    session: &mut dyn Session,
+    stamps: &mut dyn StampSource,
+    cancellation: &CancellationToken,
+    events: &mut dyn EventSink,
+) -> Result<Option<StreamEvent>, DriverError> {
+    loop {
+        let Some(receiver) = commands.as_deref_mut() else {
+            return Ok(stream.next().await);
+        };
+        tokio::select! {
+            biased;
+            command = receiver.inner.recv() => {
+                let Some(command) = command else {
+                    *commands = None;
+                    continue;
+                };
+                accept_live_control(
+                    command,
+                    machine,
+                    session,
+                    stamps,
+                    cancellation,
+                    events,
+                ).await?;
+            }
+            event = stream.next() => return Ok(event),
+        }
+    }
+}
+
+async fn accept_live_control(
+    command: SessionControl,
+    machine: &mut SessionMachine,
+    session: &mut dyn Session,
+    stamps: &mut dyn StampSource,
+    cancellation: &CancellationToken,
+    events: &mut dyn EventSink,
+) -> Result<(), DriverError> {
+    let abort = matches!(command, SessionControl::Abort);
+    let effects = machine.accept_control(command, stamps.timestamp())?;
+    apply_effects(session, events, effects).await?;
+    if abort {
+        cancellation.cancel();
+    }
+    Ok(())
+}
+
+fn mint_steer_stamps(machine: &SessionMachine, stamps: &mut dyn StampSource) -> Vec<EntryStamp> {
+    (0..machine.pending_steers())
+        .map(|_| stamps.entry())
+        .collect()
+}
+
 fn system_timestamp() -> Timestamp {
     Timestamp::from(jiff::Timestamp::now().to_string())
 }
@@ -509,6 +808,60 @@ mod tests {
         fn timestamp(&mut self) -> Timestamp {
             self.next += 1;
             Timestamp::from(format!("t{}", self.next))
+        }
+    }
+
+    struct QueueOnProviderStart {
+        sender: ControlSender,
+        sent: bool,
+        ids: Vec<QueueId>,
+    }
+
+    impl EventSink for QueueOnProviderStart {
+        fn emit(&mut self, event: AgentEvent) -> EventFuture<'_> {
+            if !self.sent
+                && matches!(
+                    event,
+                    AgentEvent::ProviderStream {
+                        event: StreamEvent::Start
+                    }
+                )
+            {
+                self.sent = true;
+                self.ids.push(
+                    self.sender
+                        .steer(SessionMessage::user("course correction"))
+                        .unwrap(),
+                );
+                self.ids.push(
+                    self.sender
+                        .follow_up(SessionMessage::user("next task"))
+                        .unwrap(),
+                );
+            }
+            Box::pin(async {})
+        }
+    }
+
+    struct AbortOnProviderStart {
+        sender: ControlSender,
+        sent: bool,
+    }
+
+    impl EventSink for AbortOnProviderStart {
+        fn emit(&mut self, event: AgentEvent) -> EventFuture<'_> {
+            if !self.sent
+                && matches!(
+                    event,
+                    AgentEvent::ProviderStream {
+                        event: StreamEvent::Start
+                    }
+                )
+            {
+                self.sent = true;
+                self.sender.abort().unwrap();
+            }
+            Box::pin(async {})
         }
     }
 
@@ -808,6 +1161,7 @@ mod tests {
                 parent: None,
                 lane: rho_core::LaneName::main(),
                 op: Some(op.clone()),
+                source_queue: None,
                 at: Timestamp::from("t1"),
                 body: rho_core::EntryBody::Message {
                     message: SessionMessage::user("change it"),
@@ -842,6 +1196,7 @@ mod tests {
                 parent: Some(user_id),
                 lane: rho_core::LaneName::main(),
                 op: Some(op.clone()),
+                source_queue: None,
                 at: Timestamp::from("t3"),
                 body: rho_core::EntryBody::Message {
                     message: SessionMessage::Assistant(interrupted_assistant),
@@ -1066,6 +1421,254 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.compaction_due(), None);
+    }
+
+    #[tokio::test]
+    async fn live_steering_continues_the_run_and_follow_up_starts_the_next_one() {
+        let first = AssistantMessage {
+            blocks: vec![rho_ai::ContentBlock::text("first")],
+            stop: StopReason::Stop,
+            usage: Usage::default(),
+            provider: ProviderId::from("p"),
+            model: ModelId::from("m"),
+        };
+        let second = AssistantMessage {
+            blocks: vec![rho_ai::ContentBlock::text("second")],
+            stop: StopReason::Stop,
+            usage: Usage::default(),
+            provider: ProviderId::from("p"),
+            model: ModelId::from("m"),
+        };
+        let third = AssistantMessage {
+            blocks: vec![rho_ai::ContentBlock::text("third")],
+            stop: StopReason::Stop,
+            usage: Usage::default(),
+            provider: ProviderId::from("p"),
+            model: ModelId::from("m"),
+        };
+        let request = |messages| Request {
+            system: "test".to_owned(),
+            messages,
+            tools: Vec::new(),
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::None,
+        };
+        let factory = FauxFactory::new(
+            vec![ModelInfo {
+                id: ModelId::from("m"),
+                display_name: "model".to_owned(),
+                context_tokens: None,
+                max_output_tokens: None,
+            }],
+            [
+                Script {
+                    request: request(vec![Message::user("initial")]),
+                    events: vec![StreamEvent::Start, StreamEvent::Done(first.clone())],
+                },
+                Script {
+                    request: request(vec![
+                        Message::user("initial"),
+                        Message::Assistant(first.clone()),
+                        Message::user("course correction"),
+                    ]),
+                    events: vec![StreamEvent::Done(second.clone())],
+                },
+                Script {
+                    request: request(vec![
+                        Message::user("initial"),
+                        Message::Assistant(first),
+                        Message::user("course correction"),
+                        Message::Assistant(second),
+                        Message::user("next task"),
+                    ]),
+                    events: vec![StreamEvent::Done(third)],
+                },
+            ],
+        )
+        .with_provider_id(ProviderId::from("p"));
+        let mut provider = BoundProvider::open(
+            &factory,
+            ModelRef {
+                provider: ProviderId::from("p"),
+                model: ModelId::from("m"),
+            },
+        )
+        .await
+        .unwrap();
+        let repo = MemoryRepo::default();
+        let mut session = repo
+            .create(CreateOptions {
+                cwd: "/workspace".to_owned(),
+            })
+            .await
+            .unwrap();
+        let machine = SessionMachine::new(
+            MachineConfig {
+                system: "test".to_owned(),
+                max_output_tokens: 100,
+                thinking: ThinkingLevel::None,
+                model: ModelRef {
+                    provider: ProviderId::from("p"),
+                    model: ModelId::from("m"),
+                },
+                tools: Vec::new(),
+                compaction: None,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let (sender, mut receiver) = control_channel();
+        let mut events = QueueOnProviderStart {
+            sender,
+            sent: false,
+            ids: Vec::new(),
+        };
+        let machine = Driver::new(
+            session.as_mut(),
+            &mut provider,
+            &ToolSet::new(),
+            &mut FixedStamps { next: 20 },
+            CancellationToken::new(),
+            &mut events,
+        )
+        .with_controls(&mut receiver)
+        .run_prompt(
+            machine,
+            SessionMessage::user("initial"),
+            Origin::External,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(machine.is_idle());
+        assert_eq!(session.lane_status().unwrap(), rho_core::LaneStatus::Idle);
+        let items = session.log(0, usize::MAX).unwrap();
+        assert!(
+            rho_core::reduce_queue(&items, &rho_core::LaneName::main())
+                .unwrap()
+                .is_empty()
+        );
+        let consumed = session
+            .branch(None)
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| entry.source_queue)
+            .collect::<Vec<_>>();
+        assert_eq!(consumed, events.ids);
+    }
+
+    #[tokio::test]
+    async fn abort_is_durable_before_in_flight_provider_cancellation() {
+        let expected = Request {
+            system: "test".to_owned(),
+            messages: vec![Message::user("long task")],
+            tools: Vec::new(),
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::None,
+        };
+        let factory = FauxFactory::new(
+            vec![ModelInfo {
+                id: ModelId::from("m"),
+                display_name: "model".to_owned(),
+                context_tokens: None,
+                max_output_tokens: None,
+            }],
+            [Script {
+                request: expected,
+                events: vec![
+                    StreamEvent::Start,
+                    StreamEvent::Done(AssistantMessage {
+                        blocks: vec![rho_ai::ContentBlock::text("too late")],
+                        stop: StopReason::Stop,
+                        usage: Usage::default(),
+                        provider: ProviderId::from("p"),
+                        model: ModelId::from("m"),
+                    }),
+                ],
+            }],
+        )
+        .with_provider_id(ProviderId::from("p"));
+        let mut provider = BoundProvider::open(
+            &factory,
+            ModelRef {
+                provider: ProviderId::from("p"),
+                model: ModelId::from("m"),
+            },
+        )
+        .await
+        .unwrap();
+        let repo = MemoryRepo::default();
+        let mut session = repo
+            .create(CreateOptions {
+                cwd: "/workspace".to_owned(),
+            })
+            .await
+            .unwrap();
+        let machine = SessionMachine::new(
+            MachineConfig {
+                system: "test".to_owned(),
+                max_output_tokens: 100,
+                thinking: ThinkingLevel::None,
+                model: ModelRef {
+                    provider: ProviderId::from("p"),
+                    model: ModelId::from("m"),
+                },
+                tools: Vec::new(),
+                compaction: None,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let (sender, mut receiver) = control_channel();
+        let mut events = AbortOnProviderStart {
+            sender,
+            sent: false,
+        };
+        let machine = Driver::new(
+            session.as_mut(),
+            &mut provider,
+            &ToolSet::new(),
+            &mut FixedStamps { next: 50 },
+            CancellationToken::new(),
+            &mut events,
+        )
+        .with_controls(&mut receiver)
+        .run_prompt(
+            machine,
+            SessionMessage::user("long task"),
+            Origin::External,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(machine.is_idle());
+        let records = session
+            .log(0, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .filter_map(|item| match item {
+                rho_core::Item::Record(record) => Some(record.body),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let abort = records
+            .iter()
+            .position(|record| matches!(record, rho_core::RecordBody::AbortRequested { .. }))
+            .unwrap();
+        let finish = records
+            .iter()
+            .position(|record| {
+                matches!(
+                    record,
+                    rho_core::RecordBody::OpFinished {
+                        outcome: rho_core::OpOutcome::Aborted,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(abort < finish);
+        assert_eq!(session.lane_status().unwrap(), rho_core::LaneStatus::Idle);
     }
 
     #[test]

@@ -10,9 +10,32 @@ use thiserror::Error;
 
 use crate::{
     CompactionWork, ContextError, Entry, EntryBody, EntryId, HostInfo, LaneName, LaneStatus,
-    NewEntry, NewRecord, OpId, OpIntent, OpOutcome, Origin, RecordBody, ReplaySafety,
-    SessionMessage, Timestamp, assemble_context, plan_compaction,
+    NewEntry, NewRecord, OpId, OpIntent, OpOutcome, Origin, QueueChange, QueueId, QueueKind,
+    QueuedInput, RecordBody, ReplaySafety, SessionMessage, Timestamp, assemble_context,
+    plan_compaction,
 };
+
+/// Asynchronous control-plane input accepted while a run is active.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum SessionControl {
+    /// Queue steering or follow-up input.
+    Enqueue {
+        /// Stable host-minted queue identity.
+        id: QueueId,
+        /// Queue semantics.
+        kind: QueueKind,
+        /// Verbatim user message.
+        message: SessionMessage,
+    },
+    /// Cancel a pending queue item.
+    Cancel {
+        /// Queue item identity.
+        id: QueueId,
+    },
+    /// Cooperatively abort the active operation.
+    Abort,
+}
 
 /// Immutable tool metadata used by the pure machine.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -207,6 +230,16 @@ pub enum AgentEvent {
         /// Generated summary.
         summary: String,
     },
+    /// Durable steering or follow-up state changed.
+    QueueChanged {
+        /// Queue mutation.
+        change: QueueChange,
+    },
+    /// Cooperative cancellation was requested.
+    AbortRequested {
+        /// Active operation identity.
+        op: OpId,
+    },
     /// Advisory provider stream event. Snapshots remain authoritative.
     ProviderStream {
         /// Transient provider event.
@@ -251,6 +284,10 @@ pub enum Input {
         origin: Origin,
         /// Optional host fencing metadata.
         host: Option<HostInfo>,
+        /// Queue item promoted into this prompt, when any.
+        queue: Option<crate::QueueId>,
+        /// Shell-minted stamps for steering already queued at the pre-poll.
+        steer_stamps: Vec<EntryStamp>,
     },
     /// Begin an explicit or automatically triggered compaction operation.
     Compact {
@@ -269,6 +306,8 @@ pub enum Input {
         status: LaneStatus,
         /// Shell-minted timestamp for newly derived recovery effects.
         at: Timestamp,
+        /// Shell-minted stamps for steering already queued at the pre-poll.
+        steer_stamps: Vec<EntryStamp>,
     },
 }
 
@@ -283,6 +322,8 @@ pub enum ActionOutcome {
         result: Result<AssistantMessage, ProviderError>,
         /// Identity and time used if a message is appended.
         stamp: EntryStamp,
+        /// Stamps for steering received while generation was in flight.
+        steer_stamps: Vec<EntryStamp>,
     },
     /// Tool execution completed.
     Tool {
@@ -296,6 +337,8 @@ pub enum ActionOutcome {
         details: Option<Value>,
         /// Identity and time for the result entry.
         stamp: EntryStamp,
+        /// Stamps for steering received while tool execution was in flight.
+        steer_stamps: Vec<EntryStamp>,
     },
     /// A summarization action completed.
     Summary {
@@ -360,6 +403,26 @@ pub enum MachineError {
     /// Prompt commands must introduce user-authored content.
     #[error("prompt input must be a user message")]
     InvalidPrompt,
+    /// Queued control-plane messages must be user-authored content.
+    #[error("queued input must be a user message")]
+    InvalidQueuedInput,
+    /// A pending queue identity was reused.
+    #[error("queue item {0} is already pending")]
+    DuplicateQueueItem(QueueId),
+    /// A cancellation named an item not currently pending.
+    #[error("queue item {0} is not pending")]
+    UnknownQueueItem(QueueId),
+    /// An abort was requested while no operation was active.
+    #[error("no operation is active")]
+    IdleAbort,
+    /// The shell supplied the wrong number of steering entry stamps.
+    #[error("expected {expected} steering stamps, received {actual}")]
+    SteerStampCount {
+        /// Number of pending steering items.
+        expected: usize,
+        /// Number of supplied stamps.
+        actual: usize,
+    },
     /// Compaction was requested without an enabled policy.
     #[error("compaction is disabled for this machine")]
     CompactionDisabled,
@@ -416,6 +479,8 @@ pub struct SessionMachine {
     leaf: Option<EntryId>,
     phase: Phase,
     last_input_tokens: u64,
+    queued: VecDeque<QueuedInput>,
+    abort_requested: bool,
 }
 
 impl SessionMachine {
@@ -450,6 +515,8 @@ impl SessionMachine {
             leaf,
             phase: Phase::Idle,
             last_input_tokens,
+            queued: VecDeque::new(),
+            abort_requested: false,
         })
     }
 
@@ -483,6 +550,142 @@ impl SessionMachine {
         .then_some(self.last_input_tokens)
     }
 
+    /// Rehydrates pending durable input before starting or resuming a run.
+    pub fn hydrate_queue(&mut self, queued: Vec<QueuedInput>) -> Result<(), MachineError> {
+        if self.phase != Phase::Idle {
+            return Err(MachineError::Busy);
+        }
+        if queued
+            .iter()
+            .any(|item| !matches!(item.message, SessionMessage::User { .. }))
+        {
+            return Err(MachineError::InvalidQueuedInput);
+        }
+        self.queued = queued.into();
+        Ok(())
+    }
+
+    /// Returns the number of pending steering messages.
+    #[must_use]
+    pub fn pending_steers(&self) -> usize {
+        self.queued
+            .iter()
+            .filter(|item| item.kind == QueueKind::Steer)
+            .count()
+    }
+
+    /// Returns whether any durable queued input remains.
+    #[must_use]
+    pub fn has_queued_input(&self) -> bool {
+        !self.queued.is_empty()
+    }
+
+    /// Applies one control-plane command while preserving the pending action.
+    pub fn accept_control(
+        &mut self,
+        control: SessionControl,
+        at: Timestamp,
+    ) -> Result<Vec<Effect>, MachineError> {
+        let op = self.active_op().cloned();
+        match control {
+            SessionControl::Enqueue { id, kind, message } => {
+                if !matches!(message, SessionMessage::User { .. }) {
+                    return Err(MachineError::InvalidQueuedInput);
+                }
+                if self.queued.iter().any(|item| item.id == id) {
+                    return Err(MachineError::DuplicateQueueItem(id));
+                }
+                let item = QueuedInput {
+                    id: id.clone(),
+                    kind,
+                    message: message.clone(),
+                };
+                self.queued.push_back(item);
+                let change = QueueChange::Enqueued { id, kind, message };
+                Ok(vec![
+                    record_effect(
+                        &at,
+                        RecordBody::QueueChanged {
+                            op,
+                            change: change.clone(),
+                        },
+                    ),
+                    Effect::Emit(AgentEvent::QueueChanged { change }),
+                ])
+            }
+            SessionControl::Cancel { id } => {
+                let Some(position) = self.queued.iter().position(|item| item.id == id) else {
+                    return Err(MachineError::UnknownQueueItem(id));
+                };
+                self.queued.remove(position);
+                let change = QueueChange::Cancelled { id };
+                Ok(vec![
+                    record_effect(
+                        &at,
+                        RecordBody::QueueChanged {
+                            op,
+                            change: change.clone(),
+                        },
+                    ),
+                    Effect::Emit(AgentEvent::QueueChanged { change }),
+                ])
+            }
+            SessionControl::Abort => {
+                let op = op.ok_or(MachineError::IdleAbort)?;
+                if self.abort_requested {
+                    return Ok(Vec::new());
+                }
+                self.abort_requested = true;
+                Ok(vec![
+                    record_effect(&at, RecordBody::AbortRequested { op: op.clone() }),
+                    Effect::Emit(AgentEvent::AbortRequested { op }),
+                ])
+            }
+        }
+    }
+
+    /// Removes the oldest queued item for a new operation after the current one ends.
+    pub fn pop_queued_input(&mut self) -> Option<QueuedInput> {
+        self.queued.pop_front()
+    }
+
+    /// Refreshes a pending provider action after the shell's pre-poll accepted steering.
+    pub fn prepare_action(
+        &mut self,
+        action: Action,
+        steer_stamps: Vec<EntryStamp>,
+    ) -> Result<(Vec<Effect>, Action), MachineError> {
+        let Action::StreamAssistant { model, origin, .. } = action else {
+            if steer_stamps.is_empty() {
+                return Ok((Vec::new(), action));
+            }
+            return Err(MachineError::SteerStampCount {
+                expected: 0,
+                actual: steer_stamps.len(),
+            });
+        };
+        let op = self.active_op().cloned().ok_or(MachineError::IdleAbort)?;
+        let mut effects = Vec::new();
+        self.drain_steers(&op, steer_stamps, &mut effects)?;
+        Ok((
+            effects,
+            Action::StreamAssistant {
+                request: self.request(),
+                model,
+                origin,
+            },
+        ))
+    }
+
+    fn active_op(&self) -> Option<&OpId> {
+        match &self.phase {
+            Phase::Idle => None,
+            Phase::AwaitingAssistant { op, .. }
+            | Phase::AwaitingSummary { op, .. }
+            | Phase::AwaitingTool(AwaitingTool { op, .. }) => Some(op),
+        }
+    }
+
     /// Handles an external or recovery command.
     pub fn handle(mut self, input: Input) -> Result<(Self, Step), MachineError> {
         match input {
@@ -492,6 +695,8 @@ impl SessionMachine {
                 stamp,
                 origin,
                 host,
+                queue,
+                steer_stamps,
             } => {
                 if self.phase != Phase::Idle {
                     return Err(MachineError::Busy);
@@ -504,6 +709,7 @@ impl SessionMachine {
                     parent: self.leaf.clone(),
                     lane: LaneName::main(),
                     op: Some(op.clone()),
+                    source_queue: queue,
                     at: stamp.at.clone(),
                     body: EntryBody::Message {
                         message: message.clone(),
@@ -515,7 +721,8 @@ impl SessionMachine {
                     step: 1,
                     origin,
                 };
-                let effects = vec![
+                self.abort_requested = false;
+                let mut effects = vec![
                     Effect::AppendEntry(entry),
                     record_effect(
                         &stamp.at,
@@ -526,15 +733,19 @@ impl SessionMachine {
                             host,
                         },
                     ),
-                    record_effect(
-                        &stamp.at,
-                        RecordBody::Step {
-                            op: op.clone(),
-                            n: 1,
-                        },
-                    ),
-                    Effect::Emit(AgentEvent::OperationStarted { op, origin }),
+                    Effect::Emit(AgentEvent::OperationStarted {
+                        op: op.clone(),
+                        origin,
+                    }),
                 ];
+                self.drain_steers(&op, steer_stamps, &mut effects)?;
+                effects.push(record_effect(
+                    &stamp.at,
+                    RecordBody::Step {
+                        op: op.clone(),
+                        n: 1,
+                    },
+                ));
                 let action = Action::StreamAssistant {
                     request: self.request(),
                     model: self.config.model.clone(),
@@ -624,7 +835,11 @@ impl SessionMachine {
                     },
                 ))
             }
-            Input::Resume { status, at } => match status {
+            Input::Resume {
+                status,
+                at,
+                steer_stamps,
+            } => match status {
                 LaneStatus::Idle => Ok((self, Step::Idle)),
                 LaneStatus::Suspended(mut suspended) => {
                     let op = suspended.op.clone();
@@ -645,7 +860,7 @@ impl SessionMachine {
                     }
 
                     if suspended.intent == OpIntent::Compaction {
-                        return self.resume_compaction(suspended, at, effects);
+                        return self.resume_compaction(suspended, at, effects, steer_stamps);
                     }
 
                     if suspended.abort_requested {
@@ -709,10 +924,17 @@ impl SessionMachine {
                                 },
                             ));
                         }
-                        return self.resume_after_assistant(suspended, message, at, effects);
+                        return self.resume_after_assistant(
+                            suspended,
+                            message,
+                            at,
+                            effects,
+                            steer_stamps,
+                        );
                     }
 
                     let next = suspended.last_step.unwrap_or(0) + 1;
+                    self.drain_steers(&op, steer_stamps, &mut effects)?;
                     self.phase = Phase::AwaitingAssistant {
                         op: op.clone(),
                         step: next,
@@ -748,6 +970,7 @@ impl SessionMachine {
         suspended: crate::SuspendedOp,
         at: Timestamp,
         mut effects: Vec<Effect>,
+        _steer_stamps: Vec<EntryStamp>,
     ) -> Result<(Self, Step), MachineError> {
         let op = suspended.op;
         if suspended.abort_requested {
@@ -852,6 +1075,7 @@ impl SessionMachine {
         message: AssistantMessage,
         at: Timestamp,
         mut effects: Vec<Effect>,
+        steer_stamps: Vec<EntryStamp>,
     ) -> Result<(Self, Step), MachineError> {
         let op = suspended.op;
         let step = suspended.last_step.unwrap_or(0);
@@ -859,6 +1083,33 @@ impl SessionMachine {
         let resolved_tool_calls = suspended.resolved_tool_calls;
         match message.stop {
             StopReason::Stop => {
+                if self.drain_steers(&op, steer_stamps, &mut effects)? {
+                    let next = step + 1;
+                    effects.push(record_effect(
+                        &at,
+                        RecordBody::Step {
+                            op: op.clone(),
+                            n: next,
+                        },
+                    ));
+                    self.phase = Phase::AwaitingAssistant {
+                        op,
+                        step: next,
+                        origin: Origin::Replay,
+                    };
+                    let action = Action::StreamAssistant {
+                        request: self.request(),
+                        model: self.config.model.clone(),
+                        origin: Origin::Replay,
+                    };
+                    return Ok((
+                        self,
+                        Step::Do {
+                            effects,
+                            action: Some(action),
+                        },
+                    ));
+                }
                 effects.extend(finish_effects(&op, OpOutcome::Completed, &at));
                 self.phase = Phase::Idle;
                 Ok((
@@ -972,6 +1223,7 @@ impl SessionMachine {
                 ))
             }
             StopReason::Paused => {
+                self.drain_steers(&op, steer_stamps, &mut effects)?;
                 let next = step + 1;
                 effects.push(record_effect(
                     &at,
@@ -1051,8 +1303,12 @@ impl SessionMachine {
         match (self.phase.clone(), outcome) {
             (
                 Phase::AwaitingAssistant { op, step, origin },
-                ActionOutcome::Assistant { result, stamp },
-            ) => self.resolve_assistant(op, step, origin, result, stamp),
+                ActionOutcome::Assistant {
+                    result,
+                    stamp,
+                    steer_stamps,
+                },
+            ) => self.resolve_assistant(op, step, origin, result, stamp, steer_stamps),
             (
                 Phase::AwaitingTool(pending),
                 ActionOutcome::Tool {
@@ -1061,6 +1317,7 @@ impl SessionMachine {
                     is_error,
                     details,
                     stamp,
+                    steer_stamps,
                 },
             ) => {
                 if call_id != pending.current.call.call_id {
@@ -1069,7 +1326,7 @@ impl SessionMachine {
                         actual: call_id,
                     });
                 }
-                self.resolve_tool(pending, content, is_error, details, stamp)
+                self.resolve_tool(pending, content, is_error, details, stamp, steer_stamps)
             }
             (
                 Phase::AwaitingSummary {
@@ -1097,6 +1354,7 @@ impl SessionMachine {
         origin: Origin,
         result: Result<AssistantMessage, ProviderError>,
         stamp: EntryStamp,
+        steer_stamps: Vec<EntryStamp>,
     ) -> Result<(Self, Step), MachineError> {
         let message = match result {
             Ok(message) => message,
@@ -1118,6 +1376,7 @@ impl SessionMachine {
             parent: self.leaf.clone(),
             lane: LaneName::main(),
             op: Some(op.clone()),
+            source_queue: None,
             at: stamp.at.clone(),
             body: EntryBody::Message {
                 message: stored.clone(),
@@ -1139,8 +1398,48 @@ impl SessionMachine {
             }),
         ];
 
+        if self.abort_requested {
+            effects.extend(finish_effects(&op, OpOutcome::Aborted, &stamp.at));
+            self.phase = Phase::Idle;
+            self.abort_requested = false;
+            return Ok((
+                self,
+                Step::Do {
+                    effects,
+                    action: None,
+                },
+            ));
+        }
+
         match message.stop {
             StopReason::Stop => {
+                if self.drain_steers(&op, steer_stamps, &mut effects)? {
+                    let next = step + 1;
+                    effects.push(record_effect(
+                        &stamp.at,
+                        RecordBody::Step {
+                            op: op.clone(),
+                            n: next,
+                        },
+                    ));
+                    self.phase = Phase::AwaitingAssistant {
+                        op,
+                        step: next,
+                        origin,
+                    };
+                    let action = Action::StreamAssistant {
+                        request: self.request(),
+                        model: self.config.model.clone(),
+                        origin,
+                    };
+                    return Ok((
+                        self,
+                        Step::Do {
+                            effects,
+                            action: Some(action),
+                        },
+                    ));
+                }
                 effects.extend(finish_effects(&op, OpOutcome::Completed, &stamp.at));
                 self.phase = Phase::Idle;
                 Ok((
@@ -1204,6 +1503,7 @@ impl SessionMachine {
                 ))
             }
             StopReason::Paused => {
+                self.drain_steers(&op, steer_stamps, &mut effects)?;
                 let next = step + 1;
                 effects.push(record_effect(
                     &stamp.at,
@@ -1280,6 +1580,7 @@ impl SessionMachine {
         is_error: bool,
         details: Option<Value>,
         stamp: EntryStamp,
+        steer_stamps: Vec<EntryStamp>,
     ) -> Result<(Self, Step), MachineError> {
         let AwaitingTool {
             op,
@@ -1300,6 +1601,7 @@ impl SessionMachine {
             parent: self.leaf.clone(),
             lane: LaneName::main(),
             op: Some(op.clone()),
+            source_queue: None,
             at: stamp.at.clone(),
             body: EntryBody::Message {
                 message: message.clone(),
@@ -1313,6 +1615,19 @@ impl SessionMachine {
                 message,
             }),
         ];
+
+        if self.abort_requested {
+            effects.extend(finish_effects(&op, OpOutcome::Aborted, &stamp.at));
+            self.phase = Phase::Idle;
+            self.abort_requested = false;
+            return Ok((
+                self,
+                Step::Do {
+                    effects,
+                    action: None,
+                },
+            ));
+        }
 
         if let Some(next) = remaining.pop_front() {
             if next.journal_start {
@@ -1341,6 +1656,7 @@ impl SessionMachine {
 
         match after {
             AfterTools::Stream => {
+                self.drain_steers(&op, steer_stamps, &mut effects)?;
                 let next_step = step + 1;
                 effects.push(record_effect(
                     &stamp.at,
@@ -1388,6 +1704,9 @@ impl SessionMachine {
         result: Result<CompactionSummary, ProviderError>,
         stamp: EntryStamp,
     ) -> Result<(Self, Step), MachineError> {
+        if self.abort_requested {
+            return Ok(self.finish(op, OpOutcome::Aborted, &stamp.at));
+        }
         let summary = match result {
             Ok(summary) => summary,
             Err(error) => {
@@ -1406,6 +1725,7 @@ impl SessionMachine {
             parent: self.leaf.clone(),
             lane: LaneName::main(),
             op: Some(op.clone()),
+            source_queue: None,
             at: stamp.at.clone(),
             body: EntryBody::Compaction {
                 summary: summary.text.clone(),
@@ -1530,6 +1850,54 @@ impl SessionMachine {
         }
     }
 
+    fn drain_steers(
+        &mut self,
+        op: &OpId,
+        stamps: Vec<EntryStamp>,
+        effects: &mut Vec<Effect>,
+    ) -> Result<bool, MachineError> {
+        let expected = self.pending_steers();
+        if stamps.len() != expected {
+            return Err(MachineError::SteerStampCount {
+                expected,
+                actual: stamps.len(),
+            });
+        }
+        let mut stamps = stamps.into_iter();
+        let mut remaining = VecDeque::new();
+        let mut drained = false;
+        while let Some(item) = self.queued.pop_front() {
+            if item.kind == QueueKind::FollowUp {
+                remaining.push_back(item);
+                continue;
+            }
+            let stamp = stamps
+                .next()
+                .expect("steering stamp count was checked before draining");
+            let message = item.message;
+            let entry = NewEntry {
+                id: stamp.id,
+                parent: self.leaf.clone(),
+                lane: LaneName::main(),
+                op: Some(op.clone()),
+                source_queue: Some(item.id),
+                at: stamp.at,
+                body: EntryBody::Message {
+                    message: message.clone(),
+                },
+            };
+            self.remember_entry(&entry);
+            effects.push(Effect::AppendEntry(entry));
+            effects.push(Effect::Emit(AgentEvent::MessageAppended {
+                op: op.clone(),
+                message,
+            }));
+            drained = true;
+        }
+        self.queued = remaining;
+        Ok(drained)
+    }
+
     fn remember_entry(&mut self, entry: &NewEntry) {
         self.leaf = Some(entry.id.clone());
         self.entries.push(Entry {
@@ -1538,6 +1906,7 @@ impl SessionMachine {
             parent: entry.parent.clone(),
             lane: entry.lane.clone(),
             op: entry.op.clone(),
+            source_queue: entry.source_queue.clone(),
             at: entry.at.clone(),
             body: entry.body.clone(),
         });
@@ -1548,6 +1917,7 @@ impl SessionMachine {
 
     fn finish(mut self, op: OpId, outcome: OpOutcome, at: &Timestamp) -> (Self, Step) {
         self.phase = Phase::Idle;
+        self.abort_requested = false;
         (
             self,
             Step::Do {
@@ -1652,6 +2022,7 @@ mod tests {
             parent: None,
             lane: LaneName::main(),
             op: Some(op.clone()),
+            source_queue: None,
             at: Timestamp::from("t1"),
             body: EntryBody::Message {
                 message: SessionMessage::user("hello"),
@@ -1663,6 +2034,7 @@ mod tests {
             parent: Some(user.id.clone()),
             lane: LaneName::main(),
             op: Some(op.clone()),
+            source_queue: None,
             at: Timestamp::from("t3"),
             body: EntryBody::Message {
                 message: SessionMessage::Assistant(message.clone()),
@@ -1716,6 +2088,8 @@ mod tests {
                 stamp: stamp("user"),
                 origin: Origin::External,
                 host: None,
+                queue: None,
+                steer_stamps: Vec::new(),
             })
             .unwrap()
         else {
@@ -1734,6 +2108,7 @@ mod tests {
                     vec![ContentBlock::text("done")],
                 )),
                 stamp: stamp("assistant"),
+                steer_stamps: Vec::new(),
             })
             .unwrap()
         else {
@@ -1754,6 +2129,154 @@ mod tests {
     }
 
     #[test]
+    fn steering_received_in_flight_is_durable_and_continues_the_same_operation() {
+        let machine = SessionMachine::new(config(), Vec::new()).unwrap();
+        let (mut machine, _) = machine
+            .handle(Input::Prompt {
+                message: SessionMessage::user("initial"),
+                op: OpId::from("op"),
+                stamp: stamp("initial"),
+                origin: Origin::External,
+                host: None,
+                queue: None,
+                steer_stamps: Vec::new(),
+            })
+            .unwrap();
+        let effects = machine
+            .accept_control(
+                SessionControl::Enqueue {
+                    id: QueueId::from("steer"),
+                    kind: QueueKind::Steer,
+                    message: SessionMessage::user("course correction"),
+                },
+                Timestamp::from("t-control"),
+            )
+            .unwrap();
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::AppendRecord(NewRecord {
+                body: RecordBody::QueueChanged {
+                    op: Some(op),
+                    change: QueueChange::Enqueued { id, .. },
+                },
+                ..
+            }) if op == &OpId::from("op") && id == &QueueId::from("steer")
+        )));
+
+        let (machine, Step::Do { effects, action }) = machine
+            .resolve(ActionOutcome::Assistant {
+                result: Ok(assistant(
+                    StopReason::Stop,
+                    vec![ContentBlock::text("first answer")],
+                )),
+                stamp: stamp("assistant"),
+                steer_stamps: vec![stamp("steer-entry")],
+            })
+            .unwrap()
+        else {
+            panic!("expected steered continuation");
+        };
+        assert!(!machine.is_idle());
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::AppendEntry(NewEntry {
+                source_queue: Some(id),
+                ..
+            }) if id == &QueueId::from("steer")
+        )));
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::AppendRecord(NewRecord {
+                body: RecordBody::OpFinished { .. },
+                ..
+            })
+        )));
+        let Some(Action::StreamAssistant { request, .. }) = action else {
+            panic!("expected another provider step");
+        };
+        assert_eq!(
+            request.messages,
+            [
+                rho_ai::Message::user("initial"),
+                rho_ai::Message::Assistant(assistant(
+                    StopReason::Stop,
+                    vec![ContentBlock::text("first answer")],
+                )),
+                rho_ai::Message::user("course correction"),
+            ]
+        );
+    }
+
+    #[test]
+    fn follow_up_waits_for_the_next_operation_and_abort_is_journaled() {
+        let machine = SessionMachine::new(config(), Vec::new()).unwrap();
+        let (mut machine, _) = machine
+            .handle(Input::Prompt {
+                message: SessionMessage::user("initial"),
+                op: OpId::from("op"),
+                stamp: stamp("initial"),
+                origin: Origin::External,
+                host: None,
+                queue: None,
+                steer_stamps: Vec::new(),
+            })
+            .unwrap();
+        machine
+            .accept_control(
+                SessionControl::Enqueue {
+                    id: QueueId::from("follow"),
+                    kind: QueueKind::FollowUp,
+                    message: SessionMessage::user("next task"),
+                },
+                Timestamp::from("t-control"),
+            )
+            .unwrap();
+        let abort_effects = machine
+            .accept_control(SessionControl::Abort, Timestamp::from("t-abort"))
+            .unwrap();
+        assert!(abort_effects.iter().any(|effect| matches!(
+            effect,
+            Effect::AppendRecord(NewRecord {
+                body: RecordBody::AbortRequested { op },
+                ..
+            }) if op == &OpId::from("op")
+        )));
+        let (mut machine, Step::Do { effects, action }) = machine
+            .resolve(ActionOutcome::Assistant {
+                result: Ok(assistant(
+                    StopReason::Stop,
+                    vec![ContentBlock::text("raced with abort")],
+                )),
+                stamp: stamp("assistant"),
+                steer_stamps: Vec::new(),
+            })
+            .unwrap()
+        else {
+            panic!("expected abort completion");
+        };
+        assert!(machine.is_idle());
+        assert!(action.is_none());
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::AppendRecord(NewRecord {
+                body: RecordBody::OpFinished {
+                    outcome: OpOutcome::Aborted,
+                    ..
+                },
+                ..
+            })
+        )));
+        assert_eq!(
+            machine.pop_queued_input(),
+            Some(QueuedInput {
+                id: QueueId::from("follow"),
+                kind: QueueKind::FollowUp,
+                message: SessionMessage::user("next task"),
+            })
+        );
+    }
+
+    #[test]
     fn tool_calls_are_journaled_before_the_shell_action() {
         let machine = SessionMachine::new(config(), Vec::new()).unwrap();
         let (machine, _) = machine
@@ -1763,10 +2286,12 @@ mod tests {
                 stamp: stamp("user"),
                 origin: Origin::External,
                 host: None,
+                queue: None,
+                steer_stamps: Vec::new(),
             })
             .unwrap();
         let call_id = ToolCallId::from("call");
-        let (machine, Step::Do { effects, action }) = machine
+        let (mut machine, Step::Do { effects, action }) = machine
             .resolve(ActionOutcome::Assistant {
                 result: Ok(assistant(
                     StopReason::ToolUse,
@@ -1777,6 +2302,7 @@ mod tests {
                     }],
                 )),
                 stamp: stamp("assistant"),
+                steer_stamps: Vec::new(),
             })
             .unwrap()
         else {
@@ -1789,7 +2315,23 @@ mod tests {
                 ..
             })
         )));
-        assert!(matches!(action, Some(Action::ExecuteTool { .. })));
+        let action = action.expect("expected tool action");
+        assert!(matches!(action, Action::ExecuteTool { .. }));
+
+        machine
+            .accept_control(
+                SessionControl::Enqueue {
+                    id: QueueId::from("steer"),
+                    kind: QueueKind::Steer,
+                    message: SessionMessage::user("adjust after the tool"),
+                },
+                Timestamp::from("t-control"),
+            )
+            .unwrap();
+        let (effects, action) = machine.prepare_action(action, Vec::new()).unwrap();
+        assert!(effects.is_empty());
+        assert!(matches!(action, Action::ExecuteTool { .. }));
+        assert_eq!(machine.pending_steers(), 1);
 
         let (_, Step::Do { action, .. }) = machine
             .resolve(ActionOutcome::Tool {
@@ -1798,12 +2340,20 @@ mod tests {
                 is_error: false,
                 details: None,
                 stamp: stamp("result"),
+                steer_stamps: vec![stamp("steer-result")],
             })
             .unwrap()
         else {
             panic!("expected next provider action");
         };
-        assert!(matches!(action, Some(Action::StreamAssistant { .. })));
+        let Some(Action::StreamAssistant { request, .. }) = action else {
+            panic!("expected next provider action");
+        };
+        assert!(matches!(
+            request.messages.last(),
+            Some(rho_ai::Message::User { content })
+                if content == &vec![ContentBlock::text("adjust after the tool")]
+        ));
     }
 
     #[test]
@@ -1816,6 +2366,8 @@ mod tests {
                 stamp: stamp("user"),
                 origin: Origin::External,
                 host: None,
+                queue: None,
+                steer_stamps: Vec::new(),
             })
             .unwrap();
         let (_, Step::Do { effects, action }) = machine
@@ -1829,6 +2381,7 @@ mod tests {
                     }],
                 )),
                 stamp: stamp("assistant"),
+                steer_stamps: Vec::new(),
             })
             .unwrap()
         else {
@@ -1861,6 +2414,7 @@ mod tests {
                 .handle(Input::Resume {
                     status,
                     at: Timestamp::from("resume"),
+                    steer_stamps: Vec::new(),
                 })
                 .unwrap()
             else {
@@ -1905,6 +2459,7 @@ mod tests {
             .handle(Input::Resume {
                 status,
                 at: Timestamp::from("resume"),
+                steer_stamps: Vec::new(),
             })
             .unwrap()
         else {
@@ -1964,6 +2519,7 @@ mod tests {
             parent: Some(EntryId::from("assistant")),
             lane: LaneName::main(),
             op: Some(OpId::from("op")),
+            source_queue: None,
             at: Timestamp::from("t5"),
             body: EntryBody::Message {
                 message: SessionMessage::ToolResult {
@@ -1983,6 +2539,7 @@ mod tests {
             .handle(Input::Resume {
                 status,
                 at: Timestamp::from("resume"),
+                steer_stamps: Vec::new(),
             })
             .unwrap()
         else {
@@ -2010,6 +2567,7 @@ mod tests {
             .handle(Input::Resume {
                 status,
                 at: Timestamp::from("resume"),
+                steer_stamps: Vec::new(),
             })
             .unwrap()
         else {
@@ -2039,6 +2597,7 @@ mod tests {
             parent: None,
             lane: LaneName::main(),
             op: Some(OpId::from("op")),
+            source_queue: None,
             at: Timestamp::from("t1"),
             body: EntryBody::Message {
                 message: SessionMessage::user("durable prompt"),
@@ -2050,6 +2609,7 @@ mod tests {
             .handle(Input::Resume {
                 status,
                 at: Timestamp::from("resume"),
+                steer_stamps: Vec::new(),
             })
             .unwrap()
         else {
@@ -2083,6 +2643,7 @@ mod tests {
             parent: None,
             lane: LaneName::main(),
             op: None,
+            source_queue: None,
             at: Timestamp::from("t"),
             body: EntryBody::SettingsChange {
                 model: Some(crate::ModelRef {
@@ -2102,6 +2663,8 @@ mod tests {
                 stamp: stamp("valid-entry"),
                 origin: Origin::External,
                 host: None,
+                queue: None,
+                steer_stamps: Vec::new(),
             })
             .unwrap()
         else {
@@ -2120,6 +2683,8 @@ mod tests {
                 stamp: stamp("entry"),
                 origin: Origin::External,
                 host: None,
+                queue: None,
+                steer_stamps: Vec::new(),
             })
             .unwrap_err();
         assert_eq!(error, MachineError::InvalidPrompt);
@@ -2151,6 +2716,7 @@ mod tests {
                 parent: prior.clone(),
                 lane: LaneName::main(),
                 op: None,
+                source_queue: None,
                 at: Timestamp::from("t"),
                 body: EntryBody::Message { message },
             };
@@ -2249,6 +2815,7 @@ mod tests {
             parent: Some(EntryId::from("e3")),
             lane: LaneName::main(),
             op: Some(op.clone()),
+            source_queue: None,
             at: Timestamp::from("t6"),
             body: EntryBody::Compaction {
                 summary: "summary".to_owned(),
@@ -2313,6 +2880,7 @@ mod tests {
             .handle(Input::Resume {
                 status,
                 at: Timestamp::from("t8"),
+                steer_stamps: Vec::new(),
             })
             .unwrap()
         else {

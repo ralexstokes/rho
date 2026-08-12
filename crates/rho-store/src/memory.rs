@@ -134,6 +134,7 @@ impl SessionRepo for MemoryRepo {
                 .map(|(index, mut entry)| {
                     entry.seq = u64::try_from(index).unwrap_or(u64::MAX) + 1;
                     entry.op = None;
+                    entry.source_queue = None;
                     Item::Entry(entry)
                 })
                 .collect::<Vec<_>>();
@@ -336,6 +337,7 @@ mod tests {
                 parent: None,
                 lane: LaneName::main(),
                 op: None,
+                source_queue: None,
                 at: rho_core::Timestamp::from("t1"),
                 body: rho_core::EntryBody::Message {
                     message: rho_core::SessionMessage::user("read"),
@@ -348,6 +350,7 @@ mod tests {
                 parent: Some(root),
                 lane: LaneName::main(),
                 op: None,
+                source_queue: None,
                 at: rho_core::Timestamp::from("t2"),
                 body: rho_core::EntryBody::Message {
                     message: rho_core::SessionMessage::Assistant(AssistantMessage {

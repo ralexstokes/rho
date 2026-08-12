@@ -229,6 +229,7 @@ mod tests {
             parent: None,
             lane: LaneName::main(),
             op: None,
+            source_queue: None,
             at: Timestamp::from("2026-08-11T00:00:01Z"),
             body: EntryBody::Message {
                 message: SessionMessage::user(text),
