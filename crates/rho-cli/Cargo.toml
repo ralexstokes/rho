@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "rho"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
@@ -14,6 +18,7 @@ rho-agent.workspace = true
 rho-ai.workspace = true
 rho-ai-anthropic.workspace = true
 rho-ai-openai.workspace = true
+rho-core.workspace = true
 rho-rpc.workspace = true
 rho-store.workspace = true
 rho-tools.workspace = true

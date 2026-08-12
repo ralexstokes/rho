@@ -5,6 +5,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     sync::mpsc,
+    task::JoinSet,
 };
 
 use crate::{
@@ -112,15 +113,17 @@ where
     let mut reader = BufReader::new(reader);
     let (outbound, mut messages) = mpsc::channel(OUTBOUND_CAPACITY);
     let sender = RpcSender { outbound };
+    let mut handlers = JoinSet::new();
     loop {
         tokio::select! {
             frame = read_frame(&mut reader) => {
                 let Some(frame) = frame? else {
+                    drain_handlers(&mut handlers, &mut messages, &mut writer).await?;
                     return Ok(());
                 };
                 match decode_client_line(&frame)? {
                     ClientMessage::Request(request) => {
-                        dispatch_request(Arc::clone(&handler), sender.clone(), request);
+                        dispatch_request(&mut handlers, Arc::clone(&handler), sender.clone(), request);
                     }
                     ClientMessage::Response(response) => {
                         if response.v != VERSION {
@@ -129,7 +132,7 @@ where
                                 response.v
                             )).into());
                         }
-                        dispatch_response(Arc::clone(&handler), sender.clone(), response);
+                        dispatch_response(&mut handlers, Arc::clone(&handler), sender.clone(), response);
                     }
                 }
             }
@@ -137,18 +140,22 @@ where
                 let Some(message) = message else {
                     return Ok(());
                 };
-                writer.write_all(&encode_server_line(&message)?).await?;
-                writer.flush().await?;
+                write_message(&mut writer, message).await?;
             }
+            _ = handlers.join_next(), if !handlers.is_empty() => {}
         }
     }
 }
 
-fn dispatch_request<H>(handler: Arc<H>, sender: RpcSender, request: ClientRequest)
-where
+fn dispatch_request<H>(
+    handlers: &mut JoinSet<()>,
+    handler: Arc<H>,
+    sender: RpcSender,
+    request: ClientRequest,
+) where
     H: RpcHandler,
 {
-    tokio::spawn(async move {
+    handlers.spawn(async move {
         let id = request.id.clone();
         let response = if request.v == VERSION {
             match handler.request(request, sender.clone()).await {
@@ -169,11 +176,15 @@ where
     });
 }
 
-fn dispatch_response<H>(handler: Arc<H>, sender: RpcSender, response: ClientResponse)
-where
+fn dispatch_response<H>(
+    handlers: &mut JoinSet<()>,
+    handler: Arc<H>,
+    sender: RpcSender,
+    response: ClientResponse,
+) where
     H: RpcHandler,
 {
-    tokio::spawn(async move {
+    handlers.spawn(async move {
         let id = response.id.clone();
         if let Err(error) = handler.response(response, sender.clone()).await {
             let _ = sender
@@ -184,6 +195,40 @@ where
                 .await;
         }
     });
+}
+
+async fn drain_handlers<W>(
+    handlers: &mut JoinSet<()>,
+    messages: &mut mpsc::Receiver<ServerMessage>,
+    writer: &mut W,
+) -> Result<(), ServeError>
+where
+    W: AsyncWrite + Unpin,
+{
+    while !handlers.is_empty() {
+        tokio::select! {
+            _ = handlers.join_next() => {}
+            message = messages.recv() => {
+                let Some(message) = message else {
+                    return Ok(());
+                };
+                write_message(writer, message).await?;
+            }
+        }
+    }
+    while let Ok(message) = messages.try_recv() {
+        write_message(writer, message).await?;
+    }
+    Ok(())
+}
+
+async fn write_message<W>(writer: &mut W, message: ServerMessage) -> Result<(), ServeError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(&encode_server_line(&message)?).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 async fn read_frame<R>(reader: &mut R) -> Result<Option<Vec<u8>>, ServeError>

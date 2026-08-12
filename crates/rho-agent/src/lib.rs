@@ -176,7 +176,7 @@ impl BoundProvider {
 }
 
 /// Shell source for pre-minted deterministic transition stamps.
-pub trait StampSource {
+pub trait StampSource: Send {
     /// Mints a UUIDv7 operation identity.
     fn op_id(&mut self) -> OpId;
 
