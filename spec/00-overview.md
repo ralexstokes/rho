@@ -204,12 +204,15 @@ is the normal case, not a special one.
 
 ### 2.3 `rho-tools`
 
-Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. Semantics
-worth adopting from pi even without conformance (they encode real failure modes):
-edit does exact-then-fuzzy matching (unicode quote/dash + trailing-whitespace
-normalization) with uniqueness and overlap errors; per-file mutation serialization
-keyed on canonical path (parallel tools!); BOM/line-ending preservation; head/tail
-truncation with explicit markers; grep/find shell out to `rg`/`fd`.
+The v1 default is pi's compact coding quartet: `read`, `write`, `edit`, and
+`bash`. `grep`, `find`, and `ls` remain candidates only if shell composition is
+not sufficient in practice. The built-ins adopt pi's important failure
+semantics: edit does exact-then-normalized matching (Unicode quote/dash/space
+and trailing-whitespace normalization) with uniqueness and overlap errors;
+per-file mutations serialize on a canonical path while different files remain
+parallel; edits preserve BOMs and line endings; and read/bash output has bounded
+head/tail truncation with explicit markers. Relative paths resolve from the
+configured working directory and absolute paths remain available.
 
 **MCP is the first extensibility mechanism** — it's the ecosystem standard for
 tools and both nanocodex and rig already speak it. Tool extensibility should not
