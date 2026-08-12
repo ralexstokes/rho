@@ -70,10 +70,21 @@ async fn main() -> Result<()> {
 }
 
 async fn serve_stdio(sessions: PathBuf, config: HostConfig) -> Result<()> {
-    let host = Arc::new(HeadlessHost::new(sessions, config)?);
-    let result = rho_rpc::serve(tokio::io::stdin(), tokio::io::stdout(), Arc::clone(&host)).await;
-    host.shutdown().await;
-    result.context("serve RPC over stdio")
+    let host = Arc::new(HeadlessHost::new(sessions, config).await?);
+    let result = tokio::select! {
+        result = rho_rpc::serve(tokio::io::stdin(), tokio::io::stdout(), Arc::clone(&host)) => {
+            Some(result)
+        }
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("listen for Ctrl-C")?;
+            None
+        }
+    };
+    host.shutdown().await?;
+    if let Some(result) = result {
+        result.context("serve RPC over stdio")?;
+    }
+    Ok(())
 }
 
 async fn serve_unix(path: PathBuf, sessions: PathBuf, config: HostConfig) -> Result<()> {
@@ -97,12 +108,24 @@ async fn serve_unix(path: PathBuf, sessions: PathBuf, config: HostConfig) -> Res
                 break;
             }
         };
-        let host = Arc::new(HeadlessHost::new(sessions.clone(), config.clone())?);
+        let host = Arc::new(HeadlessHost::new(sessions.clone(), config.clone()).await?);
         let (reader, writer) = stream.into_split();
-        if let Err(error) = rho_rpc::serve(reader, writer, Arc::clone(&host)).await {
-            eprintln!("rho RPC connection failed: {error}");
+        let stop = tokio::select! {
+            result = rho_rpc::serve(reader, writer, Arc::clone(&host)) => {
+                if let Err(error) = result {
+                    eprintln!("rho RPC connection failed: {error}");
+                }
+                false
+            }
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("listen for Ctrl-C")?;
+                true
+            }
+        };
+        host.shutdown().await?;
+        if stop {
+            break;
         }
-        host.shutdown().await;
     }
     drop(listener);
     drop(socket);

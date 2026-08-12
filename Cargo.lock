@@ -367,6 +367,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1458,6 +1464,7 @@ dependencies = [
  "rho-ai-openai",
  "rho-core",
  "rho-rpc",
+ "rho-shelterwood",
  "rho-store",
  "rho-tools",
  "serde",
@@ -1516,6 +1523,9 @@ version = "0.1.0"
 dependencies = [
  "rho-agent",
  "rho-core",
+ "shelterwood",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1778,6 +1788,58 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+]
+
+[[package]]
+name = "shelterwood"
+version = "0.1.0"
+source = "git+https://github.com/ralexstokes/shelterwood.git?rev=02d2f236ac6f29dacf1dce5bd72c72b4bbdf790b#02d2f236ac6f29dacf1dce5bd72c72b4bbdf790b"
+dependencies = [
+ "shelterwood-cells",
+ "shelterwood-core",
+ "shelterwood-mailbox",
+ "shelterwood-runtime",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "shelterwood-cells"
+version = "0.1.0"
+source = "git+https://github.com/ralexstokes/shelterwood.git?rev=02d2f236ac6f29dacf1dce5bd72c72b4bbdf790b#02d2f236ac6f29dacf1dce5bd72c72b4bbdf790b"
+dependencies = [
+ "shelterwood-core",
+ "shelterwood-mailbox",
+ "shelterwood-runtime",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "shelterwood-core"
+version = "0.1.0"
+source = "git+https://github.com/ralexstokes/shelterwood.git?rev=02d2f236ac6f29dacf1dce5bd72c72b4bbdf790b#02d2f236ac6f29dacf1dce5bd72c72b4bbdf790b"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "shelterwood-mailbox"
+version = "0.1.0"
+source = "git+https://github.com/ralexstokes/shelterwood.git?rev=02d2f236ac6f29dacf1dce5bd72c72b4bbdf790b#02d2f236ac6f29dacf1dce5bd72c72b4bbdf790b"
+dependencies = [
+ "shelterwood-core",
+ "shelterwood-runtime",
+]
+
+[[package]]
+name = "shelterwood-runtime"
+version = "0.1.0"
+source = "git+https://github.com/ralexstokes/shelterwood.git?rev=02d2f236ac6f29dacf1dce5bd72c72b4bbdf790b#02d2f236ac6f29dacf1dce5bd72c72b4bbdf790b"
+dependencies = [
+ "fastrand",
+ "shelterwood-core",
+ "tokio",
 ]
 
 [[package]]
@@ -2077,7 +2139,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
  "pin-project-lite",
+ "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-attributes"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

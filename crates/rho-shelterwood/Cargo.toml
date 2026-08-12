@@ -10,3 +10,6 @@ workspace = true
 [dependencies]
 rho-agent.workspace = true
 rho-core.workspace = true
+shelterwood.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

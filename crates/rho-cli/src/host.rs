@@ -3,9 +3,10 @@ use std::{
     io::Write as _,
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -24,11 +25,16 @@ use rho_rpc::{
     ClientRequest, ClientResponse, ErrorObject, HandlerFuture, ResponsePayload, RpcHandler, RpcId,
     RpcSender,
 };
+use rho_shelterwood::{
+    Actor, ActorDef, ActorRef, CallError, CallErrorKind, Context as ActorContext, ExitError,
+    ExitResult, Incarnation, Mailbox, Reply, RestartPolicy, SessionHandle,
+    ShelterwoodCancellationToken, StopContext, SupervisedSessions,
+};
 use rho_store::{CreateOptions, ForkPoint, JsonlRepo, Session, SessionError, SessionRepo};
 use rho_tools::{McpConnection, ToolSet, coding_tools};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::Mutex;
 
 use crate::{config::HostConfig, credentials::credential_source};
 
@@ -44,6 +50,7 @@ pub(crate) struct HeadlessHost {
     config: HostConfig,
     factories: Factories,
     actors: Mutex<BTreeMap<SessionId, ActorSlot>>,
+    supervisor: SupervisedSessions,
 }
 
 #[derive(Clone)]
@@ -109,35 +116,56 @@ impl Factories {
 
 #[derive(Clone)]
 struct ActorHandle {
-    commands: mpsc::Sender<ActorCommand>,
-    controls: ControlSender,
+    actor: ActorRef<ActorCommand>,
+    controls: Arc<ControlHub>,
     busy: Arc<AtomicBool>,
 }
 
 struct ActorSlot {
     handle: ActorHandle,
-    task: tokio::task::JoinHandle<()>,
+    _session: SessionHandle<ActorCommand>,
 }
 
 enum ActorCommand {
     Prompt {
         text: String,
-        accepted: oneshot::Sender<Result<(), ErrorObject>>,
+        accepted: Reply<Result<(), ErrorObject>>,
     },
     Compact {
-        accepted: oneshot::Sender<Result<(), ErrorObject>>,
+        accepted: Reply<Result<(), ErrorObject>>,
     },
     Configure {
         provider: Option<String>,
         model: Option<String>,
         thinking: Option<ThinkingLevel>,
-        completed: oneshot::Sender<Result<(), ErrorObject>>,
+        completed: Reply<Result<(), ErrorObject>>,
     },
-    Shutdown,
+}
+
+#[derive(Default)]
+struct ControlHub {
+    current: StdMutex<Option<ControlSender>>,
+}
+
+impl ControlHub {
+    fn install(&self, sender: ControlSender) {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
+    }
+
+    fn sender(&self) -> Result<ControlSender, ErrorObject> {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| ErrorObject::new("internal", "session actor is between incarnations"))
+    }
 }
 
 impl HeadlessHost {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         directory: impl Into<std::path::PathBuf>,
         config: HostConfig,
     ) -> Result<Self> {
@@ -145,26 +173,28 @@ impl HeadlessHost {
         factories
             .validate_model(&config.model)
             .map_err(|error| anyhow!(error.message))?;
+        let supervisor = SupervisedSessions::start().await?;
         Ok(Self {
             repo: Arc::new(JsonlRepo::new(directory)),
             config,
             factories,
             actors: Mutex::new(BTreeMap::new()),
+            supervisor,
         })
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) -> Result<()> {
         let actors = {
             let mut actors = self.actors.lock().await;
             std::mem::take(&mut *actors)
         };
         for actor in actors.values() {
-            let _ = actor.handle.controls.abort();
-            let _ = actor.handle.commands.send(ActorCommand::Shutdown).await;
+            if let Ok(controls) = actor.handle.controls.sender() {
+                let _ = controls.abort();
+            }
         }
-        for (_, actor) in actors {
-            let _ = actor.task.await;
-        }
+        self.supervisor.shutdown().await?;
+        Ok(())
     }
 
     async fn create(&self, cwd: String, outbound: RpcSender) -> Result<Value, ErrorObject> {
@@ -223,63 +253,61 @@ impl HeadlessHost {
         outbound: RpcSender,
     ) -> Result<(), ErrorObject> {
         let id = session.header().id.clone();
-        let cwd = session.header().cwd.clone();
-        let (tools, mcp) = build_tools(&self.config, &cwd).await?;
-        let base = self.config.machine(tools.specs());
-        let entries = session.branch(None).map_err(store_error)?;
-        let machine = SessionMachine::new(base.clone(), entries).map_err(|error| {
-            ErrorObject::new("conflict", format!("invalid session context: {error}"))
-        })?;
-        let status = session.lane_status().map_err(store_error)?;
-        if let LaneStatus::Corrupt(reason) = &status {
-            return Err(ErrorObject::new(
-                "conflict",
-                format!("session journal is corrupt: {reason:?}"),
-            ));
-        }
-        let provider = BoundProvider::open(
-            self.factories.get(&machine.model().provider)?,
-            machine.model().clone(),
-        )
-        .await
-        .map_err(|error| ErrorObject::new("invalid_params", error.to_string()))?;
-        let (commands, receiver) = mpsc::channel(32);
-        let (controls, control_receiver) = control_channel();
-        let busy = Arc::new(AtomicBool::new(!matches!(status, LaneStatus::Idle)));
-        let handle = ActorHandle {
-            commands,
-            controls,
-            busy: Arc::clone(&busy),
-        };
-        let (ready, ready_receiver) = oneshot::channel();
-        let actor = SessionActor {
+        drop(session);
+        let controls = Arc::new(ControlHub::default());
+        let busy = Arc::new(AtomicBool::new(true));
+        let startup_error = Arc::new(StdMutex::new(None));
+        let args = SessionArgs {
             id: id.clone(),
-            session,
-            machine,
-            provider,
-            tools,
-            _mcp: mcp,
-            base,
+            config: self.config.clone(),
             factories: self.factories.clone(),
             repo: Arc::clone(&self.repo),
             outbound,
-            commands: receiver,
-            controls: control_receiver,
+            controls: Arc::clone(&controls),
+            busy: Arc::clone(&busy),
+            startup_error: Arc::clone(&startup_error),
+        };
+        let definition = ActorDef::<SessionActor>::cloned(args)
+            .mailbox(Mailbox::queue(32).map_err(supervisor_error)?)
+            .restart(RestartPolicy::default());
+        let session = match self
+            .supervisor
+            .add(format!("session-{id}"), definition)
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                if let Some(error) = startup_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    return Err(error);
+                }
+                return Err(supervisor_error(error));
+            }
+        };
+        let handle = ActorHandle {
+            actor: session.actor().clone(),
+            controls,
             busy,
         };
-        let task = tokio::spawn(actor.run(status, ready));
-        ready_receiver
-            .await
-            .map_err(|_| ErrorObject::new("internal", "session actor exited during startup"))??;
         let mut actors = self.actors.lock().await;
-        if actors
-            .insert(id.clone(), ActorSlot { handle, task })
-            .is_some()
-        {
-            return Err(ErrorObject::new(
-                "conflict",
-                format!("session {id} was attached concurrently"),
-            ));
+        match actors.entry(id.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(ActorSlot {
+                    handle,
+                    _session: session,
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                drop(actors);
+                let _ = self.supervisor.remove(&session).await;
+                return Err(ErrorObject::new(
+                    "conflict",
+                    format!("session {id} was attached concurrently"),
+                ));
+            }
         }
         Ok(())
     }
@@ -310,34 +338,45 @@ impl HeadlessHost {
         }
         let actor = self.actor(&id).await?;
         reserve(&actor.busy)?;
-        let (accepted, receiver) = oneshot::channel();
-        if actor
-            .commands
-            .send(ActorCommand::Prompt { text, accepted })
-            .await
-            .is_err()
-        {
+        let response = actor
+            .actor
+            .call(
+                move |accepted| ActorCommand::Prompt { text, accepted },
+                Duration::MAX,
+            )
+            .await;
+        let response = match response {
+            Ok(response) => response.value,
+            Err(error) => {
+                release_unaccepted(&actor.busy, &error);
+                return Err(call_error(error));
+            }
+        };
+        if let Err(error) = response {
             actor.busy.store(false, Ordering::Release);
-            return Err(actor_closed(&id));
+            return Err(error);
         }
-        receiver.await.map_err(|_| actor_closed(&id))??;
         Ok(json!({"accepted": true}))
     }
 
     async fn compact(&self, id: SessionId) -> Result<Value, ErrorObject> {
         let actor = self.actor(&id).await?;
         reserve(&actor.busy)?;
-        let (accepted, receiver) = oneshot::channel();
-        if actor
-            .commands
-            .send(ActorCommand::Compact { accepted })
-            .await
-            .is_err()
-        {
+        let response = actor
+            .actor
+            .call(|accepted| ActorCommand::Compact { accepted }, Duration::MAX)
+            .await;
+        let response = match response {
+            Ok(response) => response.value,
+            Err(error) => {
+                release_unaccepted(&actor.busy, &error);
+                return Err(call_error(error));
+            }
+        };
+        if let Err(error) = response {
             actor.busy.store(false, Ordering::Release);
-            return Err(actor_closed(&id));
+            return Err(error);
         }
-        receiver.await.map_err(|_| actor_closed(&id))??;
         Ok(json!({"accepted": true}))
     }
 
@@ -356,22 +395,29 @@ impl HeadlessHost {
         }
         let actor = self.actor(&id).await?;
         reserve(&actor.busy)?;
-        let (completed, receiver) = oneshot::channel();
-        if actor
-            .commands
-            .send(ActorCommand::Configure {
-                provider,
-                model,
-                thinking,
-                completed,
-            })
-            .await
-            .is_err()
-        {
+        let response = actor
+            .actor
+            .call(
+                move |completed| ActorCommand::Configure {
+                    provider,
+                    model,
+                    thinking,
+                    completed,
+                },
+                Duration::MAX,
+            )
+            .await;
+        let response = match response {
+            Ok(response) => response.value,
+            Err(error) => {
+                release_unaccepted(&actor.busy, &error);
+                return Err(call_error(error));
+            }
+        };
+        if let Err(error) = response {
             actor.busy.store(false, Ordering::Release);
-            return Err(actor_closed(&id));
+            return Err(error);
         }
-        receiver.await.map_err(|_| actor_closed(&id))??;
         self.snapshot_value(id).await
     }
 }
@@ -440,10 +486,11 @@ impl RpcHandler for HeadlessHost {
                     if !actor.busy.load(Ordering::Acquire) {
                         return Err(ErrorObject::new("busy", "session has no active operation"));
                     }
+                    let controls = actor.controls.sender()?;
                     let queue = if request.method == "session.steer" {
-                        actor.controls.steer(SessionMessage::user(params.text))
+                        controls.steer(SessionMessage::user(params.text))
                     } else {
-                        actor.controls.follow_up(SessionMessage::user(params.text))
+                        controls.follow_up(SessionMessage::user(params.text))
                     }
                     .map_err(|_| actor_closed(&id))?;
                     Ok(json!({"queue_id": queue}))
@@ -457,6 +504,7 @@ impl RpcHandler for HeadlessHost {
                     }
                     actor
                         .controls
+                        .sender()?
                         .cancel(QueueId::from(params.queue_id))
                         .map_err(|_| actor_closed(&id))?;
                     Ok(json!({"accepted": true}))
@@ -468,7 +516,11 @@ impl RpcHandler for HeadlessHost {
                     if !actor.busy.load(Ordering::Acquire) {
                         return Err(ErrorObject::new("busy", "session has no active operation"));
                     }
-                    actor.controls.abort().map_err(|_| actor_closed(&id))?;
+                    actor
+                        .controls
+                        .sender()?
+                        .abort()
+                        .map_err(|_| actor_closed(&id))?;
                     Ok(json!({"accepted": true}))
                 }
                 "session.compact" => {
@@ -536,10 +588,23 @@ impl RpcHandler for HeadlessHost {
             self.actor(&session)
                 .await?
                 .controls
+                .sender()?
                 .answer_interaction(request_id, answer)
                 .map_err(|_| actor_closed(&session))
         })
     }
+}
+
+#[derive(Clone)]
+struct SessionArgs {
+    id: SessionId,
+    config: HostConfig,
+    factories: Factories,
+    repo: Arc<dyn SessionRepo>,
+    outbound: RpcSender,
+    controls: Arc<ControlHub>,
+    busy: Arc<AtomicBool>,
+    startup_error: Arc<StdMutex<Option<ErrorObject>>>,
 }
 
 struct SessionActor {
@@ -553,69 +618,167 @@ struct SessionActor {
     factories: Factories,
     repo: Arc<dyn SessionRepo>,
     outbound: RpcSender,
-    commands: mpsc::Receiver<ActorCommand>,
     controls: rho_agent::ControlReceiver,
+    control_hub: Arc<ControlHub>,
     busy: Arc<AtomicBool>,
+    shutdown: ShelterwoodCancellationToken,
+    incarnation: Incarnation,
 }
 
-impl SessionActor {
-    async fn run(mut self, status: LaneStatus, ready: oneshot::Sender<Result<(), ErrorObject>>) {
-        if !matches!(status, LaneStatus::Idle) {
-            match self.drive_resume().await {
-                Ok(machine) => self.machine = machine,
-                Err(error) => {
-                    let _ = ready.send(Err(driver_error(&error)));
-                    return;
-                }
+impl Actor for SessionActor {
+    type Msg = ActorCommand;
+    type Args = SessionArgs;
+
+    async fn init(
+        args: Self::Args,
+        context: &mut ActorContext<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        args.busy.store(true, Ordering::Release);
+        let startup_error = Arc::clone(&args.startup_error);
+        match Self::initialize(args, context).await {
+            Ok(actor) => {
+                *startup_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                Ok(actor)
             }
-        }
-        self.busy.store(false, Ordering::Release);
-        let _ = ready.send(Ok(()));
-        while let Some(command) = self.commands.recv().await {
-            match command {
-                ActorCommand::Prompt { text, accepted } => {
-                    let result = self.drive_prompt(text, accepted).await;
-                    match result {
-                        Ok(machine) => self.machine = machine,
-                        Err(error) => self.emit_failure(error).await,
-                    }
-                    self.busy.store(false, Ordering::Release);
-                    self.emit_snapshot().await;
-                }
-                ActorCommand::Compact { accepted } => {
-                    let result = self.drive_compaction(accepted).await;
-                    match result {
-                        Ok(machine) => self.machine = machine,
-                        Err(error) => self.emit_failure(error).await,
-                    }
-                    self.busy.store(false, Ordering::Release);
-                    self.emit_snapshot().await;
-                }
-                ActorCommand::Configure {
-                    provider,
-                    model,
-                    thinking,
-                    completed,
-                } => {
-                    let result = self.apply_configuration(provider, model, thinking).await;
-                    self.busy.store(false, Ordering::Release);
-                    let _ = completed.send(result);
-                    self.emit_snapshot().await;
-                }
-                ActorCommand::Shutdown => break,
+            Err(error) => {
+                *startup_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.clone());
+                Err(ExitError::message(error.message))
             }
         }
     }
 
+    async fn handle(&mut self, command: Self::Msg, _: &mut ActorContext<'_, Self>) -> ExitResult {
+        match command {
+            ActorCommand::Prompt { text, accepted } => {
+                let result = self.drive_prompt(text, accepted).await;
+                match result {
+                    Ok(machine) => self.machine = machine,
+                    Err(error) => {
+                        let message = error.to_string();
+                        self.emit_failure(&error).await;
+                        self.emit_snapshot().await;
+                        return Err(ExitError::message(message));
+                    }
+                }
+                self.busy.store(false, Ordering::Release);
+                self.emit_snapshot().await;
+            }
+            ActorCommand::Compact { accepted } => {
+                let result = self.drive_compaction(accepted).await;
+                match result {
+                    Ok(machine) => self.machine = machine,
+                    Err(error) => {
+                        let message = error.to_string();
+                        self.emit_failure(&error).await;
+                        self.emit_snapshot().await;
+                        return Err(ExitError::message(message));
+                    }
+                }
+                self.busy.store(false, Ordering::Release);
+                self.emit_snapshot().await;
+            }
+            ActorCommand::Configure {
+                provider,
+                model,
+                thinking,
+                completed,
+            } => {
+                let result = self.apply_configuration(provider, model, thinking).await;
+                self.busy.store(false, Ordering::Release);
+                completed.send(result);
+                self.emit_snapshot().await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn on_stop(&mut self, _: &mut StopContext<'_, Self>) {
+        self.busy.store(true, Ordering::Release);
+        if let Ok(controls) = self.control_hub.sender() {
+            let _ = controls.abort();
+        }
+    }
+}
+
+impl SessionActor {
+    async fn initialize(
+        args: SessionArgs,
+        context: &mut ActorContext<'_, Self>,
+    ) -> Result<Self, ErrorObject> {
+        let session = args.repo.open(args.id.clone()).await.map_err(store_error)?;
+        let cwd = session.header().cwd.clone();
+        let (tools, mcp) = build_tools(&args.config, &cwd).await?;
+        let base = args.config.machine(tools.specs());
+        let entries = session.branch(None).map_err(store_error)?;
+        let machine = SessionMachine::new(base.clone(), entries).map_err(|error| {
+            ErrorObject::new("conflict", format!("invalid session context: {error}"))
+        })?;
+        let status = session.lane_status().map_err(store_error)?;
+        if let LaneStatus::Corrupt(reason) = &status {
+            return Err(ErrorObject::new(
+                "conflict",
+                format!("session journal is corrupt: {reason:?}"),
+            ));
+        }
+        let provider = BoundProvider::open(
+            args.factories.get(&machine.model().provider)?,
+            machine.model().clone(),
+        )
+        .await
+        .map_err(|error| ErrorObject::new("invalid_params", error.to_string()))?;
+        let (controls, control_receiver) = control_channel();
+        args.controls.install(controls);
+        let mut actor = Self {
+            id: args.id,
+            session,
+            machine,
+            provider,
+            tools,
+            _mcp: mcp,
+            base,
+            factories: args.factories,
+            repo: args.repo,
+            outbound: args.outbound,
+            controls: control_receiver,
+            control_hub: args.controls,
+            busy: args.busy,
+            shutdown: context.shutdown_token(),
+            incarnation: context.incarnation(),
+        };
+        if !matches!(status, LaneStatus::Idle) {
+            actor.machine = actor
+                .drive_resume()
+                .await
+                .map_err(|error| driver_error(&error))?;
+        }
+        actor.busy.store(false, Ordering::Release);
+        let _ = actor
+            .outbound
+            .event(
+                "agent.supervision",
+                json!({
+                    "session_id": actor.id,
+                    "state": "ready",
+                    "incarnation": format!("{:?}", actor.incarnation),
+                }),
+            )
+            .await;
+        Ok(actor)
+    }
+
     async fn drive_resume(&mut self) -> Result<SessionMachine, DriverError> {
-        let cancellation = rho_ai::CancellationToken::new();
+        let (cancellation, bridge) = self.bridged_cancellation();
         let mut stamps = SystemStamps;
         let mut events = RpcEventSink::new(
             self.id.clone(),
             Arc::clone(&self.repo),
             self.outbound.clone(),
         );
-        Driver::new(
+        let result = Driver::new(
             self.session.as_mut(),
             &mut self.provider,
             &self.tools,
@@ -625,15 +788,17 @@ impl SessionActor {
         )
         .with_controls(&mut self.controls)
         .resume(self.machine.clone())
-        .await
+        .await;
+        bridge.abort();
+        result
     }
 
     async fn drive_prompt(
         &mut self,
         text: String,
-        accepted: oneshot::Sender<Result<(), ErrorObject>>,
+        accepted: Reply<Result<(), ErrorObject>>,
     ) -> Result<SessionMachine, DriverError> {
-        let cancellation = rho_ai::CancellationToken::new();
+        let (cancellation, bridge) = self.bridged_cancellation();
         let mut stamps = SystemStamps;
         let mut events = RpcEventSink::new(
             self.id.clone(),
@@ -641,6 +806,7 @@ impl SessionActor {
             self.outbound.clone(),
         )
         .with_acceptance(accepted);
+        let host = self.host_info();
         let result = Driver::new(
             self.session.as_mut(),
             &mut self.provider,
@@ -654,18 +820,19 @@ impl SessionActor {
             self.machine.clone(),
             SessionMessage::user(text),
             Origin::External,
-            Some(json!({"host": "rho-rpc", "version": env!("CARGO_PKG_VERSION")})),
+            Some(host),
         )
         .await;
+        bridge.abort();
         events.finish_acceptance(&result);
         result
     }
 
     async fn drive_compaction(
         &mut self,
-        accepted: oneshot::Sender<Result<(), ErrorObject>>,
+        accepted: Reply<Result<(), ErrorObject>>,
     ) -> Result<SessionMachine, DriverError> {
-        let cancellation = rho_ai::CancellationToken::new();
+        let (cancellation, bridge) = self.bridged_cancellation();
         let mut stamps = SystemStamps;
         let mut events = RpcEventSink::new(
             self.id.clone(),
@@ -673,6 +840,7 @@ impl SessionActor {
             self.outbound.clone(),
         )
         .with_acceptance(accepted);
+        let host = self.host_info();
         let result = Driver::new(
             self.session.as_mut(),
             &mut self.provider,
@@ -682,14 +850,30 @@ impl SessionActor {
             &mut events,
         )
         .with_controls(&mut self.controls)
-        .compact(
-            self.machine.clone(),
-            Origin::External,
-            Some(json!({"host": "rho-rpc", "version": env!("CARGO_PKG_VERSION")})),
-        )
+        .compact(self.machine.clone(), Origin::External, Some(host))
         .await;
+        bridge.abort();
         events.finish_acceptance(&result);
         result
+    }
+
+    fn bridged_cancellation(&self) -> (rho_ai::CancellationToken, tokio::task::JoinHandle<()>) {
+        let cancellation = rho_ai::CancellationToken::new();
+        let signal = cancellation.clone();
+        let shutdown = self.shutdown.clone();
+        let bridge = tokio::spawn(async move {
+            shutdown.cancelled().await;
+            signal.cancel();
+        });
+        (cancellation, bridge)
+    }
+
+    fn host_info(&self) -> Value {
+        json!({
+            "host": "rho-rpc",
+            "version": env!("CARGO_PKG_VERSION"),
+            "shelterwood_incarnation": format!("{:?}", self.incarnation),
+        })
     }
 
     async fn apply_configuration(
@@ -758,7 +942,7 @@ impl SessionActor {
         Ok(())
     }
 
-    async fn emit_failure(&mut self, error: DriverError) {
+    async fn emit_failure(&mut self, error: &DriverError) {
         let _ = self
             .outbound
             .event(
@@ -785,7 +969,7 @@ struct RpcEventSink {
     session: SessionId,
     repo: Arc<dyn SessionRepo>,
     outbound: RpcSender,
-    accepted: Option<oneshot::Sender<Result<(), ErrorObject>>>,
+    accepted: Option<Reply<Result<(), ErrorObject>>>,
 }
 
 impl RpcEventSink {
@@ -798,7 +982,7 @@ impl RpcEventSink {
         }
     }
 
-    fn with_acceptance(mut self, accepted: oneshot::Sender<Result<(), ErrorObject>>) -> Self {
+    fn with_acceptance(mut self, accepted: Reply<Result<(), ErrorObject>>) -> Self {
         self.accepted = Some(accepted);
         self
     }
@@ -814,7 +998,7 @@ impl RpcEventSink {
             ),
             Err(error) => driver_error(error),
         };
-        let _ = accepted.send(Err(error));
+        accepted.send(Err(error));
     }
 }
 
@@ -823,7 +1007,7 @@ impl EventSink for RpcEventSink {
         if matches!(&event, AgentEvent::OperationStarted { .. })
             && let Some(accepted) = self.accepted.take()
         {
-            let _ = accepted.send(Ok(()));
+            accepted.send(Ok(()));
         }
         let session = self.session.clone();
         let repo = Arc::clone(&self.repo);
@@ -1065,6 +1249,28 @@ fn actor_closed(id: &SessionId) -> ErrorObject {
     ErrorObject::new("internal", format!("session actor {id} is closed"))
 }
 
+fn call_error(error: CallError) -> ErrorObject {
+    let code = match error.kind {
+        CallErrorKind::ResponseTimedOut | CallErrorKind::ReplyDropped => "conflict",
+        CallErrorKind::Terminated | CallErrorKind::AcceptanceTimedOut => "internal",
+        _ => "internal",
+    };
+    ErrorObject::new(code, format!("session actor call failed: {error}"))
+}
+
+fn release_unaccepted(busy: &AtomicBool, error: &CallError) {
+    if matches!(
+        error.kind,
+        CallErrorKind::AcceptanceTimedOut | CallErrorKind::Terminated
+    ) {
+        busy.store(false, Ordering::Release);
+    }
+}
+
+fn supervisor_error(error: impl std::fmt::Display) -> ErrorObject {
+    ErrorObject::new("internal", format!("session supervision failed: {error}"))
+}
+
 fn driver_error(error: &DriverError) -> ErrorObject {
     match error {
         DriverError::LaneNotIdle { .. } | DriverError::Suspended => {
@@ -1158,7 +1364,8 @@ struct ConfigureParams {
 #[cfg(test)]
 mod tests {
     use rho_ai::{
-        AssistantMessage, Message, ModelInfo, ProviderId, Request, StopReason, Usage,
+        AssistantMessage, CancellationToken, Message, ModelInfo, OpenProvider, Provider,
+        ProviderId, ProviderStream, Request, SessionConfig, StopReason, Usage,
         faux::{FauxFactory, Script},
     };
     use rho_store::MemoryRepo;
@@ -1241,6 +1448,7 @@ mod tests {
                 values: Arc::new(factories),
             },
             actors: Mutex::new(BTreeMap::new()),
+            supervisor: SupervisedSessions::start().await.unwrap(),
         });
         let observed = Arc::clone(&host);
         let (client, server) = tokio::io::duplex(64 * 1024);
@@ -1298,7 +1506,169 @@ mod tests {
         drop(client_write);
         drop(client_read);
         server.await.unwrap().unwrap();
-        observed.shutdown().await;
+        observed.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shelterwood_restart_resumes_the_suspended_journal() {
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        let config = HostConfig {
+            model: ModelRef {
+                provider: ProviderId::from("crash-once"),
+                model: ModelId::from("crash-model"),
+            },
+            thinking: ThinkingLevel::None,
+            max_output_tokens: 1_000,
+            system: "test system".to_owned(),
+            compaction: None,
+            mcp: Vec::new(),
+        };
+        let done = AssistantMessage {
+            blocks: vec![ContentBlock::text("recovered")],
+            stop: StopReason::Stop,
+            usage: Usage::default(),
+            provider: ProviderId::from("crash-once"),
+            model: ModelId::from("crash-model"),
+        };
+        let factory = CrashOnceFactory::new(done);
+        let mut factories = BTreeMap::new();
+        factories.insert(
+            "crash-once".to_owned(),
+            Arc::new(factory.clone()) as Arc<dyn ProviderFactory>,
+        );
+        let repo = MemoryRepo::default();
+        let host = Arc::new(HeadlessHost {
+            repo: Arc::new(repo.clone()),
+            config,
+            factories: Factories {
+                values: Arc::new(factories),
+            },
+            actors: Mutex::new(BTreeMap::new()),
+            supervisor: SupervisedSessions::start().await.unwrap(),
+        });
+        let observed = Arc::clone(&host);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let server = tokio::spawn(rho_rpc::serve(server_read, server_write, host));
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_read = BufReader::new(client_read);
+
+        client_write
+            .write_all(
+                format!(
+                    "{{\"v\":1,\"id\":\"create\",\"method\":\"session.create\",\"params\":{{\"cwd\":{}}}}}\n",
+                    serde_json::to_string(&cwd).unwrap()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let created = read_until(&mut client_read, |value| {
+            value.get("id") == Some(&json!("create"))
+        })
+        .await;
+        let id = created
+            .pointer("/result/header/id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_owned();
+        client_write
+            .write_all(
+                format!(
+                    "{{\"v\":1,\"id\":\"prompt\",\"method\":\"session.prompt\",\"params\":{{\"session_id\":\"{id}\",\"text\":\"recover\"}}}}\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        read_until(&mut client_read, |value| {
+            value.pointer("/data/event/kind") == Some(&json!("operation_finished"))
+        })
+        .await;
+
+        let snapshot = repo.inspect(SessionId::from(id)).await.unwrap();
+        assert_eq!(snapshot.status, LaneStatus::Idle);
+        assert!(snapshot.items.iter().any(|item| matches!(
+            item,
+            rho_core::Item::Entry(rho_core::Entry {
+                body: EntryBody::Message {
+                    message: SessionMessage::Assistant(message)
+                },
+                ..
+            }) if message.blocks == [ContentBlock::text("recovered")]
+        )));
+        assert_eq!(factory.opens.load(Ordering::SeqCst), 2);
+        assert!(
+            serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("shelterwood_incarnation")
+        );
+
+        drop(client_write);
+        drop(client_read);
+        server.await.unwrap().unwrap();
+        observed.shutdown().await.unwrap();
+    }
+
+    #[derive(Clone)]
+    struct CrashOnceFactory {
+        models: Vec<ModelInfo>,
+        crashed: Arc<AtomicBool>,
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+        done: AssistantMessage,
+    }
+
+    impl CrashOnceFactory {
+        fn new(done: AssistantMessage) -> Self {
+            Self {
+                models: vec![ModelInfo {
+                    id: ModelId::from("crash-model"),
+                    display_name: "Crash model".to_owned(),
+                    context_tokens: None,
+                    max_output_tokens: None,
+                }],
+                crashed: Arc::new(AtomicBool::new(false)),
+                opens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                done,
+            }
+        }
+    }
+
+    impl ProviderFactory for CrashOnceFactory {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::from("crash-once")
+        }
+
+        fn models(&self) -> &[ModelInfo] {
+            &self.models
+        }
+
+        fn open(&self, _: SessionConfig) -> OpenProvider<'_> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            let provider = CrashOnceProvider {
+                crashed: Arc::clone(&self.crashed),
+                done: self.done.clone(),
+            };
+            Box::pin(async move { Ok(Box::new(provider) as Box<dyn Provider>) })
+        }
+    }
+
+    struct CrashOnceProvider {
+        crashed: Arc<AtomicBool>,
+        done: AssistantMessage,
+    }
+
+    impl Provider for CrashOnceProvider {
+        fn generate(&mut self, _: Request, _: CancellationToken) -> ProviderStream<'_> {
+            assert!(
+                self.crashed.swap(true, Ordering::SeqCst),
+                "injected provider panic after the durable operation start"
+            );
+            Box::pin(futures_util::stream::iter([
+                StreamEvent::Start,
+                StreamEvent::Done(self.done.clone()),
+            ]))
+        }
     }
 
     async fn read_until<R>(reader: &mut BufReader<R>, predicate: impl Fn(&Value) -> bool) -> Value
