@@ -1503,8 +1503,10 @@ dependencies = [
 name = "rho-rpc"
 version = "0.1.0"
 dependencies = [
- "rho-agent",
- "rho-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1523,6 +1525,7 @@ dependencies = [
  "rho-ai",
  "rho-codec-jsonl",
  "rho-core",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

@@ -17,6 +17,7 @@ use rho_core::{
     Entry, EntryId, Item, LaneName, LaneStatus, NewEntry, NewFact, NewRecord, RecordBody,
     SessionHeader, SessionId,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -25,14 +26,15 @@ pub type RepoFuture<'repo, T> =
     Pin<Box<dyn Future<Output = Result<T, SessionError>> + Send + 'repo>>;
 
 /// Options for a new standalone session.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CreateOptions {
     /// Working directory captured in the header.
     pub cwd: String,
 }
 
 /// A location in a source session to fork through.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "entry", rename_all = "snake_case")]
 pub enum ForkPoint {
     /// Fork through the source lane's current leaf.
     Leaf,
@@ -41,7 +43,7 @@ pub enum ForkPoint {
 }
 
 /// Cheap repository listing item.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct SessionMeta {
     /// Durable header.
     pub header: SessionHeader,
@@ -49,6 +51,23 @@ pub struct SessionMeta {
     pub leaf: Option<EntryId>,
     /// Recovery status of the main lane.
     pub status: LaneStatus,
+}
+
+/// Lock-free, read-only view of all durable state for one session.
+///
+/// `items` is the complete interleaved log, not merely the selected transcript
+/// branch. Together with `leaf`, it is sufficient to reconstruct every v1
+/// snapshot field without consulting process-local driver state.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SessionSnapshot {
+    /// Durable session header.
+    pub header: SessionHeader,
+    /// Current main-lane leaf.
+    pub leaf: Option<EntryId>,
+    /// Current recovery state reduced from `items`.
+    pub status: LaneStatus,
+    /// Complete durable entry, journal, and fact stream.
+    pub items: Vec<Item>,
 }
 
 /// Typed storage failure.
@@ -118,6 +137,9 @@ pub trait SessionRepo: Send + Sync {
 
     /// Lists repository snapshots without acquiring writer locks.
     fn list(&self) -> RepoFuture<'_, Vec<SessionMeta>>;
+
+    /// Reads authoritative state without acquiring the writer lock.
+    fn inspect(&self, id: SessionId) -> RepoFuture<'_, SessionSnapshot>;
 
     /// Deletes an unlocked session.
     fn delete(&self, id: SessionId) -> RepoFuture<'_, ()>;
@@ -226,6 +248,17 @@ fn session_meta(header: SessionHeader, items: &[Item]) -> SessionMeta {
         header,
         leaf: derive_leaf(items),
         status: rho_core::reduce_lane_status(items, &LaneName::main()),
+    }
+}
+
+fn session_snapshot(header: SessionHeader, items: Vec<Item>) -> SessionSnapshot {
+    let leaf = derive_leaf(&items);
+    let status = rho_core::reduce_lane_status(&items, &LaneName::main());
+    SessionSnapshot {
+        header,
+        leaf,
+        status,
+        items,
     }
 }
 
@@ -399,6 +432,17 @@ pub mod conformance {
             repo.open(id.clone()).await,
             Err(SessionError::Locked(locked)) if locked == id
         ));
+        let snapshot = repo
+            .inspect(id.clone())
+            .await
+            .expect("inspect writer-locked session");
+        assert_eq!(snapshot.header.id, id);
+        assert_eq!(snapshot.leaf, Some(root.clone()));
+        assert_eq!(snapshot.items.len(), 6);
+        assert!(matches!(
+            snapshot.status,
+            rho_core::LaneStatus::Suspended(_)
+        ));
         drop(session);
 
         let reopened = repo.open(id.clone()).await.expect("reopen session");
@@ -492,6 +536,10 @@ pub mod conformance {
             .expect("delete session");
         assert!(matches!(
             repo.open(doomed_id.clone()).await,
+            Err(SessionError::NotFound(missing)) if missing == doomed_id
+        ));
+        assert!(matches!(
+            repo.inspect(doomed_id.clone()).await,
             Err(SessionError::NotFound(missing)) if missing == doomed_id
         ));
     }
