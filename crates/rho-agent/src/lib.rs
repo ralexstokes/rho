@@ -208,10 +208,15 @@ impl<'driver> Driver<'driver> {
             op: self.stamps.op_id(),
             stamp: self.stamps.entry(),
             origin,
-            host,
+            host: host.clone(),
         };
         let (machine, step) = machine.handle(input)?;
-        self.drive(machine, step).await
+        let machine = self.drive(machine, step).await?;
+        if machine.compaction_due().is_some() {
+            self.compact(machine, origin, host).await
+        } else {
+            Ok(machine)
+        }
     }
 
     /// Resumes the single suspended operation described by the durable journal.
@@ -221,6 +226,30 @@ impl<'driver> Driver<'driver> {
         let (machine, step) = machine.handle(Input::Resume {
             status,
             at: self.stamps.timestamp(),
+        })?;
+        self.drive(machine, step).await
+    }
+
+    /// Runs one explicit compaction operation to a terminal state.
+    pub async fn compact(
+        &mut self,
+        machine: SessionMachine,
+        origin: Origin,
+        host: Option<rho_core::HostInfo>,
+    ) -> Result<SessionMachine, DriverError> {
+        validate_binding(&machine, self.session)?;
+        validate_provider(&machine, self.provider)?;
+        let status = self.session.lane_status()?;
+        if status != rho_core::LaneStatus::Idle {
+            return Err(DriverError::LaneNotIdle {
+                status: Box::new(status),
+            });
+        }
+        let (machine, step) = machine.handle(Input::Compact {
+            op: self.stamps.op_id(),
+            at: self.stamps.timestamp(),
+            origin,
+            host,
         })?;
         self.drive(machine, step).await
     }
@@ -368,7 +397,75 @@ async fn execute_action(
                 stamp: stamps.entry(),
             })
         }
-        Action::Summarize { .. } => Err(DriverError::UnsupportedAction("summarize")),
+        Action::Summarize { request, model, .. } => {
+            if model != provider.model {
+                return Err(DriverError::ProviderSelectionMismatch {
+                    expected: model,
+                    actual: provider.model.clone(),
+                });
+            }
+            let mut stream = provider.provider.generate(request, cancellation);
+            while let Some(event) = stream.next().await {
+                events
+                    .emit(AgentEvent::ProviderStream {
+                        event: event.clone(),
+                    })
+                    .await;
+                match event {
+                    StreamEvent::Done(message) => {
+                        if message.stop != rho_ai::StopReason::Stop {
+                            let error = if message.stop == rho_ai::StopReason::Aborted {
+                                ProviderError::cancelled()
+                            } else {
+                                ProviderError::invalid_response(format!(
+                                    "compaction response ended with {:?}",
+                                    message.stop
+                                ))
+                            };
+                            return Ok(ActionOutcome::Summary {
+                                result: Err(error),
+                                stamp: stamps.entry(),
+                            });
+                        }
+                        let text = message
+                            .blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                rho_ai::ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if text.is_empty() {
+                            return Ok(ActionOutcome::Summary {
+                                result: Err(ProviderError::invalid_response(
+                                    "compaction response contained no text",
+                                )),
+                                stamp: stamps.entry(),
+                            });
+                        }
+                        return Ok(ActionOutcome::Summary {
+                            result: Ok(rho_core::CompactionSummary {
+                                text,
+                                usage: message.usage,
+                            }),
+                            stamp: stamps.entry(),
+                        });
+                    }
+                    StreamEvent::Error(error) => {
+                        return Ok(ActionOutcome::Summary {
+                            result: Err(error),
+                            stamp: stamps.entry(),
+                        });
+                    }
+                    StreamEvent::Start
+                    | StreamEvent::Delta { .. }
+                    | StreamEvent::BlockDone { .. } => {}
+                    _ => {}
+                }
+            }
+            Err(DriverError::UnterminatedProviderStream)
+        }
         Action::AwaitInteraction { .. } => Err(DriverError::UnsupportedAction("await_interaction")),
         Action::InvokeHook { .. } => Err(DriverError::UnsupportedAction("invoke_hook")),
         _ => Err(DriverError::UnsupportedAction("future action variant")),
@@ -386,7 +483,7 @@ mod tests {
         ThinkingLevel, Usage,
         faux::{FauxFactory, Script},
     };
-    use rho_core::{EntryStamp, MachineConfig, ReplaySafety};
+    use rho_core::{CompactionConfig, EntryStamp, MachineConfig, ReplaySafety};
     use rho_store::{CreateOptions, MemoryRepo, SessionRepo};
 
     use super::*;
@@ -508,6 +605,7 @@ mod tests {
                     model: ModelId::from("m"),
                 },
                 tools: Vec::new(),
+                compaction: None,
             },
             Vec::new(),
         )
@@ -562,6 +660,7 @@ mod tests {
                     model: ModelId::from("other"),
                 },
                 tools: Vec::new(),
+                compaction: None,
             },
             machine.entries().to_vec(),
         )
@@ -613,6 +712,7 @@ mod tests {
                     model: ModelId::from("m"),
                 },
                 tools: Vec::new(),
+                compaction: None,
             },
             Vec::new(),
         )
@@ -772,6 +872,7 @@ mod tests {
                     model: ModelId::from("m"),
                 },
                 tools: Vec::new(),
+                compaction: None,
             },
             branch,
         )
@@ -826,6 +927,147 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn automatic_driver_persists_a_compaction_checkpoint() {
+        let old_assistant = AssistantMessage {
+            blocks: vec![rho_ai::ContentBlock::text("old answer")],
+            stop: StopReason::Stop,
+            usage: Usage {
+                input_tokens: 200,
+                ..Usage::default()
+            },
+            provider: ProviderId::from("p"),
+            model: ModelId::from("m"),
+        };
+        let prompt_request = Request {
+            system: "test".to_owned(),
+            messages: vec![Message::user("old question")],
+            tools: Vec::new(),
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::None,
+        };
+        let summary_request = Request {
+            system: "summarize".to_owned(),
+            messages: vec![Message::user("old question")],
+            tools: Vec::new(),
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::None,
+        };
+        let factory = FauxFactory::new(
+            vec![ModelInfo {
+                id: ModelId::from("m"),
+                display_name: "model".to_owned(),
+                context_tokens: None,
+                max_output_tokens: None,
+            }],
+            [
+                Script {
+                    request: prompt_request,
+                    events: vec![StreamEvent::Done(old_assistant)],
+                },
+                Script {
+                    request: summary_request,
+                    events: vec![StreamEvent::Done(AssistantMessage {
+                        blocks: vec![rho_ai::ContentBlock::text("condensed history")],
+                        stop: StopReason::Stop,
+                        usage: Usage {
+                            input_tokens: 50,
+                            output_tokens: 5,
+                            ..Usage::default()
+                        },
+                        provider: ProviderId::from("p"),
+                        model: ModelId::from("m"),
+                    })],
+                },
+            ],
+        )
+        .with_provider_id(ProviderId::from("p"));
+        let mut provider = BoundProvider::open(
+            &factory,
+            ModelRef {
+                provider: ProviderId::from("p"),
+                model: ModelId::from("m"),
+            },
+        )
+        .await
+        .unwrap();
+        let repo = MemoryRepo::default();
+        let mut session = repo
+            .create(CreateOptions {
+                cwd: "/workspace".to_owned(),
+            })
+            .await
+            .unwrap();
+        let machine = SessionMachine::new(
+            MachineConfig {
+                system: "test".to_owned(),
+                max_output_tokens: 100,
+                thinking: ThinkingLevel::None,
+                model: ModelRef {
+                    provider: ProviderId::from("p"),
+                    model: ModelId::from("m"),
+                },
+                tools: Vec::new(),
+                compaction: Some(CompactionConfig {
+                    threshold_tokens: 100,
+                    retain_messages: 1,
+                    system_prompt: "summarize".to_owned(),
+                }),
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let machine = Driver::new(
+            session.as_mut(),
+            &mut provider,
+            &ToolSet::new(),
+            &mut FixedStamps { next: 10 },
+            CancellationToken::new(),
+            &mut NoopEventSink,
+        )
+        .run_prompt(
+            machine,
+            SessionMessage::user("old question"),
+            Origin::External,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(machine.is_idle());
+        assert_eq!(machine.compaction_due(), None);
+        assert_eq!(session.lane_status().unwrap(), rho_core::LaneStatus::Idle);
+        assert!(matches!(
+            &session.branch(None).unwrap().last().unwrap().body,
+            rho_core::EntryBody::Compaction {
+                summary,
+                retained_tail,
+                tokens_before: 200,
+                ..
+            } if summary == "condensed history"
+                && matches!(retained_tail.as_slice(), [SessionMessage::Assistant(_)])
+        ));
+        let reopened = SessionMachine::new(
+            MachineConfig {
+                system: "test".to_owned(),
+                max_output_tokens: 100,
+                thinking: ThinkingLevel::None,
+                model: ModelRef {
+                    provider: ProviderId::from("p"),
+                    model: ModelId::from("m"),
+                },
+                tools: Vec::new(),
+                compaction: Some(CompactionConfig {
+                    threshold_tokens: 100,
+                    retain_messages: 1,
+                    system_prompt: "summarize".to_owned(),
+                }),
+            },
+            session.branch(None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reopened.compaction_due(), None);
+    }
+
     #[test]
     fn tool_specs_are_usable_without_builtin_tools() {
         let config = MachineConfig {
@@ -837,6 +1079,7 @@ mod tests {
                 model: ModelId::from("m"),
             },
             tools: Vec::new(),
+            compaction: None,
         };
         assert!(config.tools.is_empty());
         let _ = ReplaySafety::Safe;

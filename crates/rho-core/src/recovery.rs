@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use rho_ai::ToolCallId;
 
 use crate::{
-    CorruptionReason, Item, LaneName, LaneStatus, OpId, OpIntent, OpenTool, RecordBody,
-    SessionMessage, SuspendedOp,
+    CompactionWork, CompletedCompaction, CorruptionReason, Item, LaneName, LaneStatus, OpId,
+    OpIntent, OpenTool, RecordBody, SessionMessage, SuspendedCompaction, SuspendedOp,
 };
 
 #[derive(Debug)]
@@ -20,6 +20,9 @@ struct OperationState {
     last_assistant: Option<rho_ai::AssistantMessage>,
     last_assistant_usage_recorded: bool,
     resolved_tool_calls: Vec<ToolCallId>,
+    compaction_work: Option<CompactionWork>,
+    completed_compaction: Option<CompletedCompaction>,
+    compaction_usage_recorded: bool,
 }
 
 /// Reduces an interleaved session stream to one lane's recoverable status.
@@ -79,6 +82,13 @@ pub fn reduce_lane_status(items: &[Item], lane: &LaneName) -> LaneStatus {
         last_assistant: state.last_assistant.clone(),
         last_assistant_usage_recorded: state.last_assistant_usage_recorded,
         resolved_tool_calls: state.resolved_tool_calls.clone(),
+        compaction: state.compaction_work.clone().map(|work| {
+            Box::new(SuspendedCompaction {
+                work,
+                completed: state.completed_compaction.clone(),
+                usage_recorded: state.compaction_usage_recorded,
+            })
+        }),
     })
 }
 
@@ -122,6 +132,9 @@ fn reduce_record(
                 last_assistant: None,
                 last_assistant_usage_recorded: false,
                 resolved_tool_calls: Vec::new(),
+                compaction_work: None,
+                completed_compaction: None,
+                compaction_usage_recorded: false,
             },
         );
         *open = Some(op.clone());
@@ -154,6 +167,14 @@ fn reduce_record(
             if matches!(outcome, crate::OpOutcome::Completed) && state.stream_in_flight {
                 return Err(CorruptionReason::CompletedWithStreamInFlight { op: op.clone() });
             }
+            if matches!(outcome, crate::OpOutcome::Completed)
+                && state.intent == OpIntent::Compaction
+                && state.completed_compaction.is_none()
+            {
+                return Err(CorruptionReason::CompletedCompactionWithoutCheckpoint {
+                    op: op.clone(),
+                });
+            }
             state.finished = true;
             if open.as_ref() == Some(op) {
                 *open = None;
@@ -179,6 +200,12 @@ fn reduce_record(
             replay,
             ..
         } => {
+            if state.intent != OpIntent::Run {
+                return Err(CorruptionReason::IntentMismatch {
+                    op: op.clone(),
+                    intent: state.intent,
+                });
+            }
             if state.stream_in_flight {
                 return Err(CorruptionReason::ToolStartedBeforeAssistant {
                     op: op.clone(),
@@ -198,8 +225,21 @@ fn reduce_record(
                 replay: *replay,
             });
         }
+        RecordBody::CompactionStarted { work, .. } => {
+            if state.intent != OpIntent::Compaction {
+                return Err(CorruptionReason::IntentMismatch {
+                    op: op.clone(),
+                    intent: state.intent,
+                });
+            }
+            if state.compaction_work.replace(work.clone()).is_some() {
+                return Err(CorruptionReason::DuplicateCompactionStart { op: op.clone() });
+            }
+        }
         RecordBody::Usage { .. } => {
-            if state.last_assistant.is_some() {
+            if state.completed_compaction.is_some() {
+                state.compaction_usage_recorded = true;
+            } else if state.last_assistant.is_some() {
                 state.last_assistant_usage_recorded = true;
             }
         }
@@ -244,6 +284,9 @@ fn reduce_entry(
                         last_assistant: None,
                         last_assistant_usage_recorded: false,
                         resolved_tool_calls: Vec::new(),
+                        compaction_work: None,
+                        completed_compaction: None,
+                        compaction_usage_recorded: false,
                     },
                 );
                 *open = Some(op.clone());
@@ -266,9 +309,15 @@ fn reduce_entry(
     if state.finished {
         return Err(CorruptionReason::ItemAfterFinish { op: op.clone() });
     }
-    if let crate::EntryBody::Message { message } = body {
-        match message {
+    match body {
+        crate::EntryBody::Message { message } => match message {
             SessionMessage::Assistant(message) => {
+                if state.intent != OpIntent::Run {
+                    return Err(CorruptionReason::IntentMismatch {
+                        op: op.clone(),
+                        intent: state.intent,
+                    });
+                }
                 if !state.stream_in_flight {
                     return Err(CorruptionReason::AssistantWithoutStep { op: op.clone() });
                 }
@@ -292,7 +341,28 @@ fn reduce_entry(
                 state.resolved_tool_calls.push(call_id.clone());
             }
             SessionMessage::User { .. } | SessionMessage::Custom { .. } => {}
+        },
+        crate::EntryBody::Compaction { summary, usage, .. } => {
+            if state.intent != OpIntent::Compaction {
+                return Err(CorruptionReason::IntentMismatch {
+                    op: op.clone(),
+                    intent: state.intent,
+                });
+            }
+            if state.compaction_work.is_none() {
+                return Err(CorruptionReason::CompactionWithoutStart { op: op.clone() });
+            }
+            if !state.stream_in_flight {
+                return Err(CorruptionReason::AssistantWithoutStep { op: op.clone() });
+            }
+            state.stream_in_flight = false;
+            state.completed_compaction = Some(CompletedCompaction {
+                summary: summary.clone(),
+                usage: usage.clone(),
+            });
+            state.compaction_usage_recorded = false;
         }
+        crate::EntryBody::SettingsChange { .. } | crate::EntryBody::Custom { .. } => {}
     }
     Ok(())
 }
@@ -345,6 +415,45 @@ mod tests {
             origin: Origin::External,
             host: None,
         }
+    }
+
+    fn compaction_started(op: &str) -> RecordBody {
+        RecordBody::OpStarted {
+            op: op.into(),
+            intent: OpIntent::Compaction,
+            origin: Origin::External,
+            host: None,
+        }
+    }
+
+    fn compaction_work(op: &str) -> RecordBody {
+        RecordBody::CompactionStarted {
+            op: op.into(),
+            work: CompactionWork {
+                compacted: vec![SessionMessage::user("old")],
+                retained_tail: vec![SessionMessage::user("tail")],
+                first_kept: None,
+                tokens_before: 100,
+            },
+        }
+    }
+
+    fn compaction_entry(seq: u64, op: &str) -> Item {
+        Item::Entry(Entry {
+            seq,
+            id: format!("e{seq}").into(),
+            parent: None,
+            lane: LaneName::main(),
+            op: Some(OpId::from(op)),
+            at: Timestamp::from("t"),
+            body: EntryBody::Compaction {
+                summary: "summary".to_owned(),
+                first_kept: None,
+                retained_tail: Vec::new(),
+                tokens_before: 100,
+                usage: Usage::default(),
+            },
+        })
     }
 
     fn assistant() -> SessionMessage {
@@ -636,6 +745,54 @@ mod tests {
                     ),
                 ],
                 CorruptionReason::CompletedWithStreamInFlight {
+                    op: OpId::from("a"),
+                },
+            ),
+            (
+                vec![record(1, started("a")), record(2, compaction_work("a"))],
+                CorruptionReason::IntentMismatch {
+                    op: OpId::from("a"),
+                    intent: OpIntent::Run,
+                },
+            ),
+            (
+                vec![
+                    record(1, compaction_started("a")),
+                    record(2, compaction_work("a")),
+                    record(3, compaction_work("a")),
+                ],
+                CorruptionReason::DuplicateCompactionStart {
+                    op: OpId::from("a"),
+                },
+            ),
+            (
+                vec![
+                    record(1, compaction_started("a")),
+                    record(
+                        2,
+                        RecordBody::Step {
+                            op: OpId::from("a"),
+                            n: 1,
+                        },
+                    ),
+                    compaction_entry(3, "a"),
+                ],
+                CorruptionReason::CompactionWithoutStart {
+                    op: OpId::from("a"),
+                },
+            ),
+            (
+                vec![
+                    record(1, compaction_started("a")),
+                    record(
+                        2,
+                        RecordBody::OpFinished {
+                            op: OpId::from("a"),
+                            outcome: OpOutcome::Completed,
+                        },
+                    ),
+                ],
+                CorruptionReason::CompletedCompactionWithoutCheckpoint {
                     op: OpId::from("a"),
                 },
             ),

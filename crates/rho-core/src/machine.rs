@@ -2,16 +2,16 @@ use std::collections::VecDeque;
 
 use rho_ai::{
     AssistantMessage, ContentBlock, ErrorKind, ProviderError, Request, StopReason, ThinkingLevel,
-    ToolCallId, ToolDefinition,
+    ToolCallId, ToolDefinition, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    ContextError, Entry, EntryBody, EntryId, HostInfo, LaneName, LaneStatus, NewEntry, NewRecord,
-    OpId, OpIntent, OpOutcome, Origin, RecordBody, ReplaySafety, SessionMessage, Timestamp,
-    assemble_context,
+    CompactionWork, ContextError, Entry, EntryBody, EntryId, HostInfo, LaneName, LaneStatus,
+    NewEntry, NewRecord, OpId, OpIntent, OpOutcome, Origin, RecordBody, ReplaySafety,
+    SessionMessage, Timestamp, assemble_context, plan_compaction,
 };
 
 /// Immutable tool metadata used by the pure machine.
@@ -36,6 +36,28 @@ pub struct MachineConfig {
     pub model: crate::ModelRef,
     /// Available tools and their durability metadata.
     pub tools: Vec<ToolSpec>,
+    /// Automatic context compaction policy, or `None` to disable it.
+    pub compaction: Option<CompactionConfig>,
+}
+
+/// Simple summarize-and-truncate policy.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CompactionConfig {
+    /// Compact after a provider request reports at least this many input tokens.
+    pub threshold_tokens: u64,
+    /// Number of newest messages copied into the self-contained checkpoint.
+    pub retain_messages: usize,
+    /// System instructions used for the isolated summarization request.
+    pub system_prompt: String,
+}
+
+/// Authoritative output of a compaction summarization request.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CompactionSummary {
+    /// Plain-text history summary.
+    pub text: String,
+    /// Provider token accounting.
+    pub usage: Usage,
 }
 
 /// Shell-minted identity and time for a transcript effect.
@@ -122,6 +144,8 @@ pub enum Action {
     Summarize {
         /// Isolated summarization request.
         request: Request,
+        /// Provider session the shell must have open.
+        model: crate::ModelRef,
         /// Side-effect provenance.
         origin: Origin,
     },
@@ -169,6 +193,20 @@ pub enum AgentEvent {
         /// Tool name.
         name: String,
     },
+    /// Context compaction began.
+    CompactionStarted {
+        /// Operation identity.
+        op: OpId,
+        /// Token estimate before compaction.
+        tokens_before: u64,
+    },
+    /// A self-contained compaction checkpoint was appended.
+    CompactionFinished {
+        /// Operation identity.
+        op: OpId,
+        /// Generated summary.
+        summary: String,
+    },
     /// Advisory provider stream event. Snapshots remain authoritative.
     ProviderStream {
         /// Transient provider event.
@@ -214,6 +252,17 @@ pub enum Input {
         /// Optional host fencing metadata.
         host: Option<HostInfo>,
     },
+    /// Begin an explicit or automatically triggered compaction operation.
+    Compact {
+        /// Shell-minted operation identity.
+        op: OpId,
+        /// Shell-minted timestamp for journal effects.
+        at: Timestamp,
+        /// Request provenance.
+        origin: Origin,
+        /// Optional host fencing metadata.
+        host: Option<HostInfo>,
+    },
     /// Inspect recovery state before resuming in the shell.
     Resume {
         /// Reducer result read from storage.
@@ -251,7 +300,7 @@ pub enum ActionOutcome {
     /// A summarization action completed.
     Summary {
         /// Summary or normalized error.
-        result: Result<String, String>,
+        result: Result<CompactionSummary, ProviderError>,
         /// Identity and time for a future checkpoint entry.
         stamp: EntryStamp,
     },
@@ -311,13 +360,29 @@ pub enum MachineError {
     /// Prompt commands must introduce user-authored content.
     #[error("prompt input must be a user message")]
     InvalidPrompt,
+    /// Compaction was requested without an enabled policy.
+    #[error("compaction is disabled for this machine")]
+    CompactionDisabled,
+    /// There is no old context to summarize under the configured retention policy.
+    #[error("the current context does not require compaction")]
+    NothingToCompact,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Phase {
     Idle,
-    AwaitingAssistant { op: OpId, step: u32, origin: Origin },
+    AwaitingAssistant {
+        op: OpId,
+        step: u32,
+        origin: Origin,
+    },
     AwaitingTool(AwaitingTool),
+    AwaitingSummary {
+        op: OpId,
+        step: u32,
+        work: CompactionWork,
+        origin: Origin,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -350,6 +415,7 @@ pub struct SessionMachine {
     provider_messages: Vec<rho_ai::Message>,
     leaf: Option<EntryId>,
     phase: Phase,
+    last_input_tokens: u64,
 }
 
 impl SessionMachine {
@@ -363,12 +429,27 @@ impl SessionMachine {
             config.thinking = thinking;
         }
         let leaf = entries.last().map(|entry| entry.id.clone());
+        let context_start = entries
+            .iter()
+            .rposition(|entry| matches!(entry.body, EntryBody::Compaction { .. }))
+            .map_or(0, |index| index + 1);
+        let last_input_tokens = entries[context_start..]
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.body {
+                EntryBody::Message {
+                    message: SessionMessage::Assistant(message),
+                } => Some(message.usage.input_tokens),
+                _ => None,
+            })
+            .unwrap_or(0);
         Ok(Self {
             config,
             entries,
             provider_messages: context.messages,
             leaf,
             phase: Phase::Idle,
+            last_input_tokens,
         })
     }
 
@@ -388,6 +469,18 @@ impl SessionMachine {
     #[must_use]
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    /// Returns the latest provider input-token estimate when policy says to compact.
+    #[must_use]
+    pub fn compaction_due(&self) -> Option<u64> {
+        let policy = self.config.compaction.as_ref()?;
+        (self.is_idle()
+            && self.last_input_tokens >= policy.threshold_tokens
+            && !plan_compaction(&self.entries, policy.retain_messages)
+                .compacted
+                .is_empty())
+        .then_some(self.last_input_tokens)
     }
 
     /// Handles an external or recovery command.
@@ -455,6 +548,82 @@ impl SessionMachine {
                     },
                 ))
             }
+            Input::Compact {
+                op,
+                at,
+                origin,
+                host,
+            } => {
+                if self.phase != Phase::Idle {
+                    return Err(MachineError::Busy);
+                }
+                let policy = self
+                    .config
+                    .compaction
+                    .as_ref()
+                    .ok_or(MachineError::CompactionDisabled)?;
+                let plan = plan_compaction(&self.entries, policy.retain_messages);
+                if plan.compacted.is_empty() {
+                    return Err(MachineError::NothingToCompact);
+                }
+                let work = CompactionWork {
+                    compacted: plan.compacted,
+                    retained_tail: plan.retained_tail,
+                    first_kept: plan.first_kept,
+                    tokens_before: self.last_input_tokens,
+                };
+                self.phase = Phase::AwaitingSummary {
+                    op: op.clone(),
+                    step: 1,
+                    work: work.clone(),
+                    origin,
+                };
+                let effects = vec![
+                    record_effect(
+                        &at,
+                        RecordBody::OpStarted {
+                            op: op.clone(),
+                            intent: OpIntent::Compaction,
+                            origin,
+                            host,
+                        },
+                    ),
+                    record_effect(
+                        &at,
+                        RecordBody::CompactionStarted {
+                            op: op.clone(),
+                            work: work.clone(),
+                        },
+                    ),
+                    record_effect(
+                        &at,
+                        RecordBody::Step {
+                            op: op.clone(),
+                            n: 1,
+                        },
+                    ),
+                    Effect::Emit(AgentEvent::OperationStarted {
+                        op: op.clone(),
+                        origin,
+                    }),
+                    Effect::Emit(AgentEvent::CompactionStarted {
+                        op: op.clone(),
+                        tokens_before: work.tokens_before,
+                    }),
+                ];
+                let action = Action::Summarize {
+                    request: self.summary_request(&work),
+                    model: self.config.model.clone(),
+                    origin,
+                };
+                Ok((
+                    self,
+                    Step::Do {
+                        effects,
+                        action: Some(action),
+                    },
+                ))
+            }
             Input::Resume { status, at } => match status {
                 LaneStatus::Idle => Ok((self, Step::Idle)),
                 LaneStatus::Suspended(mut suspended) => {
@@ -473,6 +642,10 @@ impl SessionMachine {
                                 host: None,
                             },
                         ));
+                    }
+
+                    if suspended.intent == OpIntent::Compaction {
+                        return self.resume_compaction(suspended, at, effects);
                     }
 
                     if suspended.abort_requested {
@@ -568,6 +741,109 @@ impl SessionMachine {
                 LaneStatus::Corrupt(_) => Err(MachineError::CorruptResume),
             },
         }
+    }
+
+    fn resume_compaction(
+        mut self,
+        suspended: crate::SuspendedOp,
+        at: Timestamp,
+        mut effects: Vec<Effect>,
+    ) -> Result<(Self, Step), MachineError> {
+        let op = suspended.op;
+        if suspended.abort_requested {
+            effects.extend(finish_effects(&op, OpOutcome::Aborted, &at));
+            self.phase = Phase::Idle;
+            return Ok((
+                self,
+                Step::Do {
+                    effects,
+                    action: None,
+                },
+            ));
+        }
+        let compaction = if let Some(compaction) = suspended.compaction {
+            compaction
+        } else {
+            let policy = self
+                .config
+                .compaction
+                .as_ref()
+                .ok_or(MachineError::CompactionDisabled)?;
+            let plan = plan_compaction(&self.entries, policy.retain_messages);
+            if plan.compacted.is_empty() {
+                return Err(MachineError::CorruptResume);
+            }
+            let work = CompactionWork {
+                compacted: plan.compacted,
+                retained_tail: plan.retained_tail,
+                first_kept: plan.first_kept,
+                tokens_before: self.last_input_tokens,
+            };
+            effects.push(record_effect(
+                &at,
+                RecordBody::CompactionStarted {
+                    op: op.clone(),
+                    work: work.clone(),
+                },
+            ));
+            Box::new(crate::SuspendedCompaction {
+                work,
+                completed: None,
+                usage_recorded: false,
+            })
+        };
+        if let Some(completed) = compaction.completed {
+            if !compaction.usage_recorded {
+                effects.push(record_effect(
+                    &at,
+                    RecordBody::Usage {
+                        op: op.clone(),
+                        usage: completed.usage,
+                    },
+                ));
+            }
+            effects.push(Effect::Emit(AgentEvent::CompactionFinished {
+                op: op.clone(),
+                summary: completed.summary,
+            }));
+            effects.extend(finish_effects(&op, OpOutcome::Completed, &at));
+            self.phase = Phase::Idle;
+            self.last_input_tokens = 0;
+            return Ok((
+                self,
+                Step::Do {
+                    effects,
+                    action: None,
+                },
+            ));
+        }
+
+        let next = suspended.last_step.unwrap_or(0) + 1;
+        effects.push(record_effect(
+            &at,
+            RecordBody::Step {
+                op: op.clone(),
+                n: next,
+            },
+        ));
+        self.phase = Phase::AwaitingSummary {
+            op: op.clone(),
+            step: next,
+            work: compaction.work.clone(),
+            origin: Origin::Replay,
+        };
+        let action = Action::Summarize {
+            request: self.summary_request(&compaction.work),
+            model: self.config.model.clone(),
+            origin: Origin::Replay,
+        };
+        Ok((
+            self,
+            Step::Do {
+                effects,
+                action: Some(action),
+            },
+        ))
     }
 
     fn resume_after_assistant(
@@ -795,10 +1071,22 @@ impl SessionMachine {
                 }
                 self.resolve_tool(pending, content, is_error, details, stamp)
             }
+            (
+                Phase::AwaitingSummary {
+                    op,
+                    step: _,
+                    work,
+                    origin: _,
+                },
+                ActionOutcome::Summary { result, stamp },
+            ) => self.resolve_summary(op, work, result, stamp),
             (Phase::Idle, _) => Err(MachineError::UnexpectedOutcome),
-            (Phase::AwaitingAssistant { .. } | Phase::AwaitingTool(_), _) => {
-                Err(MachineError::MismatchedOutcome)
-            }
+            (
+                Phase::AwaitingAssistant { .. }
+                | Phase::AwaitingTool(_)
+                | Phase::AwaitingSummary { .. },
+                _,
+            ) => Err(MachineError::MismatchedOutcome),
         }
     }
 
@@ -823,6 +1111,7 @@ impl SessionMachine {
                 return Ok(self.finish(op, outcome, &stamp.at));
             }
         };
+        self.last_input_tokens = message.usage.input_tokens;
         let stored = SessionMessage::Assistant(message.clone());
         let entry = NewEntry {
             id: stamp.id,
@@ -1092,6 +1381,67 @@ impl SessionMachine {
         }
     }
 
+    fn resolve_summary(
+        mut self,
+        op: OpId,
+        work: CompactionWork,
+        result: Result<CompactionSummary, ProviderError>,
+        stamp: EntryStamp,
+    ) -> Result<(Self, Step), MachineError> {
+        let summary = match result {
+            Ok(summary) => summary,
+            Err(error) => {
+                let outcome = if error.kind == ErrorKind::Cancelled {
+                    OpOutcome::Aborted
+                } else {
+                    OpOutcome::Failed {
+                        error: error.to_string(),
+                    }
+                };
+                return Ok(self.finish(op, outcome, &stamp.at));
+            }
+        };
+        let entry = NewEntry {
+            id: stamp.id,
+            parent: self.leaf.clone(),
+            lane: LaneName::main(),
+            op: Some(op.clone()),
+            at: stamp.at.clone(),
+            body: EntryBody::Compaction {
+                summary: summary.text.clone(),
+                first_kept: work.first_kept,
+                retained_tail: work.retained_tail,
+                tokens_before: work.tokens_before,
+                usage: summary.usage.clone(),
+            },
+        };
+        self.remember_entry(&entry);
+        self.last_input_tokens = 0;
+        let mut effects = vec![
+            Effect::AppendEntry(entry),
+            record_effect(
+                &stamp.at,
+                RecordBody::Usage {
+                    op: op.clone(),
+                    usage: summary.usage,
+                },
+            ),
+            Effect::Emit(AgentEvent::CompactionFinished {
+                op: op.clone(),
+                summary: summary.text,
+            }),
+        ];
+        effects.extend(finish_effects(&op, OpOutcome::Completed, &stamp.at));
+        self.phase = Phase::Idle;
+        Ok((
+            self,
+            Step::Do {
+                effects,
+                action: None,
+            },
+        ))
+    }
+
     fn prepare_calls(
         &self,
         message: &AssistantMessage,
@@ -1161,10 +1511,26 @@ impl SessionMachine {
         }
     }
 
-    fn remember_entry(&mut self, entry: &NewEntry) {
-        if let EntryBody::Message { message } = &entry.body {
-            self.provider_messages.push(message.to_provider());
+    fn summary_request(&self, work: &CompactionWork) -> Request {
+        let policy = self
+            .config
+            .compaction
+            .as_ref()
+            .expect("compaction work requires an enabled policy");
+        Request {
+            system: policy.system_prompt.clone(),
+            messages: work
+                .compacted
+                .iter()
+                .map(SessionMessage::to_provider)
+                .collect(),
+            tools: Vec::new(),
+            max_output_tokens: self.config.max_output_tokens,
+            thinking: self.config.thinking,
         }
+    }
+
+    fn remember_entry(&mut self, entry: &NewEntry) {
         self.leaf = Some(entry.id.clone());
         self.entries.push(Entry {
             seq: 0,
@@ -1175,6 +1541,9 @@ impl SessionMachine {
             at: entry.at.clone(),
             body: entry.body.clone(),
         });
+        self.provider_messages = assemble_context(&self.entries)
+            .expect("machine entries remain a valid root-to-leaf path")
+            .messages;
     }
 
     fn finish(mut self, op: OpId, outcome: OpOutcome, at: &Timestamp) -> (Self, Step) {
@@ -1254,6 +1623,7 @@ mod tests {
                 definition: ToolDefinition::new("read", "read", json!({"type": "object"})),
                 replay: ReplaySafety::Safe,
             }],
+            compaction: None,
         }
     }
 
@@ -1753,5 +2123,212 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error, MachineError::InvalidPrompt);
+    }
+
+    fn compaction_entries() -> Vec<Entry> {
+        let mut prior = None;
+        [
+            SessionMessage::user("old question"),
+            SessionMessage::Assistant(AssistantMessage {
+                blocks: vec![ContentBlock::text("old answer")],
+                stop: StopReason::Stop,
+                usage: Usage {
+                    input_tokens: 200,
+                    ..Usage::default()
+                },
+                provider: ProviderId::from("p"),
+                model: ModelId::from("m"),
+            }),
+            SessionMessage::user("retain this"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let id = EntryId::from(format!("e{}", index + 1));
+            let entry = Entry {
+                seq: u64::try_from(index + 1).unwrap(),
+                id: id.clone(),
+                parent: prior.clone(),
+                lane: LaneName::main(),
+                op: None,
+                at: Timestamp::from("t"),
+                body: EntryBody::Message { message },
+            };
+            prior = Some(id);
+            entry
+        })
+        .collect()
+    }
+
+    fn compaction_config() -> MachineConfig {
+        MachineConfig {
+            compaction: Some(CompactionConfig {
+                threshold_tokens: 100,
+                retain_messages: 1,
+                system_prompt: "Summarize the history faithfully.".to_owned(),
+            }),
+            ..config()
+        }
+    }
+
+    #[test]
+    fn compaction_is_a_durable_operation_with_an_isolated_request() {
+        let machine = SessionMachine::new(compaction_config(), compaction_entries()).unwrap();
+        assert_eq!(machine.compaction_due(), Some(200));
+        let (machine, Step::Do { effects, action }) = machine
+            .handle(Input::Compact {
+                op: OpId::from("compact"),
+                at: Timestamp::from("t4"),
+                origin: Origin::External,
+                host: None,
+            })
+            .unwrap()
+        else {
+            panic!("expected compaction action");
+        };
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::AppendRecord(NewRecord {
+                body: RecordBody::CompactionStarted { work, .. },
+                ..
+            }) if work.tokens_before == 200 && work.retained_tail.len() == 1
+        )));
+        let Some(Action::Summarize { request, .. }) = action else {
+            panic!("expected summarization request");
+        };
+        assert_eq!(request.system, "Summarize the history faithfully.");
+        assert_eq!(request.messages.len(), 2);
+        assert!(request.tools.is_empty());
+
+        let (machine, Step::Do { effects, action }) = machine
+            .resolve(ActionOutcome::Summary {
+                result: Ok(CompactionSummary {
+                    text: "old history summary".to_owned(),
+                    usage: Usage {
+                        input_tokens: 50,
+                        output_tokens: 10,
+                        ..Usage::default()
+                    },
+                }),
+                stamp: stamp("checkpoint"),
+            })
+            .unwrap()
+        else {
+            panic!("expected terminal compaction effects");
+        };
+        assert!(action.is_none());
+        assert!(machine.is_idle());
+        assert_eq!(machine.compaction_due(), None);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::AppendEntry(NewEntry {
+                body: EntryBody::Compaction {
+                    summary,
+                    retained_tail,
+                    tokens_before: 200,
+                    ..
+                },
+                ..
+            }) if summary == "old history summary" && retained_tail.len() == 1
+        )));
+    }
+
+    #[test]
+    fn resume_finishes_a_durable_compaction_checkpoint_without_reissuing_it() {
+        let op = OpId::from("compact");
+        let work = CompactionWork {
+            compacted: vec![SessionMessage::user("old")],
+            retained_tail: vec![SessionMessage::user("tail")],
+            first_kept: Some(EntryId::from("e3")),
+            tokens_before: 200,
+        };
+        let mut entries = compaction_entries();
+        entries.push(Entry {
+            seq: 6,
+            id: EntryId::from("checkpoint"),
+            parent: Some(EntryId::from("e3")),
+            lane: LaneName::main(),
+            op: Some(op.clone()),
+            at: Timestamp::from("t6"),
+            body: EntryBody::Compaction {
+                summary: "summary".to_owned(),
+                first_kept: work.first_kept.clone(),
+                retained_tail: work.retained_tail.clone(),
+                tokens_before: work.tokens_before,
+                usage: Usage::default(),
+            },
+        });
+        let items = vec![
+            Item::Entry(entries[0].clone()),
+            Item::Entry(entries[1].clone()),
+            Item::Entry(entries[2].clone()),
+            Item::Record(crate::Record {
+                seq: 4,
+                lane: LaneName::main(),
+                at: Timestamp::from("t4"),
+                body: RecordBody::OpStarted {
+                    op: op.clone(),
+                    intent: OpIntent::Compaction,
+                    origin: Origin::External,
+                    host: None,
+                },
+            }),
+            Item::Record(crate::Record {
+                seq: 5,
+                lane: LaneName::main(),
+                at: Timestamp::from("t5"),
+                body: RecordBody::CompactionStarted {
+                    op: op.clone(),
+                    work,
+                },
+            }),
+            Item::Record(crate::Record {
+                seq: 6,
+                lane: LaneName::main(),
+                at: Timestamp::from("t5"),
+                body: RecordBody::Step {
+                    op: op.clone(),
+                    n: 1,
+                },
+            }),
+            Item::Entry(Entry {
+                seq: 7,
+                ..entries[3].clone()
+            }),
+        ];
+        let status = crate::reduce_lane_status(&items, &LaneName::main());
+        assert!(matches!(
+            &status,
+            LaneStatus::Suspended(suspended)
+                if matches!(
+                    suspended.compaction.as_deref(),
+                    Some(crate::SuspendedCompaction {
+                        completed: Some(_),
+                        ..
+                    })
+                )
+        ));
+        let machine = SessionMachine::new(compaction_config(), entries).unwrap();
+        let (machine, Step::Do { effects, action }) = machine
+            .handle(Input::Resume {
+                status,
+                at: Timestamp::from("t8"),
+            })
+            .unwrap()
+        else {
+            panic!("expected recovery effects");
+        };
+        assert!(machine.is_idle());
+        assert!(action.is_none());
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::AppendRecord(NewRecord {
+                body: RecordBody::OpFinished {
+                    outcome: OpOutcome::Completed,
+                    ..
+                },
+                ..
+            })
+        )));
     }
 }
