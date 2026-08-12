@@ -7,8 +7,10 @@ use rho_core::ReplaySafety;
 use serde_json::Value;
 
 mod builtins;
+mod mcp;
 
 pub use builtins::{BashTool, EditTool, ReadTool, WriteTool, coding_tools};
+pub use mcp::{McpConnection, McpError, McpStdioConfig, McpTool};
 
 /// Type-erased future returned by tool implementations.
 pub type ToolFuture<'tool> = Pin<Box<dyn Future<Output = ToolOutput> + Send + 'tool>>;

@@ -218,6 +218,26 @@ configured working directory and absolute paths remain available.
 tools and both nanocodex and rig already speak it. Tool extensibility should not
 wait for the WASM ABI.
 
+**MCP v1 scope (DECIDED)**: client-launched stdio servers, using the current
+`2026-07-28` stateless protocol with the specification's discovery probe and
+fallback to the initialization-based `2025-11-25` through `2024-11-05`
+revisions. Every configured server has a short stable name; remote tools are
+exposed through the provider-portable `mcp__<server>__<tool>` namespace (MCP
+dots normalize to underscores, and normalization collisions fail the whole
+connection). Server declarations and annotations are untrusted: schemas are
+validated at connection time, task-required tools are rejected until rho has
+that extension, and every MCP tool is `ReplaySafety::Never`.
+
+The first client deliberately snapshots all paginated tools at process start.
+It ignores list-change notifications and does not restart a failed process;
+reconnect is the refresh/recovery operation. Requests have deadlines and emit
+MCP cancellation on timeout or caller abort. Text and images cross the native
+content boundary, resource blocks get model-visible text representations,
+unsupported audio is identified but omitted, and structured content is retained
+as journal details. Server stderr is drained continuously and retained as an
+8 KiB diagnostic tail. stdio servers inherit the host environment plus explicit
+overrides, so their containment and credential scope are operator decisions.
+
 **Safety stance (v1, DECIDED)**: no built-in tool gating — like pi, rho v1
 delegates safety to the execution environment (containers, sandboxes, VMs) and
 documents that posture plainly. The `before_tool` hook and the RPC interaction
@@ -385,7 +405,9 @@ Open:
 4. Thinking-level / model-switch mid-session semantics. The provider side is
    now settled (spec/01 §1.1: switch = reopen via the factory); still open is
    the loop side — keep pi's per-turn swap point?
-5. MCP wiring: server config location (user-level per config decision),
-   collision handling, process supervision (possibly the first real
-   shelterwood use inside rho).
+5. MCP config location and supervision — **settled for v1**: MCP server entries
+   live in the user-level host config; namespacing/collision and fixed-snapshot
+   behavior are specified in §2.3. The Tokio stdio client owns child lifetime;
+   automatic restart and Shelterwood supervision are deferred until runtime
+   evidence warrants them.
 6. Workspace/naming: binary `rho`, crate prefix `rho-` — confirm and scaffold.
