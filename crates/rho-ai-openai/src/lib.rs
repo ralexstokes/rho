@@ -86,6 +86,10 @@ impl OpenAiFactory {
 }
 
 impl ProviderFactory for OpenAiFactory {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::from(PROVIDER)
+    }
+
     fn models(&self) -> &[ModelInfo] {
         &self.models
     }
