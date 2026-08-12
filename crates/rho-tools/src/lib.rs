@@ -1,14 +1,14 @@
-//! Tool boundary traits, replay metadata, and executor registry.
-//!
-//! Built-in tool implementations arrive in phase 3. Phase 2 needs this small
-//! boundary so the session driver can execute prepared calls without owning
-//! tool I/O or policy.
+//! Tool boundary traits, replay metadata, executor registry, and coding tools.
 
 use std::{future::Future, pin::Pin};
 
 use rho_ai::{CancellationToken, ContentBlock, ToolDefinition};
 use rho_core::ReplaySafety;
 use serde_json::Value;
+
+mod builtins;
+
+pub use builtins::{BashTool, EditTool, ReadTool, WriteTool, coding_tools};
 
 /// Type-erased future returned by tool implementations.
 pub type ToolFuture<'tool> = Pin<Box<dyn Future<Output = ToolOutput> + Send + 'tool>>;
