@@ -338,6 +338,28 @@ pub enum QueueChange {
     },
 }
 
+/// Durable inputs required to resume an interrupted compaction.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CompactionWork {
+    /// Messages presented to the summarization model.
+    pub compacted: Vec<SessionMessage>,
+    /// Self-contained tail copied into the checkpoint.
+    pub retained_tail: Vec<SessionMessage>,
+    /// First retained entry when the tail maps directly to stored entries.
+    pub first_kept: Option<EntryId>,
+    /// Token estimate that triggered compaction.
+    pub tokens_before: u64,
+}
+
+/// Durable compaction result recovered from a checkpoint entry.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CompletedCompaction {
+    /// Generated summary.
+    pub summary: String,
+    /// Provider token accounting for the summarization request.
+    pub usage: Usage,
+}
+
 /// Journal record payload.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[non_exhaustive]
@@ -386,6 +408,13 @@ pub enum RecordBody {
         /// Interruption replay policy.
         replay: ReplaySafety,
     },
+    /// Records all inputs needed to resume a compaction operation.
+    CompactionStarted {
+        /// Operation identity.
+        op: OpId,
+        /// Deterministic compaction plan and trigger metadata.
+        work: CompactionWork,
+    },
     /// Records queue state.
     QueueChanged {
         /// Active operation, when the change happened during one.
@@ -417,6 +446,7 @@ impl RecordBody {
             | Self::AbortRequested { op }
             | Self::Step { op, .. }
             | Self::ToolStarted { op, .. }
+            | Self::CompactionStarted { op, .. }
             | Self::Usage { op, .. } => Some(op),
             Self::QueueChanged { op, .. } => op.as_ref(),
             Self::LaneMoved { .. } => None,
@@ -532,6 +562,19 @@ pub struct SuspendedOp {
     pub last_assistant_usage_recorded: bool,
     /// Calls from `last_assistant` that already have durable results.
     pub resolved_tool_calls: Vec<ToolCallId>,
+    /// Resumable compaction state for a compaction operation.
+    pub compaction: Option<Box<SuspendedCompaction>>,
+}
+
+/// Journal-derived state for an interrupted compaction operation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SuspendedCompaction {
+    /// Durable summary inputs.
+    pub work: CompactionWork,
+    /// Checkpoint result when it was written before the crash.
+    pub completed: Option<CompletedCompaction>,
+    /// Whether usage for the completed checkpoint is already durable.
+    pub usage_recorded: bool,
 }
 
 /// Named impossible journal sequence.
@@ -611,6 +654,28 @@ pub enum CorruptionReason {
     },
     /// A completed operation still had a provider stream in flight.
     CompletedWithStreamInFlight {
+        /// Operation identity.
+        op: OpId,
+    },
+    /// A normal run recorded compaction-only state or vice versa.
+    IntentMismatch {
+        /// Operation identity.
+        op: OpId,
+        /// Durable operation intent.
+        intent: OpIntent,
+    },
+    /// A compaction operation recorded its work item more than once.
+    DuplicateCompactionStart {
+        /// Operation identity.
+        op: OpId,
+    },
+    /// A compaction checkpoint appeared without durable work metadata.
+    CompactionWithoutStart {
+        /// Operation identity.
+        op: OpId,
+    },
+    /// A compaction operation completed without producing a checkpoint.
+    CompletedCompactionWithoutCheckpoint {
         /// Operation identity.
         op: OpId,
     },
