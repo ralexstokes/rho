@@ -97,6 +97,9 @@ pub enum SessionError {
     /// Entry identity was already present.
     #[error("entry {0} already exists")]
     DuplicateEntry(EntryId),
+    /// Format v1 only supports the main execution lane.
+    #[error("session format v1 does not support lane {0}")]
+    UnsupportedLane(LaneName),
     /// Entry identity is absent.
     #[error("entry {0} was not found")]
     UnknownEntry(EntryId),
@@ -246,6 +249,9 @@ fn append_entry_to_items(
     leaf: &mut Option<EntryId>,
     entry: NewEntry,
 ) -> Result<Entry, SessionError> {
+    if entry.lane.as_str() != LaneName::MAIN {
+        return Err(SessionError::UnsupportedLane(entry.lane));
+    }
     if items
         .iter()
         .any(|item| matches!(item, Item::Entry(existing) if existing.id == entry.id))
@@ -305,6 +311,21 @@ pub mod conformance {
                 },
             })
             .expect("append root");
+        let unsupported = EntryId::from("00000000-0000-7000-8000-000000000099");
+        assert!(matches!(
+            session.append_entry(NewEntry {
+                id: unsupported,
+                parent: Some(root.clone()),
+                lane: LaneName::from("background"),
+                op: None,
+                at: Timestamp::from("2026-08-11T00:00:00Z"),
+                body: EntryBody::Message {
+                    message: SessionMessage::user("unsupported lane"),
+                },
+            }),
+            Err(SessionError::UnsupportedLane(lane)) if lane.as_str() == "background"
+        ));
+        assert_eq!(session.leaf(), Some(root.clone()));
         let child = EntryId::from("00000000-0000-7000-8000-000000000002");
         session
             .append_entry(NewEntry {

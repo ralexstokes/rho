@@ -223,7 +223,9 @@ fn assistant_calls(message: &SessionMessage) -> Vec<ToolCallId> {
         .blocks
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolCall { id, .. } => Some(id.clone()),
+            ContentBlock::ToolCall { id, .. } | ContentBlock::RejectedToolCall { id, .. } => {
+                Some(id.clone())
+            }
             _ => None,
         })
         .collect()
@@ -232,7 +234,8 @@ fn assistant_calls(message: &SessionMessage) -> Vec<ToolCallId> {
 #[cfg(test)]
 mod tests {
     use rho_ai::{
-        AssistantMessage, ContentBlock, ModelId, ProviderId, StopReason, ToolCallId, Usage,
+        AssistantMessage, ContentBlock, ModelId, ProviderId, StopReason, ToolArgumentError,
+        ToolCallId, Usage,
     };
 
     use crate::{LaneName, Timestamp};
@@ -288,15 +291,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compaction_keeps_tool_call_and_result_together() {
-        let call_id = ToolCallId::from("call");
+    fn assert_compaction_keeps_call_and_result_together(call: ContentBlock) {
+        let call_id = match &call {
+            ContentBlock::ToolCall { id, .. } | ContentBlock::RejectedToolCall { id, .. } => {
+                id.clone()
+            }
+            _ => panic!("test requires a tool call block"),
+        };
         let assistant = AssistantMessage {
-            blocks: vec![ContentBlock::ToolCall {
-                id: call_id.clone(),
-                name: "read".to_owned(),
-                args: serde_json::json!({}),
-            }],
+            blocks: vec![call],
             stop: StopReason::ToolUse,
             usage: Usage::default(),
             provider: ProviderId::from("p"),
@@ -336,6 +339,28 @@ mod tests {
             [ToolCallId::from("call")]
         );
         assert!(unresolved_tool_calls(&entries).unwrap().is_empty());
+    }
+
+    #[test]
+    fn compaction_keeps_tool_call_and_result_together() {
+        assert_compaction_keeps_call_and_result_together(ContentBlock::ToolCall {
+            id: ToolCallId::from("call"),
+            name: "read".to_owned(),
+            args: serde_json::json!({}),
+        });
+    }
+
+    #[test]
+    fn compaction_keeps_rejected_tool_call_and_result_together() {
+        assert_compaction_keeps_call_and_result_together(ContentBlock::RejectedToolCall {
+            id: ToolCallId::from("call"),
+            name: "read".to_owned(),
+            args: None,
+            error: ToolArgumentError {
+                kind: "json_parse".to_owned(),
+                message: "bad JSON".to_owned(),
+            },
+        });
     }
 
     #[test]
