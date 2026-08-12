@@ -316,19 +316,18 @@ pub enum MachineError {
 #[derive(Clone, Debug, PartialEq)]
 enum Phase {
     Idle,
-    AwaitingAssistant {
-        op: OpId,
-        step: u32,
-        origin: Origin,
-    },
-    AwaitingTool {
-        op: OpId,
-        step: u32,
-        current: PendingTool,
-        remaining: VecDeque<PendingTool>,
-        after: AfterTools,
-        origin: Origin,
-    },
+    AwaitingAssistant { op: OpId, step: u32, origin: Origin },
+    AwaitingTool(AwaitingTool),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AwaitingTool {
+    op: OpId,
+    step: u32,
+    current: PendingTool,
+    remaining: VecDeque<PendingTool>,
+    after: AfterTools,
+    origin: Origin,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -458,7 +457,7 @@ impl SessionMachine {
             }
             Input::Resume { status, at } => match status {
                 LaneStatus::Idle => Ok((self, Step::Idle)),
-                LaneStatus::Suspended(suspended) => {
+                LaneStatus::Suspended(mut suspended) => {
                     let op = suspended.op.clone();
                     let mut effects = vec![Effect::Emit(AgentEvent::OperationStarted {
                         op: op.clone(),
@@ -508,14 +507,14 @@ impl SessionMachine {
                             call: current.call.clone(),
                             origin: Origin::Replay,
                         };
-                        self.phase = Phase::AwaitingTool {
+                        self.phase = Phase::AwaitingTool(AwaitingTool {
                             op: op.clone(),
                             step: suspended.last_step.unwrap_or(0),
                             current,
                             remaining: calls,
                             after: AfterTools::Finish(OpOutcome::Aborted),
                             origin: Origin::Replay,
-                        };
+                        });
                         return Ok((
                             self,
                             Step::Do {
@@ -526,7 +525,7 @@ impl SessionMachine {
                     }
 
                     if !suspended.stream_in_flight
-                        && let Some(message) = suspended.last_assistant
+                        && let Some(message) = suspended.last_assistant.take()
                     {
                         if !suspended.last_assistant_usage_recorded {
                             effects.push(record_effect(
@@ -537,15 +536,7 @@ impl SessionMachine {
                                 },
                             ));
                         }
-                        return self.resume_after_assistant(
-                            op,
-                            suspended.last_step.unwrap_or(0),
-                            message,
-                            suspended.open_tools,
-                            &suspended.resolved_tool_calls,
-                            at,
-                            effects,
-                        );
+                        return self.resume_after_assistant(suspended, message, at, effects);
                     }
 
                     let next = suspended.last_step.unwrap_or(0) + 1;
@@ -579,17 +570,17 @@ impl SessionMachine {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn resume_after_assistant(
         mut self,
-        op: OpId,
-        step: u32,
+        suspended: crate::SuspendedOp,
         message: AssistantMessage,
-        open_tools: Vec<crate::OpenTool>,
-        resolved_tool_calls: &[ToolCallId],
         at: Timestamp,
         mut effects: Vec<Effect>,
     ) -> Result<(Self, Step), MachineError> {
+        let op = suspended.op;
+        let step = suspended.last_step.unwrap_or(0);
+        let open_tools = suspended.open_tools;
+        let resolved_tool_calls = suspended.resolved_tool_calls;
         match message.stop {
             StopReason::Stop => {
                 effects.extend(finish_effects(&op, OpOutcome::Completed, &at));
@@ -688,14 +679,14 @@ impl SessionMachine {
                     call: current.call.clone(),
                     origin: Origin::Replay,
                 };
-                self.phase = Phase::AwaitingTool {
+                self.phase = Phase::AwaitingTool(AwaitingTool {
                     op,
                     step,
                     current,
                     remaining: calls,
                     after: AfterTools::Stream,
                     origin: Origin::Replay,
-                };
+                });
                 Ok((
                     self,
                     Step::Do {
@@ -787,14 +778,7 @@ impl SessionMachine {
                 ActionOutcome::Assistant { result, stamp },
             ) => self.resolve_assistant(op, step, origin, result, stamp),
             (
-                Phase::AwaitingTool {
-                    op,
-                    step,
-                    current,
-                    remaining,
-                    after,
-                    origin,
-                },
+                Phase::AwaitingTool(pending),
                 ActionOutcome::Tool {
                     call_id,
                     content,
@@ -803,18 +787,16 @@ impl SessionMachine {
                     stamp,
                 },
             ) => {
-                if call_id != current.call.call_id {
+                if call_id != pending.current.call.call_id {
                     return Err(MachineError::MismatchedToolCall {
-                        expected: current.call.call_id,
+                        expected: pending.current.call.call_id,
                         actual: call_id,
                     });
                 }
-                self.resolve_tool(
-                    op, step, current, remaining, after, origin, content, is_error, details, stamp,
-                )
+                self.resolve_tool(pending, content, is_error, details, stamp)
             }
             (Phase::Idle, _) => Err(MachineError::UnexpectedOutcome),
-            (Phase::AwaitingAssistant { .. } | Phase::AwaitingTool { .. }, _) => {
+            (Phase::AwaitingAssistant { .. } | Phase::AwaitingTool(_), _) => {
                 Err(MachineError::MismatchedOutcome)
             }
         }
@@ -916,14 +898,14 @@ impl SessionMachine {
                     call: current.call.clone(),
                     origin,
                 };
-                self.phase = Phase::AwaitingTool {
+                self.phase = Phase::AwaitingTool(AwaitingTool {
                     op,
                     step,
                     current,
                     remaining: calls,
                     after: AfterTools::Stream,
                     origin,
-                };
+                });
                 Ok((
                     self,
                     Step::Do {
@@ -1002,20 +984,22 @@ impl SessionMachine {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn resolve_tool(
         mut self,
-        op: OpId,
-        step: u32,
-        current: PendingTool,
-        mut remaining: VecDeque<PendingTool>,
-        after: AfterTools,
-        origin: Origin,
+        pending: AwaitingTool,
         content: Vec<ContentBlock>,
         is_error: bool,
         details: Option<Value>,
         stamp: EntryStamp,
     ) -> Result<(Self, Step), MachineError> {
+        let AwaitingTool {
+            op,
+            step,
+            current,
+            mut remaining,
+            after,
+            origin,
+        } = pending;
         let message = SessionMessage::ToolResult {
             call_id: current.call.call_id,
             content,
@@ -1049,14 +1033,14 @@ impl SessionMachine {
                 call: next.call.clone(),
                 origin,
             };
-            self.phase = Phase::AwaitingTool {
+            self.phase = Phase::AwaitingTool(AwaitingTool {
                 op,
                 step,
                 current: next,
                 remaining,
                 after,
                 origin,
-            };
+            });
             return Ok((
                 self,
                 Step::Do {

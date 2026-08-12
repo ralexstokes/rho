@@ -6,11 +6,7 @@
 
 #![allow(clippy::disallowed_methods)]
 
-use std::{
-    future::Future,
-    pin::Pin,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{future::Future, pin::Pin};
 
 use futures_util::StreamExt;
 use rho_ai::{
@@ -160,78 +156,104 @@ pub enum DriverError {
     },
 }
 
-/// Runs one prompt to a terminal state using the same machine exposed for
-/// manual drive and deterministic replay.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_prompt(
-    machine: SessionMachine,
-    session: &mut dyn Session,
-    provider: &mut BoundProvider,
-    tools: &ToolSet,
-    message: SessionMessage,
-    origin: Origin,
-    host: Option<rho_core::HostInfo>,
-    stamps: &mut dyn StampSource,
+/// Mutable shell resources used to execute deterministic machine steps.
+pub struct Driver<'driver> {
+    session: &'driver mut dyn Session,
+    provider: &'driver mut BoundProvider,
+    tools: &'driver ToolSet,
+    stamps: &'driver mut dyn StampSource,
     cancellation: CancellationToken,
-    events: &mut dyn EventSink,
-) -> Result<SessionMachine, DriverError> {
-    validate_binding(&machine, session)?;
-    validate_provider(&machine, provider)?;
-    let status = session.lane_status()?;
-    if status != rho_core::LaneStatus::Idle {
-        return Err(DriverError::LaneNotIdle {
-            status: Box::new(status),
-        });
-    }
-    let input = Input::Prompt {
-        message,
-        op: stamps.op_id(),
-        stamp: stamps.entry(),
-        origin,
-        host,
-    };
-    let (machine, step) = machine.handle(input)?;
-    drive(
-        machine,
-        step,
-        session,
-        provider,
-        tools,
-        stamps,
-        cancellation,
-        events,
-    )
-    .await
+    events: &'driver mut dyn EventSink,
 }
 
-/// Resumes the single suspended operation described by the durable journal.
-#[allow(clippy::too_many_arguments)]
-pub async fn resume(
-    machine: SessionMachine,
-    session: &mut dyn Session,
-    provider: &mut BoundProvider,
-    tools: &ToolSet,
-    stamps: &mut dyn StampSource,
-    cancellation: CancellationToken,
-    events: &mut dyn EventSink,
-) -> Result<SessionMachine, DriverError> {
-    validate_binding(&machine, session)?;
-    let status = session.lane_status()?;
-    let (machine, step) = machine.handle(Input::Resume {
-        status,
-        at: stamps.timestamp(),
-    })?;
-    drive(
-        machine,
-        step,
-        session,
-        provider,
-        tools,
-        stamps,
-        cancellation,
-        events,
-    )
-    .await
+impl<'driver> Driver<'driver> {
+    /// Binds the resources used for one or more automatic driver operations.
+    pub fn new(
+        session: &'driver mut dyn Session,
+        provider: &'driver mut BoundProvider,
+        tools: &'driver ToolSet,
+        stamps: &'driver mut dyn StampSource,
+        cancellation: CancellationToken,
+        events: &'driver mut dyn EventSink,
+    ) -> Self {
+        Self {
+            session,
+            provider,
+            tools,
+            stamps,
+            cancellation,
+            events,
+        }
+    }
+
+    /// Runs one prompt to a terminal state using the same machine exposed for
+    /// manual drive and deterministic replay.
+    pub async fn run_prompt(
+        &mut self,
+        machine: SessionMachine,
+        message: SessionMessage,
+        origin: Origin,
+        host: Option<rho_core::HostInfo>,
+    ) -> Result<SessionMachine, DriverError> {
+        validate_binding(&machine, self.session)?;
+        validate_provider(&machine, self.provider)?;
+        let status = self.session.lane_status()?;
+        if status != rho_core::LaneStatus::Idle {
+            return Err(DriverError::LaneNotIdle {
+                status: Box::new(status),
+            });
+        }
+        let input = Input::Prompt {
+            message,
+            op: self.stamps.op_id(),
+            stamp: self.stamps.entry(),
+            origin,
+            host,
+        };
+        let (machine, step) = machine.handle(input)?;
+        self.drive(machine, step).await
+    }
+
+    /// Resumes the single suspended operation described by the durable journal.
+    pub async fn resume(&mut self, machine: SessionMachine) -> Result<SessionMachine, DriverError> {
+        validate_binding(&machine, self.session)?;
+        let status = self.session.lane_status()?;
+        let (machine, step) = machine.handle(Input::Resume {
+            status,
+            at: self.stamps.timestamp(),
+        })?;
+        self.drive(machine, step).await
+    }
+
+    async fn drive(
+        &mut self,
+        mut machine: SessionMachine,
+        mut step: Step,
+    ) -> Result<SessionMachine, DriverError> {
+        loop {
+            match step {
+                Step::Do { effects, action } => {
+                    apply_effects(self.session, self.events, effects).await?;
+                    let Some(action) = action else {
+                        return Ok(machine);
+                    };
+                    let outcome = execute_action(
+                        action,
+                        self.provider,
+                        self.tools,
+                        self.stamps,
+                        self.cancellation.clone(),
+                        self.events,
+                    )
+                    .await?;
+                    (machine, step) = machine.resolve(outcome)?;
+                }
+                Step::Idle => return Ok(machine),
+                Step::AwaitingOutcome => return Err(DriverError::Suspended),
+                _ => return Err(DriverError::UnsupportedAction("future step variant")),
+            }
+        }
+    }
 }
 
 fn validate_binding(machine: &SessionMachine, session: &dyn Session) -> Result<(), DriverError> {
@@ -263,42 +285,6 @@ fn validate_provider(
             expected: machine.model().clone(),
             actual: provider.model().clone(),
         })
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn drive(
-    mut machine: SessionMachine,
-    mut step: Step,
-    session: &mut dyn Session,
-    provider: &mut BoundProvider,
-    tools: &ToolSet,
-    stamps: &mut dyn StampSource,
-    cancellation: CancellationToken,
-    events: &mut dyn EventSink,
-) -> Result<SessionMachine, DriverError> {
-    loop {
-        match step {
-            Step::Do { effects, action } => {
-                apply_effects(session, events, effects).await?;
-                let Some(action) = action else {
-                    return Ok(machine);
-                };
-                let outcome = execute_action(
-                    action,
-                    provider,
-                    tools,
-                    stamps,
-                    cancellation.clone(),
-                    events,
-                )
-                .await?;
-                (machine, step) = machine.resolve(outcome)?;
-            }
-            Step::Idle => return Ok(machine),
-            Step::AwaitingOutcome => return Err(DriverError::Suspended),
-            _ => return Err(DriverError::UnsupportedAction("future step variant")),
-        }
     }
 }
 
@@ -390,37 +376,7 @@ async fn execute_action(
 }
 
 fn system_timestamp() -> Timestamp {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let seconds = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
-    let days = seconds.div_euclid(86_400);
-    let day_seconds = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let hour = day_seconds / 3_600;
-    let minute = day_seconds % 3_600 / 60;
-    let second = day_seconds % 60;
-    let nanos = duration.subsec_nanos();
-    Timestamp::from(if nanos == 0 {
-        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-    } else {
-        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos:09}Z")
-    })
-}
-
-fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
-    let z = days_since_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    (year, month, day)
+    Timestamp::from(jiff::Timestamp::now().to_string())
 }
 
 #[cfg(test)]
@@ -556,17 +512,19 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        let machine = run_prompt(
-            machine,
+        let machine = Driver::new(
             session.as_mut(),
             &mut provider,
             &ToolSet::new(),
-            SessionMessage::user("hello"),
-            Origin::External,
-            None,
             &mut FixedStamps { next: 1 },
             CancellationToken::new(),
             &mut NoopEventSink,
+        )
+        .run_prompt(
+            machine,
+            SessionMessage::user("hello"),
+            Origin::External,
+            None,
         )
         .await
         .unwrap();
@@ -574,17 +532,19 @@ mod tests {
         assert_eq!(session.export_entries().unwrap().len(), 2);
         assert_eq!(session.lane_status().unwrap(), rho_core::LaneStatus::Idle);
 
-        let machine = run_prompt(
-            machine,
+        let machine = Driver::new(
             session.as_mut(),
             &mut provider,
             &ToolSet::new(),
-            SessionMessage::user("again"),
-            Origin::External,
-            None,
             &mut FixedStamps { next: 10 },
             CancellationToken::new(),
             &mut NoopEventSink,
+        )
+        .run_prompt(
+            machine,
+            SessionMessage::user("again"),
+            Origin::External,
+            None,
         )
         .await
         .unwrap();
@@ -607,8 +567,7 @@ mod tests {
         )
         .unwrap();
         let item_count = session.log(0, usize::MAX).unwrap().len();
-        let resumed = resume(
-            wrong_model.clone(),
+        let resumed = Driver::new(
             session.as_mut(),
             &mut provider,
             &ToolSet::new(),
@@ -616,22 +575,25 @@ mod tests {
             CancellationToken::new(),
             &mut NoopEventSink,
         )
+        .resume(wrong_model.clone())
         .await
         .unwrap();
         assert!(resumed.is_idle());
         assert_eq!(session.log(0, usize::MAX).unwrap().len(), item_count);
 
-        let error = run_prompt(
-            wrong_model,
+        let error = Driver::new(
             session.as_mut(),
             &mut provider,
             &ToolSet::new(),
-            SessionMessage::user("wrong model"),
-            Origin::External,
-            None,
             &mut FixedStamps { next: 15 },
             CancellationToken::new(),
             &mut NoopEventSink,
+        )
+        .run_prompt(
+            wrong_model,
+            SessionMessage::user("wrong model"),
+            Origin::External,
+            None,
         )
         .await
         .unwrap_err();
@@ -655,17 +617,19 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        let error = run_prompt(
-            unrelated,
+        let error = Driver::new(
             session.as_mut(),
             &mut provider,
             &ToolSet::new(),
-            SessionMessage::user("wrong session"),
-            Origin::External,
-            None,
             &mut FixedStamps { next: 20 },
             CancellationToken::new(),
             &mut NoopEventSink,
+        )
+        .run_prompt(
+            unrelated,
+            SessionMessage::user("wrong session"),
+            Origin::External,
+            None,
         )
         .await
         .unwrap_err();
@@ -813,24 +777,25 @@ mod tests {
         )
         .unwrap();
 
-        let error = run_prompt(
-            machine.clone(),
+        let error = Driver::new(
             session.as_mut(),
             &mut provider,
             &ToolSet::new(),
-            SessionMessage::user("must resume first"),
-            Origin::External,
-            None,
             &mut FixedStamps { next: 8 },
             CancellationToken::new(),
             &mut NoopEventSink,
+        )
+        .run_prompt(
+            machine.clone(),
+            SessionMessage::user("must resume first"),
+            Origin::External,
+            None,
         )
         .await
         .unwrap_err();
         assert!(matches!(error, DriverError::LaneNotIdle { .. }));
 
-        let machine = resume(
-            machine,
+        let machine = Driver::new(
             session.as_mut(),
             &mut provider,
             &ToolSet::new(),
@@ -838,6 +803,7 @@ mod tests {
             CancellationToken::new(),
             &mut NoopEventSink,
         )
+        .resume(machine)
         .await
         .unwrap();
         assert!(machine.is_idle());
