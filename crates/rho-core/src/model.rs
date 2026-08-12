@@ -386,6 +386,101 @@ pub enum QueueError {
     },
 }
 
+/// Stable hook point in the session choreography.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookPoint {
+    /// Run lifecycle entry.
+    RunStarted,
+    /// Transform the assembled provider request.
+    TransformContext,
+    /// Inspect or replace the request immediately before generation.
+    BeforeRequest,
+    /// Observe the durable assistant result.
+    AfterRequest,
+    /// Inspect or replace a prepared tool call before it is journaled.
+    BeforeTool,
+    /// Observe a durable tool result.
+    AfterTool,
+    /// Inspect or replace a compaction request.
+    BeforeCompaction,
+    /// Run lifecycle exit before the terminal record is appended.
+    RunFinished,
+}
+
+/// Headless interaction request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InteractionRequest {
+    /// Stable request identifier minted by the hook host.
+    pub id: String,
+    /// User-facing prompt.
+    pub prompt: String,
+    /// Timeout in milliseconds.
+    pub timeout_ms: u64,
+}
+
+/// Durable answer to a headless interaction.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InteractionAnswer {
+    /// User supplied a value.
+    Answered {
+        /// Answer text.
+        value: String,
+    },
+    /// User declined.
+    Declined,
+    /// No answer arrived before the deadline or the host restarted.
+    TimedOut,
+}
+
+/// Owned, serializable hook invocation payload.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct HookInvocation {
+    /// Typed hook point.
+    pub hook: HookPoint,
+    /// Hook-specific owned payload.
+    pub payload: Value,
+}
+
+/// Result returned by a hook host.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HookOutput {
+    /// Continue the hook pipeline with an owned result value.
+    Continue {
+        /// Hook-point-specific result.
+        value: Value,
+    },
+    /// Suspend this hook on a headless client interaction.
+    Interact {
+        /// Request surfaced to the client.
+        request: InteractionRequest,
+    },
+}
+
+/// Journal-derived interaction state inside an interrupted hook.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SuspendedInteraction {
+    /// Request surfaced to the client.
+    pub request: InteractionRequest,
+    /// Durable answer, when one arrived before the interruption.
+    pub answer: Option<InteractionAnswer>,
+}
+
+/// Journal-derived hook state for an interrupted operation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SuspendedHook {
+    /// Consecutive one-based hook action number within the operation.
+    pub n: u32,
+    /// Exact invocation passed to the hook host.
+    pub invocation: HookInvocation,
+    /// Durable terminal hook result, when available.
+    pub result: Option<Result<HookOutput, String>>,
+    /// Ordered nested interactions, with at most the newest awaiting an answer.
+    pub interactions: Vec<SuspendedInteraction>,
+}
+
 /// Durable inputs required to resume an interrupted compaction.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CompactionWork {
@@ -463,6 +558,44 @@ pub enum RecordBody {
         /// Deterministic compaction plan and trigger metadata.
         work: CompactionWork,
     },
+    /// Records a hook invocation before calling extension code.
+    HookStarted {
+        /// Operation identity.
+        op: OpId,
+        /// Consecutive hook action number.
+        n: u32,
+        /// Exact owned invocation.
+        invocation: HookInvocation,
+    },
+    /// Records a hook's terminal result.
+    HookFinished {
+        /// Operation identity.
+        op: OpId,
+        /// Matching hook action number.
+        n: u32,
+        /// Hook decision or normalized host failure.
+        result: Result<HookOutput, String>,
+    },
+    /// Records a client interaction before it is surfaced.
+    InteractionRequested {
+        /// Operation identity.
+        op: OpId,
+        /// Hook action waiting for the answer.
+        hook: u32,
+        /// Exact client request.
+        request: InteractionRequest,
+    },
+    /// Records an interaction answer before resuming its hook.
+    InteractionAnswered {
+        /// Operation identity.
+        op: OpId,
+        /// Hook action waiting for the answer.
+        hook: u32,
+        /// Stable request identity.
+        request_id: String,
+        /// Durable answer.
+        answer: InteractionAnswer,
+    },
     /// Records queue state.
     QueueChanged {
         /// Active operation, when the change happened during one.
@@ -495,6 +628,10 @@ impl RecordBody {
             | Self::Step { op, .. }
             | Self::ToolStarted { op, .. }
             | Self::CompactionStarted { op, .. }
+            | Self::HookStarted { op, .. }
+            | Self::HookFinished { op, .. }
+            | Self::InteractionRequested { op, .. }
+            | Self::InteractionAnswered { op, .. }
             | Self::Usage { op, .. } => Some(op),
             Self::QueueChanged { op, .. } => op.as_ref(),
             Self::LaneMoved { .. } => None,
@@ -612,6 +749,10 @@ pub struct SuspendedOp {
     pub resolved_tool_calls: Vec<ToolCallId>,
     /// Resumable compaction state for a compaction operation.
     pub compaction: Option<Box<SuspendedCompaction>>,
+    /// Last durable hook action number.
+    pub last_hook: u32,
+    /// Latest hook action that has not crossed its next durable boundary.
+    pub hook: Option<Box<SuspendedHook>>,
 }
 
 /// Journal-derived state for an interrupted compaction operation.
@@ -724,6 +865,16 @@ pub enum CorruptionReason {
     },
     /// A compaction operation completed without producing a checkpoint.
     CompletedCompactionWithoutCheckpoint {
+        /// Operation identity.
+        op: OpId,
+    },
+    /// Hook records were duplicated, skipped, or mismatched.
+    InvalidHookSequence {
+        /// Operation identity.
+        op: OpId,
+    },
+    /// Interaction records did not match the active hook and request.
+    InvalidInteractionSequence {
         /// Operation identity.
         op: OpId,
     },

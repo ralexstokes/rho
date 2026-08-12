@@ -14,14 +14,16 @@ pub use context::{
 };
 pub use machine::{
     Action, ActionOutcome, AgentEvent, CompactionConfig, CompactionSummary, Effect, EntryStamp,
-    HookInvocation, Input, InteractionAnswer, InteractionRequest, MachineConfig, MachineError,
-    PreparedToolCall, SessionControl, SessionMachine, Step, ToolSpec,
+    Input, MachineConfig, MachineError, PreparedToolCall, SessionControl, SessionMachine, Step,
+    ToolSpec,
 };
 pub use model::{
     CompactionWork, CompletedCompaction, CorruptionReason, Entry, EntryBody, EntryId,
-    FORMAT_VERSION, Fact, ForkParent, HostInfo, Item, LaneName, LaneStatus, ModelRef, NewEntry,
-    NewFact, NewRecord, OpId, OpIntent, OpOutcome, OpenTool, Origin, QueueChange, QueueError,
-    QueueId, QueueKind, QueuedInput, Record, RecordBody, ReplaySafety, SessionHeader, SessionId,
-    SessionMessage, SuspendedCompaction, SuspendedOp, Timestamp,
+    FORMAT_VERSION, Fact, ForkParent, HookInvocation, HookOutput, HookPoint, HostInfo,
+    InteractionAnswer, InteractionRequest, Item, LaneName, LaneStatus, ModelRef, NewEntry, NewFact,
+    NewRecord, OpId, OpIntent, OpOutcome, OpenTool, Origin, QueueChange, QueueError, QueueId,
+    QueueKind, QueuedInput, Record, RecordBody, ReplaySafety, SessionHeader, SessionId,
+    SessionMessage, SuspendedCompaction, SuspendedHook, SuspendedInteraction, SuspendedOp,
+    Timestamp,
 };
 pub use recovery::{reduce_lane_status, reduce_queue};

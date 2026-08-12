@@ -5,7 +5,7 @@ use rho_ai::ToolCallId;
 use crate::{
     CompactionWork, CompletedCompaction, CorruptionReason, Item, LaneName, LaneStatus, OpId,
     OpIntent, OpenTool, QueueChange, QueueError, QueuedInput, RecordBody, SessionMessage,
-    SuspendedCompaction, SuspendedOp,
+    SuspendedCompaction, SuspendedHook, SuspendedInteraction, SuspendedOp,
 };
 
 /// Reconstructs pending steering and follow-up input in enqueue order.
@@ -79,6 +79,8 @@ struct OperationState {
     compaction_work: Option<CompactionWork>,
     completed_compaction: Option<CompletedCompaction>,
     compaction_usage_recorded: bool,
+    last_hook: u32,
+    hook: Option<SuspendedHook>,
 }
 
 /// Reduces an interleaved session stream to one lane's recoverable status.
@@ -145,6 +147,8 @@ pub fn reduce_lane_status(items: &[Item], lane: &LaneName) -> LaneStatus {
                 usage_recorded: state.compaction_usage_recorded,
             })
         }),
+        last_hook: state.last_hook,
+        hook: state.hook.clone().map(Box::new),
     })
 }
 
@@ -191,6 +195,8 @@ fn reduce_record(
                 compaction_work: None,
                 completed_compaction: None,
                 compaction_usage_recorded: false,
+                last_hook: 0,
+                hook: None,
             },
         );
         *open = Some(op.clone());
@@ -210,6 +216,7 @@ fn reduce_record(
 
     match body {
         RecordBody::OpFinished { outcome, .. } => {
+            cross_hook_boundary(state, op)?;
             if !state.open_tools.is_empty() {
                 return Err(CorruptionReason::FinishedWithOpenTools {
                     op: op.clone(),
@@ -238,6 +245,7 @@ fn reduce_record(
         }
         RecordBody::AbortRequested { .. } => state.abort_requested = true,
         RecordBody::Step { n, .. } => {
+            cross_hook_boundary(state, op)?;
             let expected = state.last_step.map_or(1, |last| last + 1);
             if *n != expected {
                 return Err(CorruptionReason::NonConsecutiveStep {
@@ -256,6 +264,7 @@ fn reduce_record(
             replay,
             ..
         } => {
+            cross_hook_boundary(state, op)?;
             if state.intent != OpIntent::Run {
                 return Err(CorruptionReason::IntentMismatch {
                     op: op.clone(),
@@ -291,6 +300,77 @@ fn reduce_record(
             if state.compaction_work.replace(work.clone()).is_some() {
                 return Err(CorruptionReason::DuplicateCompactionStart { op: op.clone() });
             }
+        }
+        RecordBody::HookStarted { n, invocation, .. } => {
+            if state
+                .hook
+                .as_ref()
+                .is_some_and(|hook| hook.result.is_none())
+                || *n != state.last_hook + 1
+            {
+                return Err(CorruptionReason::InvalidHookSequence { op: op.clone() });
+            }
+            state.last_hook = *n;
+            state.hook = Some(SuspendedHook {
+                n: *n,
+                invocation: invocation.clone(),
+                result: None,
+                interactions: Vec::new(),
+            });
+        }
+        RecordBody::HookFinished { n, result, .. } => {
+            let Some(hook) = state.hook.as_mut() else {
+                return Err(CorruptionReason::InvalidHookSequence { op: op.clone() });
+            };
+            if hook.n != *n
+                || hook.result.is_some()
+                || matches!(result, Ok(crate::HookOutput::Interact { .. }))
+                || hook
+                    .interactions
+                    .last()
+                    .is_some_and(|interaction| interaction.answer.is_none())
+            {
+                return Err(CorruptionReason::InvalidHookSequence { op: op.clone() });
+            }
+            hook.result = Some(result.clone());
+        }
+        RecordBody::InteractionRequested { hook, request, .. } => {
+            let Some(active) = state.hook.as_mut() else {
+                return Err(CorruptionReason::InvalidInteractionSequence { op: op.clone() });
+            };
+            if active.n != *hook
+                || active.result.is_some()
+                || active
+                    .interactions
+                    .last()
+                    .is_some_and(|interaction| interaction.answer.is_none())
+            {
+                return Err(CorruptionReason::InvalidInteractionSequence { op: op.clone() });
+            }
+            active.interactions.push(SuspendedInteraction {
+                request: request.clone(),
+                answer: None,
+            });
+        }
+        RecordBody::InteractionAnswered {
+            hook,
+            request_id,
+            answer,
+            ..
+        } => {
+            let Some(active) = state.hook.as_mut() else {
+                return Err(CorruptionReason::InvalidInteractionSequence { op: op.clone() });
+            };
+            let Some(interaction) = active.interactions.last_mut() else {
+                return Err(CorruptionReason::InvalidInteractionSequence { op: op.clone() });
+            };
+            if active.n != *hook
+                || interaction.request.id != *request_id
+                || interaction.answer.is_some()
+            {
+                return Err(CorruptionReason::InvalidInteractionSequence { op: op.clone() });
+            }
+            interaction.answer = Some(answer.clone());
         }
         RecordBody::Usage { .. } => {
             if state.completed_compaction.is_some() {
@@ -343,6 +423,8 @@ fn reduce_entry(
                         compaction_work: None,
                         completed_compaction: None,
                         compaction_usage_recorded: false,
+                        last_hook: 0,
+                        hook: None,
                     },
                 );
                 *open = Some(op.clone());
@@ -368,6 +450,7 @@ fn reduce_entry(
     match body {
         crate::EntryBody::Message { message } => match message {
             SessionMessage::Assistant(message) => {
+                cross_hook_boundary(state, op)?;
                 if state.intent != OpIntent::Run {
                     return Err(CorruptionReason::IntentMismatch {
                         op: op.clone(),
@@ -383,6 +466,7 @@ fn reduce_entry(
                 state.resolved_tool_calls.clear();
             }
             SessionMessage::ToolResult { call_id, .. } => {
+                cross_hook_boundary(state, op)?;
                 let Some(position) = state
                     .open_tools
                     .iter()
@@ -399,6 +483,7 @@ fn reduce_entry(
             SessionMessage::User { .. } | SessionMessage::Custom { .. } => {}
         },
         crate::EntryBody::Compaction { summary, usage, .. } => {
+            cross_hook_boundary(state, op)?;
             if state.intent != OpIntent::Compaction {
                 return Err(CorruptionReason::IntentMismatch {
                     op: op.clone(),
@@ -420,6 +505,17 @@ fn reduce_entry(
         }
         crate::EntryBody::SettingsChange { .. } | crate::EntryBody::Custom { .. } => {}
     }
+    Ok(())
+}
+
+fn cross_hook_boundary(state: &mut OperationState, op: &OpId) -> Result<(), CorruptionReason> {
+    let Some(hook) = &state.hook else {
+        return Ok(());
+    };
+    if hook.result.is_none() {
+        return Err(CorruptionReason::InvalidHookSequence { op: op.clone() });
+    }
+    state.hook = None;
     Ok(())
 }
 
@@ -745,6 +841,46 @@ mod tests {
             Err(QueueError::SourceMismatch {
                 id: QueueId::from("mismatch"),
             })
+        );
+    }
+
+    #[test]
+    fn malformed_hook_and_interaction_sequences_are_typed_corruption() {
+        let op = OpId::from("op");
+        let finished_without_start = vec![
+            record(1, started("op")),
+            record(
+                2,
+                RecordBody::HookFinished {
+                    op: op.clone(),
+                    n: 1,
+                    result: Ok(crate::HookOutput::Continue { value: json!(null) }),
+                },
+            ),
+        ];
+        assert_eq!(
+            reduce_lane_status(&finished_without_start, &LaneName::main()),
+            LaneStatus::Corrupt(CorruptionReason::InvalidHookSequence { op: op.clone() })
+        );
+
+        let interaction_without_hook = vec![
+            record(1, started("op")),
+            record(
+                2,
+                RecordBody::InteractionRequested {
+                    op: op.clone(),
+                    hook: 1,
+                    request: crate::InteractionRequest {
+                        id: "ask".to_owned(),
+                        prompt: "continue?".to_owned(),
+                        timeout_ms: 1_000,
+                    },
+                },
+            ),
+        ];
+        assert_eq!(
+            reduce_lane_status(&interaction_without_hook, &LaneName::main()),
+            LaneStatus::Corrupt(CorruptionReason::InvalidInteractionSequence { op })
         );
     }
 

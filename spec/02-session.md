@@ -147,6 +147,11 @@ enum RecordBody {
     ToolStarted { op: OpId, call_id: ToolCallId, name: String,
                   effective_args: JsonValue,     // post-hook args actually executed
                   replay: ReplaySafety },        // Safe | Never (required)
+    HookStarted { op: OpId, n: u32, invocation: HookInvocation },
+    HookFinished{ op: OpId, n: u32, result: Result<HookOutput, String> },
+    InteractionRequested { op: OpId, hook: u32, request: InteractionRequest },
+    InteractionAnswered  { op: OpId, hook: u32, request_id: String,
+                           answer: InteractionAnswer },
     QueueChanged{ op: Option<OpId>, change: Enqueued { id, kind: Steer|FollowUp,
                   message: Message } | Cancelled { id } },
     Usage       { op: OpId, usage: Usage },
@@ -160,6 +165,14 @@ enum Origin    { External, Replay }              // provenance (05-embedding haz
 Notes:
 - `ToolStarted.effective_args` records what actually ran (after any hook
   mutation) — the audit record, and what a `Safe` replay re-executes.
+- `HookStarted` is synced before extension code runs. `HookFinished` stores the
+  exact owned result. Hook action numbers are consecutive within an operation;
+  impossible hook/interaction sequences are typed corruption.
+- A hook may return `Interact { request }` instead of completing. The request is
+  recorded before it reaches a client, the answer is recorded before the hook
+  resumes, and only the hook's eventual terminal result produces
+  `HookFinished`. A hook may ask more than once; recovery folds its ordered,
+  durable request/answer chain back into the original invocation.
 - A tool call is **closed** by a `ToolResult` entry with the same `call_id`
   and `op`. No separate tool-finished record; the entry is the closure.
 - `Step` exists for retry accounting and so recovery can distinguish "stream
@@ -210,6 +223,8 @@ struct SuspendedOp {
     last_step: Option<u32>,
     open_tools: Vec<OpenTool>,             // ToolStarted without ToolResult entry
     stream_in_flight: bool,                // Step without following Assistant entry
+    last_hook: u32,
+    hook: Option<SuspendedHook>,            // result and nested interaction, if any
 }
 ```
 
@@ -225,6 +240,26 @@ Resume semantics (executed by rho-agent, not storage):
    double-appended.
 4. Resume-injected work runs with `origin: Replay` so journaling middleware
    can distinguish it (the double-execution hazard from shelterwood's spec).
+5. An unanswered interaction is durably resolved as `TimedOut` and its hook is
+   resumed with that answer. It is never silently re-presented after restart.
+   A hook interrupted outside an interaction is re-invoked with
+   `origin: Replay`; a durable `HookFinished` result is applied without calling
+   the hook again.
+6. Recovery derives a missing post-request, post-tool, pre-compaction, or
+   run-finished hook when the preceding entry/record is durable but the
+   corresponding `HookStarted` is not. An abort closes an open hook (and any
+   unanswered interaction) before the terminal record, without replaying the
+   interrupted extension.
+
+Hook points are typed and enabled explicitly in `MachineConfig`: user-run
+start/end, context transform, before/after request, before/after tool, and
+before compaction. Compaction is a separate maintenance operation and does not
+fire the user-run lifecycle pair. One `rho-agent::HookHost` receives owned serde
+invocations and may multiplex any number of native or serialized extensions.
+Transform results are parsed at the core boundary. In particular, `before_tool`
+cannot change tool identity or replay policy; its argument mutation is
+schema-revalidated before the post-hook `ToolStarted.effective_args` record is
+synced.
 
 `CorruptionReason` is a closed enum of impossible sequences (two open ops,
 record after finish, non-consecutive step, tool result without start, unknown
@@ -287,11 +322,3 @@ trait Session {  // one open handle = the lane writer
 4. Export format for sharing — later, but one property is already fixed:
    exports are **entries-only** (records MUST be stripped; see §6 privacy
    note).
-5. **Interaction primitive** (carved out of the deferred RPC doc — core loop
-   concern): a tool/hook asks the client a question and blocks with a
-   timeout. Needs: a place in the action vocabulary (an `AwaitInteraction`
-   action whose journaled result is the answer — keeps replay deterministic),
-   likely an `InteractionRequested` record so recovery can see a pending ask,
-   and crash-resume semantics (proposed: a suspended interaction resolves as
-   timed-out/declined on resume — never silently re-asked with side effects
-   already taken). To be designed before the phase-2 loop hardens.
