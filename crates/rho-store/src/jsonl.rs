@@ -412,6 +412,9 @@ fn is_sync_boundary(body: &RecordBody) -> bool {
         RecordBody::OpStarted { .. }
             | RecordBody::OpFinished { .. }
             | RecordBody::AbortRequested { .. }
+            | RecordBody::HookStarted { .. }
+            | RecordBody::InteractionRequested { .. }
+            | RecordBody::InteractionAnswered { .. }
             | RecordBody::ToolStarted { .. }
     )
 }
@@ -486,14 +489,42 @@ mod tests {
     }
 
     #[test]
-    fn tool_start_is_fsynced_before_the_side_effect() {
-        assert!(is_sync_boundary(&RecordBody::ToolStarted {
-            op: rho_core::OpId::from("op"),
-            call_id: rho_ai::ToolCallId::from("call"),
-            name: "write".to_owned(),
-            effective_args: serde_json::json!({}),
-            replay: rho_core::ReplaySafety::Never,
-        }));
+    fn action_starts_and_interaction_transitions_are_fsynced() {
+        let op = rho_core::OpId::from("op");
+        let request = rho_core::InteractionRequest {
+            id: "request".to_owned(),
+            prompt: "continue?".to_owned(),
+            timeout_ms: 1_000,
+        };
+        let boundaries = [
+            RecordBody::ToolStarted {
+                op: op.clone(),
+                call_id: rho_ai::ToolCallId::from("call"),
+                name: "write".to_owned(),
+                effective_args: serde_json::json!({}),
+                replay: rho_core::ReplaySafety::Never,
+            },
+            RecordBody::HookStarted {
+                op: op.clone(),
+                n: 1,
+                invocation: rho_core::HookInvocation {
+                    hook: rho_core::HookPoint::RunStarted,
+                    payload: serde_json::Value::Null,
+                },
+            },
+            RecordBody::InteractionRequested {
+                op: op.clone(),
+                hook: 1,
+                request: request.clone(),
+            },
+            RecordBody::InteractionAnswered {
+                op,
+                hook: 1,
+                request_id: request.id,
+                answer: rho_core::InteractionAnswer::Declined,
+            },
+        ];
+        assert!(boundaries.iter().all(is_sync_boundary));
     }
 
     #[tokio::test]

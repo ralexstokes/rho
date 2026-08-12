@@ -6,7 +6,7 @@
 
 #![allow(clippy::disallowed_methods)]
 
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, time::Duration};
 
 use futures_util::StreamExt;
 use rho_ai::{
@@ -14,9 +14,9 @@ use rho_ai::{
     StreamEvent,
 };
 use rho_core::{
-    Action, ActionOutcome, AgentEvent, Effect, EntryId, EntryStamp, Input, MachineError, ModelRef,
-    OpId, Origin, QueueError, QueueId, QueueKind, SessionControl, SessionMachine, SessionMessage,
-    Step, Timestamp,
+    Action, ActionOutcome, AgentEvent, Effect, EntryId, EntryStamp, HookInvocation, HookOutput,
+    Input, InteractionAnswer, InteractionRequest, MachineError, ModelRef, OpId, Origin, QueueError,
+    QueueId, QueueKind, SessionControl, SessionMachine, SessionMessage, Step, Timestamp,
 };
 use rho_store::{Session, SessionError};
 use rho_tools::{ToolOutput, ToolSet};
@@ -30,6 +30,16 @@ pub type EventFuture<'sink> = Pin<Box<dyn Future<Output = ()> + Send + 'sink>>;
 pub trait EventSink: Send {
     /// Publishes one event with listener-selected backpressure.
     fn emit(&mut self, event: AgentEvent) -> EventFuture<'_>;
+}
+
+/// Type-erased hook-host operation.
+pub type HookFuture<'hook> =
+    Pin<Box<dyn Future<Output = Result<HookOutput, String>> + Send + 'hook>>;
+
+/// Mutable-shell host for native or serialized extension hooks.
+pub trait HookHost: Send {
+    /// Invokes one owned hook action.
+    fn invoke(&mut self, invocation: HookInvocation, origin: Origin) -> HookFuture<'_>;
 }
 
 /// Event sink that discards all advisory output.
@@ -97,6 +107,20 @@ impl ControlSender {
     pub fn abort(&self) -> Result<(), ControlClosed> {
         self.inner
             .send(SessionControl::Abort)
+            .map_err(|_| ControlClosed)
+    }
+
+    /// Answers one pending headless interaction.
+    pub fn answer_interaction(
+        &self,
+        id: impl Into<String>,
+        answer: InteractionAnswer,
+    ) -> Result<(), ControlClosed> {
+        self.inner
+            .send(SessionControl::AnswerInteraction {
+                id: id.into(),
+                answer,
+            })
             .map_err(|_| ControlClosed)
     }
 }
@@ -196,7 +220,7 @@ pub enum DriverError {
     /// Provider stream violated the terminal-event contract.
     #[error("provider stream ended without Done or Error")]
     UnterminatedProviderStream,
-    /// The automatic driver does not yet host hooks or interactions.
+    /// The automatic driver received an action variant it cannot execute.
     #[error("automatic driver does not support action {0}")]
     UnsupportedAction(&'static str),
     /// Recovery found work that requires explicit resume choreography.
@@ -233,6 +257,7 @@ pub struct Driver<'driver> {
     cancellation: CancellationToken,
     events: &'driver mut dyn EventSink,
     commands: Option<&'driver mut ControlReceiver>,
+    hooks: Option<&'driver mut dyn HookHost>,
 }
 
 impl<'driver> Driver<'driver> {
@@ -253,6 +278,7 @@ impl<'driver> Driver<'driver> {
             cancellation,
             events,
             commands: None,
+            hooks: None,
         }
     }
 
@@ -260,6 +286,13 @@ impl<'driver> Driver<'driver> {
     #[must_use]
     pub fn with_controls(mut self, commands: &'driver mut ControlReceiver) -> Self {
         self.commands = Some(commands);
+        self
+    }
+
+    /// Attaches the extension hook host used by enabled machine hook points.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: &'driver mut dyn HookHost) -> Self {
+        self.hooks = Some(hooks);
         self
     }
 
@@ -360,7 +393,9 @@ impl<'driver> Driver<'driver> {
                         }
                         return Ok(machine);
                     };
-                    self.drain_ready_controls(&mut machine).await?;
+                    if !matches!(&action, Action::AwaitInteraction { .. }) {
+                        self.drain_ready_controls(&mut machine).await?;
+                    }
                     let steer_stamps = if matches!(&action, Action::StreamAssistant { .. }) {
                         self.steer_stamps(&machine)
                     } else {
@@ -368,6 +403,10 @@ impl<'driver> Driver<'driver> {
                     };
                     let (effects, action) = machine.prepare_action(action, steer_stamps)?;
                     apply_effects(self.session, self.events, effects).await?;
+                    let hooks = self
+                        .hooks
+                        .as_mut()
+                        .map(|hooks| &mut **hooks as &mut dyn HookHost);
                     let outcome = execute_action(
                         action,
                         ActionShell {
@@ -380,6 +419,7 @@ impl<'driver> Driver<'driver> {
                             events: self.events,
                             commands: self.commands.as_deref_mut(),
                         },
+                        hooks,
                     )
                     .await?;
                     (machine, step) = machine.resolve(outcome)?;
@@ -530,6 +570,7 @@ struct ActionShell<'shell> {
 async fn execute_action(
     action: Action,
     shell: ActionShell<'_>,
+    hooks: Option<&mut dyn HookHost>,
 ) -> Result<ActionOutcome, DriverError> {
     let ActionShell {
         machine,
@@ -708,8 +749,58 @@ async fn execute_action(
             }
             Err(DriverError::UnterminatedProviderStream)
         }
-        Action::AwaitInteraction { .. } => Err(DriverError::UnsupportedAction("await_interaction")),
-        Action::InvokeHook { .. } => Err(DriverError::UnsupportedAction("invoke_hook")),
+        Action::AwaitInteraction { request, .. } => {
+            await_interaction(
+                request,
+                &mut commands,
+                machine,
+                session,
+                stamps,
+                &cancellation,
+                events,
+            )
+            .await
+        }
+        Action::InvokeHook { invocation, origin } => {
+            let Some(hooks) = hooks else {
+                return Ok(ActionOutcome::Hook {
+                    result: Err("hook host is not configured".to_owned()),
+                    at: stamps.timestamp(),
+                });
+            };
+            let mut invocation = hooks.invoke(invocation, origin);
+            let result = loop {
+                let Some(receiver) = commands.as_deref_mut() else {
+                    break tokio::select! {
+                        result = &mut invocation => result,
+                        _ = cancellation.cancelled() => Err("hook cancelled".to_owned()),
+                    };
+                };
+                tokio::select! {
+                    biased;
+                    command = receiver.inner.recv() => {
+                        let Some(command) = command else {
+                            commands = None;
+                            continue;
+                        };
+                        accept_live_control(
+                            command,
+                            machine,
+                            session,
+                            stamps,
+                            &cancellation,
+                            events,
+                        ).await?;
+                    }
+                    result = &mut invocation => break result,
+                    _ = cancellation.cancelled() => break Err("hook cancelled".to_owned()),
+                }
+            };
+            Ok(ActionOutcome::Hook {
+                result,
+                at: stamps.timestamp(),
+            })
+        }
         _ => Err(DriverError::UnsupportedAction("future action variant")),
     }
 }
@@ -744,6 +835,87 @@ async fn next_provider_event(
                 ).await?;
             }
             event = stream.next() => return Ok(event),
+        }
+    }
+}
+
+async fn await_interaction(
+    request: InteractionRequest,
+    commands: &mut Option<&mut ControlReceiver>,
+    machine: &mut SessionMachine,
+    session: &mut dyn Session,
+    stamps: &mut dyn StampSource,
+    cancellation: &CancellationToken,
+    events: &mut dyn EventSink,
+) -> Result<ActionOutcome, DriverError> {
+    let timeout = tokio::time::sleep(Duration::from_millis(request.timeout_ms));
+    tokio::pin!(timeout);
+    loop {
+        let Some(receiver) = commands.as_deref_mut() else {
+            tokio::select! {
+                _ = &mut timeout => {
+                    return Ok(ActionOutcome::Interaction {
+                        request_id: request.id,
+                        answer: InteractionAnswer::TimedOut,
+                        at: stamps.timestamp(),
+                    });
+                }
+                _ = cancellation.cancelled() => {
+                    return Ok(ActionOutcome::Interaction {
+                        request_id: request.id,
+                        answer: InteractionAnswer::TimedOut,
+                        at: stamps.timestamp(),
+                    });
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            command = receiver.inner.recv() => {
+                let Some(command) = command else {
+                    *commands = None;
+                    continue;
+                };
+                match command {
+                    SessionControl::AnswerInteraction { id, answer } if id == request.id => {
+                        return Ok(ActionOutcome::Interaction {
+                            request_id: id,
+                            answer,
+                            at: stamps.timestamp(),
+                        });
+                    }
+                    SessionControl::AnswerInteraction { id, .. } => {
+                        return Err(MachineError::MismatchedInteraction {
+                            expected: request.id,
+                            actual: id,
+                        }.into());
+                    }
+                    command => {
+                        accept_live_control(
+                            command,
+                            machine,
+                            session,
+                            stamps,
+                            cancellation,
+                            events,
+                        ).await?;
+                    }
+                }
+            }
+            _ = &mut timeout => {
+                return Ok(ActionOutcome::Interaction {
+                    request_id: request.id,
+                    answer: InteractionAnswer::TimedOut,
+                    at: stamps.timestamp(),
+                });
+            }
+            _ = cancellation.cancelled() => {
+                return Ok(ActionOutcome::Interaction {
+                    request_id: request.id,
+                    answer: InteractionAnswer::TimedOut,
+                    at: stamps.timestamp(),
+                });
+            }
         }
     }
 }
@@ -784,6 +956,7 @@ mod tests {
     };
     use rho_core::{CompactionConfig, EntryStamp, MachineConfig, ReplaySafety};
     use rho_store::{CreateOptions, MemoryRepo, SessionRepo};
+    use serde_json::Value;
 
     use super::*;
 
@@ -846,6 +1019,54 @@ mod tests {
     struct AbortOnProviderStart {
         sender: ControlSender,
         sent: bool,
+    }
+
+    struct InteractiveRunHook {
+        calls: usize,
+    }
+
+    impl HookHost for InteractiveRunHook {
+        fn invoke(&mut self, invocation: HookInvocation, _: Origin) -> HookFuture<'_> {
+            self.calls += 1;
+            if self.calls == 1 {
+                assert_eq!(invocation.hook, rho_core::HookPoint::RunStarted);
+                Box::pin(async {
+                    Ok(HookOutput::Interact {
+                        request: InteractionRequest {
+                            id: "permission".to_owned(),
+                            prompt: "continue?".to_owned(),
+                            timeout_ms: 1_000,
+                        },
+                    })
+                })
+            } else {
+                assert_eq!(
+                    invocation.payload["interaction"]["answer"]["kind"],
+                    "answered"
+                );
+                Box::pin(async { Ok(HookOutput::Continue { value: Value::Null }) })
+            }
+        }
+    }
+
+    struct AnswerOnInteraction {
+        sender: ControlSender,
+    }
+
+    impl EventSink for AnswerOnInteraction {
+        fn emit(&mut self, event: AgentEvent) -> EventFuture<'_> {
+            if let AgentEvent::InteractionRequested { request, .. } = event {
+                self.sender
+                    .answer_interaction(
+                        request.id,
+                        InteractionAnswer::Answered {
+                            value: "yes".to_owned(),
+                        },
+                    )
+                    .unwrap();
+            }
+            Box::pin(async {})
+        }
     }
 
     impl EventSink for AbortOnProviderStart {
@@ -958,6 +1179,7 @@ mod tests {
                     model: ModelId::from("m"),
                 },
                 tools: Vec::new(),
+                hooks: Vec::new(),
                 compaction: None,
             },
             Vec::new(),
@@ -1013,6 +1235,7 @@ mod tests {
                     model: ModelId::from("other"),
                 },
                 tools: Vec::new(),
+                hooks: Vec::new(),
                 compaction: None,
             },
             machine.entries().to_vec(),
@@ -1065,6 +1288,7 @@ mod tests {
                     model: ModelId::from("m"),
                 },
                 tools: Vec::new(),
+                hooks: Vec::new(),
                 compaction: None,
             },
             Vec::new(),
@@ -1227,6 +1451,7 @@ mod tests {
                     model: ModelId::from("m"),
                 },
                 tools: Vec::new(),
+                hooks: Vec::new(),
                 compaction: None,
             },
             branch,
@@ -1363,6 +1588,7 @@ mod tests {
                     model: ModelId::from("m"),
                 },
                 tools: Vec::new(),
+                hooks: Vec::new(),
                 compaction: Some(CompactionConfig {
                     threshold_tokens: 100,
                     retain_messages: 1,
@@ -1411,6 +1637,7 @@ mod tests {
                     model: ModelId::from("m"),
                 },
                 tools: Vec::new(),
+                hooks: Vec::new(),
                 compaction: Some(CompactionConfig {
                     threshold_tokens: 100,
                     retain_messages: 1,
@@ -1512,6 +1739,7 @@ mod tests {
                     model: ModelId::from("m"),
                 },
                 tools: Vec::new(),
+                hooks: Vec::new(),
                 compaction: None,
             },
             Vec::new(),
@@ -1614,6 +1842,7 @@ mod tests {
                     model: ModelId::from("m"),
                 },
                 tools: Vec::new(),
+                hooks: Vec::new(),
                 compaction: None,
             },
             Vec::new(),
@@ -1671,6 +1900,117 @@ mod tests {
         assert_eq!(session.lane_status().unwrap(), rho_core::LaneStatus::Idle);
     }
 
+    #[tokio::test]
+    async fn driver_runs_a_hook_through_a_durable_client_interaction() {
+        let expected = Request {
+            system: "test".to_owned(),
+            messages: vec![Message::user("task")],
+            tools: Vec::new(),
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::None,
+        };
+        let factory = FauxFactory::new(
+            vec![ModelInfo {
+                id: ModelId::from("m"),
+                display_name: "model".to_owned(),
+                context_tokens: None,
+                max_output_tokens: None,
+            }],
+            [Script {
+                request: expected,
+                events: vec![StreamEvent::Done(AssistantMessage {
+                    blocks: vec![rho_ai::ContentBlock::text("done")],
+                    stop: StopReason::Stop,
+                    usage: Usage::default(),
+                    provider: ProviderId::from("p"),
+                    model: ModelId::from("m"),
+                })],
+            }],
+        )
+        .with_provider_id(ProviderId::from("p"));
+        let mut provider = BoundProvider::open(
+            &factory,
+            ModelRef {
+                provider: ProviderId::from("p"),
+                model: ModelId::from("m"),
+            },
+        )
+        .await
+        .unwrap();
+        let repo = MemoryRepo::default();
+        let mut session = repo
+            .create(CreateOptions {
+                cwd: "/workspace".to_owned(),
+            })
+            .await
+            .unwrap();
+        let machine = SessionMachine::new(
+            MachineConfig {
+                system: "test".to_owned(),
+                max_output_tokens: 100,
+                thinking: ThinkingLevel::None,
+                model: ModelRef {
+                    provider: ProviderId::from("p"),
+                    model: ModelId::from("m"),
+                },
+                tools: Vec::new(),
+                hooks: vec![rho_core::HookPoint::RunStarted],
+                compaction: None,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let (sender, mut receiver) = control_channel();
+        let mut hooks = InteractiveRunHook { calls: 0 };
+        let mut events = AnswerOnInteraction { sender };
+        let machine = Driver::new(
+            session.as_mut(),
+            &mut provider,
+            &ToolSet::new(),
+            &mut FixedStamps { next: 70 },
+            CancellationToken::new(),
+            &mut events,
+        )
+        .with_controls(&mut receiver)
+        .with_hooks(&mut hooks)
+        .run_prompt(
+            machine,
+            SessionMessage::user("task"),
+            Origin::External,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(machine.is_idle());
+        assert_eq!(hooks.calls, 2);
+        let records = session
+            .log(0, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .filter_map(|item| match item {
+                rho_core::Item::Record(record) => Some(record.body),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let requested = records
+            .iter()
+            .position(|record| matches!(record, rho_core::RecordBody::InteractionRequested { .. }))
+            .unwrap();
+        let answered = records
+            .iter()
+            .position(|record| matches!(record, rho_core::RecordBody::InteractionAnswered { .. }))
+            .unwrap();
+        let hook_finished = records
+            .iter()
+            .position(|record| matches!(record, rho_core::RecordBody::HookFinished { .. }))
+            .unwrap();
+        let step = records
+            .iter()
+            .position(|record| matches!(record, rho_core::RecordBody::Step { .. }))
+            .unwrap();
+        assert!(requested < answered && answered < hook_finished && hook_finished < step);
+    }
+
     #[test]
     fn tool_specs_are_usable_without_builtin_tools() {
         let config = MachineConfig {
@@ -1682,6 +2022,7 @@ mod tests {
                 model: ModelId::from("m"),
             },
             tools: Vec::new(),
+            hooks: Vec::new(),
             compaction: None,
         };
         assert!(config.tools.is_empty());
