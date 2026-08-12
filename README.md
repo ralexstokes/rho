@@ -12,6 +12,8 @@ The phase-3 host includes:
   stdio servers.
 - Text and machine-readable one-shot modes, and RPC over stdio or a local Unix
   socket.
+- Shelterwood-supervised session actors that reopen incarnation-owned provider,
+  tool, and MCP state and resume suspended journals after a crash.
 
 ## Run rho
 

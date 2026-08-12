@@ -76,10 +76,10 @@ Two properties fall out and both are load-bearing:
    through the machine and assert the derived effects equal the file's actual
    entries/records, byte for byte. A golden-session test is a diff. Drift
    between code and journal is caught structurally.
-2. **Every host is trivial.** The tokio driver, the actor host (one shelterwood
-   `offload` per `Action`, outcome re-enters as a message), and the RPC server
-   are all the same dumb loop around the same machine. The embedding story
-   stops being special.
+2. **Every host shares the driver.** The one-shot CLI and the Shelterwood actor
+   both run the same automatic driver around the same machine; RPC only routes
+   commands and events. Live control uses the driver's separate control
+   channel, so embedding does not duplicate the machine loop.
 
 Determinism rules for the core, enforced (§5):
 - No `SystemTime::now`, `Instant::now`, `rand`, `Uuid::new_v4/v7`, env reads.
@@ -134,7 +134,7 @@ rho/
     rho-cli/                 # phase 3: binary; config loading; thin
     rho-ext/                 # phase 4: ABI types (pure) — hook wire structs
     rho-ext-wasm/            # phase 4: wasmtime host (shell)
-    rho-shelterwood/         # parked: actor host (shell), per spec/05
+    rho-shelterwood/         # phase 3: supervised session-tree shell, per spec/05
 ```
 
 Dependency rules (the point of the split):
@@ -195,9 +195,12 @@ Dependency rules (the point of the split):
   (trap, timeout, garbage) is an `ActionOutcome` variant the core already
   handles — no extension-specific paths inside the machine.
 
-**Embedding (parked, spec/05):** the actor host was specified as "offload per
-action, outcome re-enters as message" — §2's machine is exactly the shape that
-makes that host a page of code. Nothing to redo when shelterwood matures.
+**Embedding (implemented, spec/05):** the Shelterwood actor owns the ordinary
+automatic driver and routes live steering/abort through rho's separate control
+channel. Each restart reconstructs shell resources and feeds a suspended
+journal through the same `resume()` path. This keeps one loop implementation
+while still gaining supervised panic recovery, incarnation fencing, structured
+shutdown, and exact dynamic-scope removal.
 
 ## 5. Enforcement (so the discipline survives contact with development)
 

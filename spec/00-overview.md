@@ -283,27 +283,26 @@ debuggable, evolvable):
 ### 2.6 Embedding contract & shelterwood integration
 
 The seam between rho and shelterwood is a **session-actor message protocol**,
-and it is deliberately the same vocabulary the RPC protocol uses:
+and it deliberately projects the same vocabulary the RPC protocol uses:
 
 - **Commands in** (mailbox): `Prompt`, `Steer`, `FollowUp`, `Abort`,
   `SetModel/SetThinking`, `AnswerInteraction { id, .. }`, `Compact`, `Fork`, …
 - **Events out** (to subscribers / parent): the agent event enum plus
   `InteractionRequest { id, .. }` for permission prompts and dialogs. All
-  messages are `Send + serde` — which the RPC host needs anyway, so actor
-  messages and wire messages are the same types. Reply slots are abstract in
-  rho-agent; `rho-shelterwood` concretizes them as `shelterwood::Reply<T>` to
-  get its `CallError` taxonomy (accepted-vs-answered-vs-crashed) and
-  incarnation fencing — the key primitives for at-most-once command delivery.
+  wire messages are owned serde data. The host translates durable-operation
+  requests into actor commands carrying `shelterwood::Reply<T>` to get its
+  `CallError` taxonomy (accepted-vs-answered-vs-crashed) and incarnation
+  fencing — the key primitives for at-most-once command delivery.
 - **Cancellation**: shelterwood ships its own observe-only `CancellationToken`
   (engine-fired). rho keeps its own internal cancel for *user aborts*; the
   actor maps shutdown-token-fired → rho cancel → loop reaches a clean point →
   lane journal records the outcome.
-- **Turns run off the actor loop** (shelterwood offloads), re-entering the
-  mailbox as completion messages, so `Steer`/`Abort` stay live mid-turn.
+- **Turns use the ordinary automatic driver** inside the actor callback.
+  `Steer`/`FollowUp`/`Abort` and interaction answers stay live through rho's
+  separate control channel, avoiding a second manual-driver implementation.
 
-Details, patterns, and hazards: **spec/05-embedding.md** (grounded in
-shelterwood's SPEC.md and its assistant-control-plane acceptance test, which is
-nearly rho's topology already).
+The implemented topology, restart contract, and deliberate limits are in
+**spec/05-embedding.md**.
 
 **The restart/resume synergy (design for this on purpose).** rho sessions are
 durable and the lane journal makes interruption a first-class, *inspectable*
@@ -327,10 +326,12 @@ dynamic scope and await its result — provided by the shelterwood host layer
 protocol so such tools have a stable thing to talk to.
 
 `rho-shelterwood` (integration crate, kept out of rho-agent so the core stays
-runtime-light): wraps a session as a handler actor, maps shutdown/restart hooks,
-and offers a scope helper for fleets of sessions. The RPC host should itself be
-built as a shelterwood tree (listener actor + per-session actors) — dogfooding
-the integration instead of maintaining a second concurrency structure.
+runtime-light) provides the fixed-root/dynamic-session tree and exact
+membership handles. The RPC host supplies the rho-specific restartable session
+actor and maps Shelterwood shutdown into rho's control path. The byte listener
+remains the outer connection boundary, while every durable session is
+supervised and rehydrates from its journal. This dogfoods restart/fencing where
+it adds recovery value without creating a second RPC request loop.
 
 ## 3. Phasing
 
@@ -372,7 +373,7 @@ Decided (details in the linked specs):
   design — they share a threat model. AGENTS.md-style context files are
   content, not config, and load from the project regardless.
 - Session-actor protocol ownership + tool `replay: safe | never` markers.
-  → spec/05-embedding.md (embedding revisited when shelterwood matures)
+  → spec/05-embedding.md (phase-3 embedding implemented)
 - Observability: `tracing` with stable span names; no telemetry subsystem.
 - **Implementation shape**: modular crates split along a pure-core /
   mutable-shell boundary; the session machine emits Effects + Actions, shells
