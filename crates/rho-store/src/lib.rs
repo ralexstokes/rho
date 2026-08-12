@@ -270,6 +270,7 @@ fn append_entry_to_items(
         parent: leaf.clone(),
         lane: entry.lane,
         op: entry.op,
+        source_queue: entry.source_queue,
         at: entry.at,
         body: entry.body,
     };
@@ -305,6 +306,7 @@ pub mod conformance {
                 parent: None,
                 lane: LaneName::main(),
                 op: None,
+                source_queue: None,
                 at: Timestamp::from("2026-08-11T00:00:00Z"),
                 body: EntryBody::Message {
                     message: SessionMessage::user("root"),
@@ -318,6 +320,7 @@ pub mod conformance {
                 parent: Some(root.clone()),
                 lane: LaneName::from("background"),
                 op: None,
+                source_queue: None,
                 at: Timestamp::from("2026-08-11T00:00:00Z"),
                 body: EntryBody::Message {
                     message: SessionMessage::user("unsupported lane"),
@@ -333,6 +336,7 @@ pub mod conformance {
                 parent: Some(root.clone()),
                 lane: LaneName::main(),
                 op: None,
+                source_queue: None,
                 at: Timestamp::from("2026-08-11T00:00:01Z"),
                 body: EntryBody::Message {
                     message: SessionMessage::user("child"),
@@ -428,6 +432,7 @@ pub mod conformance {
                 parent: None,
                 lane: LaneName::main(),
                 op: Some(completed_op.clone()),
+                source_queue: None,
                 at: Timestamp::from("2026-08-11T00:01:00Z"),
                 body: EntryBody::Message {
                     message: SessionMessage::user("completed operation"),

@@ -249,6 +249,7 @@ mod tests {
             parent: (index > 1).then(|| format!("e{}", index - 1).into()),
             lane: LaneName::main(),
             op: None,
+            source_queue: None,
             at: Timestamp::from("t"),
             body,
         }

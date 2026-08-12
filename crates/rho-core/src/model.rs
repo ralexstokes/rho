@@ -237,6 +237,9 @@ pub struct Entry {
     pub lane: LaneName,
     /// Operation that produced this entry, if any.
     pub op: Option<OpId>,
+    /// Durable queue item promoted into this transcript entry, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_queue: Option<QueueId>,
     /// Shell-minted timestamp.
     pub at: Timestamp,
     /// Entry payload.
@@ -254,6 +257,9 @@ pub struct NewEntry {
     pub lane: LaneName,
     /// Operation that produced this entry, if any.
     pub op: Option<OpId>,
+    /// Durable queue item promoted into this transcript entry, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_queue: Option<QueueId>,
     /// Shell-minted timestamp.
     pub at: Timestamp,
     /// Entry payload.
@@ -334,6 +340,48 @@ pub enum QueueChange {
     /// Cancel a queued message without deleting its audit record.
     Cancelled {
         /// Queue item identity.
+        id: QueueId,
+    },
+}
+
+/// One durable queue item awaiting promotion into the transcript.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct QueuedInput {
+    /// Stable queue identity.
+    pub id: QueueId,
+    /// Steering or follow-up semantics.
+    pub kind: QueueKind,
+    /// Verbatim queued message.
+    pub message: SessionMessage,
+}
+
+/// Invalid durable queue history.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QueueError {
+    /// The same queue identity was enqueued twice.
+    DuplicateId {
+        /// Duplicated identity.
+        id: QueueId,
+    },
+    /// A cancellation named an item that was never enqueued or was already consumed.
+    UnknownCancellation {
+        /// Unknown identity.
+        id: QueueId,
+    },
+    /// A transcript entry names an item that was never enqueued or was already consumed.
+    UnknownSource {
+        /// Unknown identity.
+        id: QueueId,
+    },
+    /// A queue record contained content that cannot be promoted as user input.
+    InvalidMessage {
+        /// Invalid queue item identity.
+        id: QueueId,
+    },
+    /// A consuming transcript entry did not match the queued message.
+    SourceMismatch {
+        /// Mismatched queue item identity.
         id: QueueId,
     },
 }
