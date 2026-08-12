@@ -15,4 +15,5 @@ thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+rho-ai.workspace = true
 tokio.workspace = true

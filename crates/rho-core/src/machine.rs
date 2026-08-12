@@ -32,6 +32,8 @@ pub struct MachineConfig {
     pub max_output_tokens: u64,
     /// Requested reasoning level.
     pub thinking: ThinkingLevel,
+    /// Provider/model required for generation actions.
+    pub model: crate::ModelRef,
     /// Available tools and their durability metadata.
     pub tools: Vec<ToolSpec>,
 }
@@ -104,6 +106,8 @@ pub enum Action {
     StreamAssistant {
         /// Complete transcript-authoritative request.
         request: Request,
+        /// Provider session the shell must have open.
+        model: crate::ModelRef,
         /// Side-effect provenance.
         origin: Origin,
     },
@@ -304,6 +308,9 @@ pub enum MachineError {
     /// Resume cannot continue a corrupt lane.
     #[error("cannot resume a corrupt lane")]
     CorruptResume,
+    /// Prompt commands must introduce user-authored content.
+    #[error("prompt input must be a user message")]
+    InvalidPrompt,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -317,11 +324,17 @@ enum Phase {
     AwaitingTool {
         op: OpId,
         step: u32,
-        current: PreparedToolCall,
-        remaining: VecDeque<PreparedToolCall>,
+        current: PendingTool,
+        remaining: VecDeque<PendingTool>,
         after: AfterTools,
         origin: Origin,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PendingTool {
+    call: PreparedToolCall,
+    journal_start: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -342,8 +355,14 @@ pub struct SessionMachine {
 
 impl SessionMachine {
     /// Creates a machine from one current root-to-leaf branch.
-    pub fn new(config: MachineConfig, entries: Vec<Entry>) -> Result<Self, ContextError> {
+    pub fn new(mut config: MachineConfig, entries: Vec<Entry>) -> Result<Self, ContextError> {
         let context = assemble_context(&entries)?;
+        if let Some(model) = context.settings.model {
+            config.model = model;
+        }
+        if let Some(thinking) = context.settings.thinking {
+            config.thinking = thinking;
+        }
         let leaf = entries.last().map(|entry| entry.id.clone());
         Ok(Self {
             config,
@@ -360,6 +379,18 @@ impl SessionMachine {
         self.phase == Phase::Idle
     }
 
+    /// Returns the durable effective provider/model selection.
+    #[must_use]
+    pub fn model(&self) -> &crate::ModelRef {
+        &self.config.model
+    }
+
+    /// Returns the root-to-leaf branch this machine was reconstructed from.
+    #[must_use]
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
     /// Handles an external or recovery command.
     pub fn handle(mut self, input: Input) -> Result<(Self, Step), MachineError> {
         match input {
@@ -372,6 +403,9 @@ impl SessionMachine {
             } => {
                 if self.phase != Phase::Idle {
                     return Err(MachineError::Busy);
+                }
+                if !matches!(message, SessionMessage::User { .. }) {
+                    return Err(MachineError::InvalidPrompt);
                 }
                 let entry = NewEntry {
                     id: stamp.id,
@@ -411,6 +445,7 @@ impl SessionMachine {
                 ];
                 let action = Action::StreamAssistant {
                     request: self.request(),
+                    model: self.config.model.clone(),
                     origin,
                 };
                 Ok((
@@ -424,30 +459,53 @@ impl SessionMachine {
             Input::Resume { status, at } => match status {
                 LaneStatus::Idle => Ok((self, Step::Idle)),
                 LaneStatus::Suspended(suspended) => {
-                    let op = suspended.op;
-                    let finish = suspended.abort_requested.then_some(OpOutcome::Aborted);
-                    let mut calls = suspended
-                        .open_tools
-                        .into_iter()
-                        .map(|tool| PreparedToolCall {
-                            call_id: tool.call_id,
-                            name: tool.name,
-                            effective_args: tool.effective_args,
-                            replay: tool.replay,
-                            precomputed_error: (suspended.abort_requested
-                                || tool.replay == ReplaySafety::Never)
-                                .then(|| {
-                                    if suspended.abort_requested {
-                                        "interrupted after abort was requested".to_owned()
-                                    } else {
-                                        "interrupted; tool is not safe to re-run".to_owned()
-                                    }
-                                }),
-                        })
-                        .collect::<VecDeque<_>>();
-                    if let Some(current) = calls.pop_front() {
+                    let op = suspended.op.clone();
+                    let mut effects = vec![Effect::Emit(AgentEvent::OperationStarted {
+                        op: op.clone(),
+                        origin: Origin::Replay,
+                    })];
+                    if !suspended.operation_started {
+                        effects.push(record_effect(
+                            &at,
+                            RecordBody::OpStarted {
+                                op: op.clone(),
+                                intent: suspended.intent,
+                                origin: Origin::Replay,
+                                host: None,
+                            },
+                        ));
+                    }
+
+                    if suspended.abort_requested {
+                        let mut calls = suspended
+                            .open_tools
+                            .into_iter()
+                            .map(|tool| PendingTool {
+                                call: PreparedToolCall {
+                                    call_id: tool.call_id,
+                                    name: tool.name,
+                                    effective_args: tool.effective_args,
+                                    replay: tool.replay,
+                                    precomputed_error: Some(
+                                        "interrupted after abort was requested".to_owned(),
+                                    ),
+                                },
+                                journal_start: false,
+                            })
+                            .collect::<VecDeque<_>>();
+                        let Some(current) = calls.pop_front() else {
+                            effects.extend(finish_effects(&op, OpOutcome::Aborted, &at));
+                            self.phase = Phase::Idle;
+                            return Ok((
+                                self,
+                                Step::Do {
+                                    effects,
+                                    action: None,
+                                },
+                            ));
+                        };
                         let action = Action::ExecuteTool {
-                            call: current.clone(),
+                            call: current.call.clone(),
                             origin: Origin::Replay,
                         };
                         self.phase = Phase::AwaitingTool {
@@ -455,44 +513,57 @@ impl SessionMachine {
                             step: suspended.last_step.unwrap_or(0),
                             current,
                             remaining: calls,
-                            after: finish.map_or(AfterTools::Stream, AfterTools::Finish),
+                            after: AfterTools::Finish(OpOutcome::Aborted),
                             origin: Origin::Replay,
                         };
                         return Ok((
                             self,
                             Step::Do {
-                                effects: vec![Effect::Emit(AgentEvent::OperationStarted {
-                                    op,
-                                    origin: Origin::Replay,
-                                })],
+                                effects,
                                 action: Some(action),
                             },
                         ));
                     }
-                    if let Some(outcome) = finish {
-                        return Ok(self.finish(op, outcome, &at));
+
+                    if !suspended.stream_in_flight
+                        && let Some(message) = suspended.last_assistant
+                    {
+                        if !suspended.last_assistant_usage_recorded {
+                            effects.push(record_effect(
+                                &at,
+                                RecordBody::Usage {
+                                    op: op.clone(),
+                                    usage: message.usage.clone(),
+                                },
+                            ));
+                        }
+                        return self.resume_after_assistant(
+                            op,
+                            suspended.last_step.unwrap_or(0),
+                            message,
+                            suspended.open_tools,
+                            &suspended.resolved_tool_calls,
+                            at,
+                            effects,
+                        );
                     }
+
                     let next = suspended.last_step.unwrap_or(0) + 1;
                     self.phase = Phase::AwaitingAssistant {
                         op: op.clone(),
                         step: next,
                         origin: Origin::Replay,
                     };
-                    let effects = vec![
-                        Effect::Emit(AgentEvent::OperationStarted {
+                    effects.push(record_effect(
+                        &at,
+                        RecordBody::Step {
                             op: op.clone(),
-                            origin: Origin::Replay,
-                        }),
-                        record_effect(
-                            &at,
-                            RecordBody::Step {
-                                op: op.clone(),
-                                n: next,
-                            },
-                        ),
-                    ];
+                            n: next,
+                        },
+                    ));
                     let action = Action::StreamAssistant {
                         request: self.request(),
+                        model: self.config.model.clone(),
                         origin: Origin::Replay,
                     };
                     Ok((
@@ -505,6 +576,206 @@ impl SessionMachine {
                 }
                 LaneStatus::Corrupt(_) => Err(MachineError::CorruptResume),
             },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resume_after_assistant(
+        mut self,
+        op: OpId,
+        step: u32,
+        message: AssistantMessage,
+        open_tools: Vec<crate::OpenTool>,
+        resolved_tool_calls: &[ToolCallId],
+        at: Timestamp,
+        mut effects: Vec<Effect>,
+    ) -> Result<(Self, Step), MachineError> {
+        match message.stop {
+            StopReason::Stop => {
+                effects.extend(finish_effects(&op, OpOutcome::Completed, &at));
+                self.phase = Phase::Idle;
+                Ok((
+                    self,
+                    Step::Do {
+                        effects,
+                        action: None,
+                    },
+                ))
+            }
+            StopReason::ToolUse | StopReason::Length => {
+                let prepared = self.prepare_calls(&message, message.stop == StopReason::Length);
+                if prepared.is_empty() {
+                    let error = if message.stop == StopReason::Length {
+                        "provider output was truncated before completing the turn"
+                    } else {
+                        "provider stopped for tool use without returning a tool call"
+                    };
+                    effects.extend(finish_effects(
+                        &op,
+                        OpOutcome::Failed {
+                            error: error.to_owned(),
+                        },
+                        &at,
+                    ));
+                    self.phase = Phase::Idle;
+                    return Ok((
+                        self,
+                        Step::Do {
+                            effects,
+                            action: None,
+                        },
+                    ));
+                }
+
+                let mut calls = prepared
+                    .into_iter()
+                    .filter(|call| !resolved_tool_calls.contains(&call.call_id))
+                    .map(|call| {
+                        if let Some(open) =
+                            open_tools.iter().find(|open| open.call_id == call.call_id)
+                        {
+                            PendingTool {
+                                call: PreparedToolCall {
+                                    call_id: open.call_id.clone(),
+                                    name: open.name.clone(),
+                                    effective_args: open.effective_args.clone(),
+                                    replay: open.replay,
+                                    precomputed_error: (open.replay == ReplaySafety::Never).then(
+                                        || "interrupted; tool is not safe to re-run".to_owned(),
+                                    ),
+                                },
+                                journal_start: false,
+                            }
+                        } else {
+                            PendingTool {
+                                call,
+                                journal_start: true,
+                            }
+                        }
+                    })
+                    .collect::<VecDeque<_>>();
+                let Some(current) = calls.pop_front() else {
+                    let next = step + 1;
+                    effects.push(record_effect(
+                        &at,
+                        RecordBody::Step {
+                            op: op.clone(),
+                            n: next,
+                        },
+                    ));
+                    self.phase = Phase::AwaitingAssistant {
+                        op,
+                        step: next,
+                        origin: Origin::Replay,
+                    };
+                    let action = Action::StreamAssistant {
+                        request: self.request(),
+                        model: self.config.model.clone(),
+                        origin: Origin::Replay,
+                    };
+                    return Ok((
+                        self,
+                        Step::Do {
+                            effects,
+                            action: Some(action),
+                        },
+                    ));
+                };
+                if current.journal_start {
+                    effects.extend(start_tool_effects(&op, &current.call, &at));
+                }
+                let action = Action::ExecuteTool {
+                    call: current.call.clone(),
+                    origin: Origin::Replay,
+                };
+                self.phase = Phase::AwaitingTool {
+                    op,
+                    step,
+                    current,
+                    remaining: calls,
+                    after: AfterTools::Stream,
+                    origin: Origin::Replay,
+                };
+                Ok((
+                    self,
+                    Step::Do {
+                        effects,
+                        action: Some(action),
+                    },
+                ))
+            }
+            StopReason::Paused => {
+                let next = step + 1;
+                effects.push(record_effect(
+                    &at,
+                    RecordBody::Step {
+                        op: op.clone(),
+                        n: next,
+                    },
+                ));
+                self.phase = Phase::AwaitingAssistant {
+                    op,
+                    step: next,
+                    origin: Origin::Replay,
+                };
+                let action = Action::StreamAssistant {
+                    request: self.request(),
+                    model: self.config.model.clone(),
+                    origin: Origin::Replay,
+                };
+                Ok((
+                    self,
+                    Step::Do {
+                        effects,
+                        action: Some(action),
+                    },
+                ))
+            }
+            StopReason::Aborted => {
+                effects.extend(finish_effects(&op, OpOutcome::Aborted, &at));
+                self.phase = Phase::Idle;
+                Ok((
+                    self,
+                    Step::Do {
+                        effects,
+                        action: None,
+                    },
+                ))
+            }
+            StopReason::Refusal | StopReason::Error => {
+                effects.extend(finish_effects(
+                    &op,
+                    OpOutcome::Failed {
+                        error: format!("provider ended the generation with {:?}", message.stop),
+                    },
+                    &at,
+                ));
+                self.phase = Phase::Idle;
+                Ok((
+                    self,
+                    Step::Do {
+                        effects,
+                        action: None,
+                    },
+                ))
+            }
+            _ => {
+                effects.extend(finish_effects(
+                    &op,
+                    OpOutcome::Failed {
+                        error: "provider returned an unsupported stop reason".to_owned(),
+                    },
+                    &at,
+                ));
+                self.phase = Phase::Idle;
+                Ok((
+                    self,
+                    Step::Do {
+                        effects,
+                        action: None,
+                    },
+                ))
+            }
         }
     }
 
@@ -532,9 +803,9 @@ impl SessionMachine {
                     stamp,
                 },
             ) => {
-                if call_id != current.call_id {
+                if call_id != current.call.call_id {
                     return Err(MachineError::MismatchedToolCall {
-                        expected: current.call_id,
+                        expected: current.call.call_id,
                         actual: call_id,
                     });
                 }
@@ -610,7 +881,14 @@ impl SessionMachine {
                 ))
             }
             StopReason::ToolUse | StopReason::Length => {
-                let mut calls = self.prepare_calls(&message, message.stop == StopReason::Length);
+                let mut calls = self
+                    .prepare_calls(&message, message.stop == StopReason::Length)
+                    .into_iter()
+                    .map(|call| PendingTool {
+                        call,
+                        journal_start: true,
+                    })
+                    .collect::<VecDeque<_>>();
                 let Some(current) = calls.pop_front() else {
                     let error = if message.stop == StopReason::Length {
                         "provider output was truncated before completing the turn"
@@ -633,9 +911,9 @@ impl SessionMachine {
                         },
                     ));
                 };
-                effects.extend(start_tool_effects(&op, &current, &stamp.at));
+                effects.extend(start_tool_effects(&op, &current.call, &stamp.at));
                 let action = Action::ExecuteTool {
-                    call: current.clone(),
+                    call: current.call.clone(),
                     origin,
                 };
                 self.phase = Phase::AwaitingTool {
@@ -670,6 +948,7 @@ impl SessionMachine {
                 };
                 let action = Action::StreamAssistant {
                     request: self.request(),
+                    model: self.config.model.clone(),
                     origin,
                 };
                 Ok((
@@ -728,8 +1007,8 @@ impl SessionMachine {
         mut self,
         op: OpId,
         step: u32,
-        current: PreparedToolCall,
-        mut remaining: VecDeque<PreparedToolCall>,
+        current: PendingTool,
+        mut remaining: VecDeque<PendingTool>,
         after: AfterTools,
         origin: Origin,
         content: Vec<ContentBlock>,
@@ -738,7 +1017,7 @@ impl SessionMachine {
         stamp: EntryStamp,
     ) -> Result<(Self, Step), MachineError> {
         let message = SessionMessage::ToolResult {
-            call_id: current.call_id,
+            call_id: current.call.call_id,
             content,
             is_error,
             details,
@@ -763,9 +1042,11 @@ impl SessionMachine {
         ];
 
         if let Some(next) = remaining.pop_front() {
-            effects.extend(start_tool_effects(&op, &next, &stamp.at));
+            if next.journal_start {
+                effects.extend(start_tool_effects(&op, &next.call, &stamp.at));
+            }
             let action = Action::ExecuteTool {
-                call: next.clone(),
+                call: next.call.clone(),
                 origin,
             };
             self.phase = Phase::AwaitingTool {
@@ -802,6 +1083,7 @@ impl SessionMachine {
                 };
                 let action = Action::StreamAssistant {
                     request: self.request(),
+                    model: self.config.model.clone(),
                     origin,
                 };
                 Ok((
@@ -971,6 +1253,8 @@ mod tests {
     use rho_ai::{AssistantMessage, ModelId, ProviderId, StopReason, ToolCallId, Usage};
     use serde_json::json;
 
+    use crate::Item;
+
     use super::*;
 
     fn config() -> MachineConfig {
@@ -978,6 +1262,10 @@ mod tests {
             system: "test".to_owned(),
             max_output_tokens: 100,
             thinking: ThinkingLevel::None,
+            model: crate::ModelRef {
+                provider: ProviderId::from("p"),
+                model: ModelId::from("m"),
+            },
             tools: vec![ToolSpec {
                 definition: ToolDefinition::new("read", "read", json!({"type": "object"})),
                 replay: ReplaySafety::Safe,
@@ -1000,6 +1288,68 @@ mod tests {
             provider: ProviderId::from("p"),
             model: ModelId::from("m"),
         }
+    }
+
+    fn persisted_prefix(message: AssistantMessage, include_usage: bool) -> (Vec<Entry>, Vec<Item>) {
+        let op = OpId::from("op");
+        let user = Entry {
+            seq: 1,
+            id: EntryId::from("user"),
+            parent: None,
+            lane: LaneName::main(),
+            op: Some(op.clone()),
+            at: Timestamp::from("t1"),
+            body: EntryBody::Message {
+                message: SessionMessage::user("hello"),
+            },
+        };
+        let assistant = Entry {
+            seq: 4,
+            id: EntryId::from("assistant"),
+            parent: Some(user.id.clone()),
+            lane: LaneName::main(),
+            op: Some(op.clone()),
+            at: Timestamp::from("t3"),
+            body: EntryBody::Message {
+                message: SessionMessage::Assistant(message.clone()),
+            },
+        };
+        let mut items = vec![
+            Item::Entry(user.clone()),
+            Item::Record(crate::Record {
+                seq: 2,
+                lane: LaneName::main(),
+                at: Timestamp::from("t1"),
+                body: RecordBody::OpStarted {
+                    op: op.clone(),
+                    intent: OpIntent::Run,
+                    origin: Origin::External,
+                    host: None,
+                },
+            }),
+            Item::Record(crate::Record {
+                seq: 3,
+                lane: LaneName::main(),
+                at: Timestamp::from("t2"),
+                body: RecordBody::Step {
+                    op: op.clone(),
+                    n: 1,
+                },
+            }),
+            Item::Entry(assistant.clone()),
+        ];
+        if include_usage {
+            items.push(Item::Record(crate::Record {
+                seq: 5,
+                lane: LaneName::main(),
+                at: Timestamp::from("t3"),
+                body: RecordBody::Usage {
+                    op,
+                    usage: message.usage,
+                },
+            }));
+        }
+        (vec![user, assistant], items)
     }
 
     #[test]
@@ -1144,5 +1494,280 @@ mod tests {
             panic!("expected shell-visible precomputed result");
         };
         assert!(call.precomputed_error.is_some());
+    }
+
+    #[test]
+    fn resume_after_durable_terminal_message_only_derives_missing_effects() {
+        for include_usage in [false, true] {
+            let terminal = assistant(StopReason::Stop, vec![ContentBlock::text("done")]);
+            let (entries, items) = persisted_prefix(terminal, include_usage);
+            let status = crate::reduce_lane_status(&items, &LaneName::main());
+            let machine = SessionMachine::new(config(), entries).unwrap();
+            let (_, Step::Do { effects, action }) = machine
+                .handle(Input::Resume {
+                    status,
+                    at: Timestamp::from("resume"),
+                })
+                .unwrap()
+            else {
+                panic!("expected recovery effects");
+            };
+            assert!(action.is_none());
+            assert_eq!(
+                effects
+                    .iter()
+                    .filter(|effect| matches!(effect, Effect::AppendRecord(_)))
+                    .count(),
+                usize::from(!include_usage) + 1
+            );
+            assert!(effects.iter().any(|effect| matches!(
+                effect,
+                Effect::AppendRecord(NewRecord {
+                    body: RecordBody::OpFinished {
+                        outcome: OpOutcome::Completed,
+                        ..
+                    },
+                    ..
+                })
+            )));
+        }
+    }
+
+    #[test]
+    fn resume_after_assistant_starts_missing_tool_instead_of_restreaming() {
+        let call_id = ToolCallId::from("call");
+        let tool_message = assistant(
+            StopReason::ToolUse,
+            vec![ContentBlock::ToolCall {
+                id: call_id.clone(),
+                name: "read".to_owned(),
+                args: json!({"path": "x"}),
+            }],
+        );
+        let (entries, items) = persisted_prefix(tool_message, true);
+        let status = crate::reduce_lane_status(&items, &LaneName::main());
+        let machine = SessionMachine::new(config(), entries).unwrap();
+        let (_, Step::Do { effects, action }) = machine
+            .handle(Input::Resume {
+                status,
+                at: Timestamp::from("resume"),
+            })
+            .unwrap()
+        else {
+            panic!("expected recovery tool action");
+        };
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::AppendRecord(NewRecord {
+                body: RecordBody::ToolStarted {
+                    call_id: started,
+                    ..
+                },
+                ..
+            }) if started == &call_id
+        )));
+        assert!(matches!(
+            action,
+            Some(Action::ExecuteTool { call, origin: Origin::Replay }) if call.call_id == call_id
+        ));
+    }
+
+    #[test]
+    fn resume_continues_at_the_first_unresolved_tool_in_a_batch() {
+        let first = ToolCallId::from("first");
+        let second = ToolCallId::from("second");
+        let tool_message = assistant(
+            StopReason::ToolUse,
+            vec![
+                ContentBlock::ToolCall {
+                    id: first.clone(),
+                    name: "read".to_owned(),
+                    args: json!({"path": "a"}),
+                },
+                ContentBlock::ToolCall {
+                    id: second.clone(),
+                    name: "read".to_owned(),
+                    args: json!({"path": "b"}),
+                },
+            ],
+        );
+        let (mut entries, mut items) = persisted_prefix(tool_message, true);
+        items.push(Item::Record(crate::Record {
+            seq: 6,
+            lane: LaneName::main(),
+            at: Timestamp::from("t4"),
+            body: RecordBody::ToolStarted {
+                op: OpId::from("op"),
+                call_id: first.clone(),
+                name: "read".to_owned(),
+                effective_args: json!({"path": "a"}),
+                replay: ReplaySafety::Safe,
+            },
+        }));
+        let result = Entry {
+            seq: 7,
+            id: EntryId::from("first-result"),
+            parent: Some(EntryId::from("assistant")),
+            lane: LaneName::main(),
+            op: Some(OpId::from("op")),
+            at: Timestamp::from("t5"),
+            body: EntryBody::Message {
+                message: SessionMessage::ToolResult {
+                    call_id: first,
+                    content: vec![ContentBlock::text("a")],
+                    is_error: false,
+                    details: None,
+                },
+            },
+        };
+        entries.push(result.clone());
+        items.push(Item::Entry(result));
+
+        let status = crate::reduce_lane_status(&items, &LaneName::main());
+        let machine = SessionMachine::new(config(), entries).unwrap();
+        let (_, Step::Do { effects, action }) = machine
+            .handle(Input::Resume {
+                status,
+                at: Timestamp::from("resume"),
+            })
+            .unwrap()
+        else {
+            panic!("expected second tool action");
+        };
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::AppendRecord(NewRecord {
+                body: RecordBody::ToolStarted { call_id, .. },
+                ..
+            }) if call_id == &second
+        )));
+        assert!(matches!(
+            action,
+            Some(Action::ExecuteTool { call, .. }) if call.call_id == second
+        ));
+    }
+
+    #[test]
+    fn resume_after_paused_message_derives_the_next_step() {
+        let (entries, items) = persisted_prefix(assistant(StopReason::Paused, Vec::new()), true);
+        let status = crate::reduce_lane_status(&items, &LaneName::main());
+        let machine = SessionMachine::new(config(), entries).unwrap();
+        let (_, Step::Do { effects, action }) = machine
+            .handle(Input::Resume {
+                status,
+                at: Timestamp::from("resume"),
+            })
+            .unwrap()
+        else {
+            panic!("expected resumed stream");
+        };
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::AppendRecord(NewRecord {
+                body: RecordBody::Step { n: 2, .. },
+                ..
+            })
+        )));
+        assert!(matches!(
+            action,
+            Some(Action::StreamAssistant {
+                origin: Origin::Replay,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn resume_closes_the_prompt_entry_before_op_started_crash_window() {
+        let user = Entry {
+            seq: 1,
+            id: EntryId::from("user"),
+            parent: None,
+            lane: LaneName::main(),
+            op: Some(OpId::from("op")),
+            at: Timestamp::from("t1"),
+            body: EntryBody::Message {
+                message: SessionMessage::user("durable prompt"),
+            },
+        };
+        let status = crate::reduce_lane_status(&[Item::Entry(user.clone())], &LaneName::main());
+        let machine = SessionMachine::new(config(), vec![user]).unwrap();
+        let (_, Step::Do { effects, action }) = machine
+            .handle(Input::Resume {
+                status,
+                at: Timestamp::from("resume"),
+            })
+            .unwrap()
+        else {
+            panic!("expected resumed provider action");
+        };
+        assert!(matches!(action, Some(Action::StreamAssistant { .. })));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::AppendRecord(NewRecord {
+                body: RecordBody::OpStarted {
+                    origin: Origin::Replay,
+                    ..
+                },
+                ..
+            })
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::AppendRecord(NewRecord {
+                body: RecordBody::Step { n: 1, .. },
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn durable_settings_override_constructor_defaults_and_prompt_role_is_checked() {
+        let settings = Entry {
+            seq: 1,
+            id: EntryId::from("settings"),
+            parent: None,
+            lane: LaneName::main(),
+            op: None,
+            at: Timestamp::from("t"),
+            body: EntryBody::SettingsChange {
+                model: Some(crate::ModelRef {
+                    provider: ProviderId::from("durable-provider"),
+                    model: ModelId::from("durable-model"),
+                }),
+                thinking: Some(ThinkingLevel::Max),
+            },
+        };
+        let machine = SessionMachine::new(config(), vec![settings]).unwrap();
+        assert_eq!(machine.model().model, ModelId::from("durable-model"));
+        let (_, Step::Do { action, .. }) = machine
+            .clone()
+            .handle(Input::Prompt {
+                message: SessionMessage::user("continue"),
+                op: OpId::from("valid-op"),
+                stamp: stamp("valid-entry"),
+                origin: Origin::External,
+                host: None,
+            })
+            .unwrap()
+        else {
+            panic!("expected provider action");
+        };
+        assert!(matches!(
+            action,
+            Some(Action::StreamAssistant { model, request, .. })
+                if model.model == ModelId::from("durable-model")
+                    && request.thinking == ThinkingLevel::Max
+        ));
+        let error = machine
+            .handle(Input::Prompt {
+                message: SessionMessage::Assistant(assistant(StopReason::Stop, Vec::new())),
+                op: OpId::from("op"),
+                stamp: stamp("entry"),
+                origin: Origin::External,
+                host: None,
+            })
+            .unwrap_err();
+        assert_eq!(error, MachineError::InvalidPrompt);
     }
 }

@@ -73,6 +73,10 @@ impl AnthropicFactory {
 }
 
 impl ProviderFactory for AnthropicFactory {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::from(PROVIDER)
+    }
+
     fn models(&self) -> &[ModelInfo] {
         &self.models
     }

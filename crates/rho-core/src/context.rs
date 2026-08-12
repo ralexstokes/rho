@@ -148,6 +148,34 @@ pub fn plan_compaction(entries: &[Entry], retain_messages: usize) -> CompactionP
     }
 }
 
+/// Returns provider tool calls that lack a later result on this branch.
+pub fn unresolved_tool_calls(entries: &[Entry]) -> Result<Vec<ToolCallId>, ContextError> {
+    let context = assemble_context(entries)?;
+    let mut unresolved = Vec::<ToolCallId>::new();
+    for message in context.messages {
+        match message {
+            Message::Assistant(message) => {
+                unresolved.extend(message.blocks.into_iter().filter_map(|block| match block {
+                    ContentBlock::ToolCall { id, .. }
+                    | ContentBlock::RejectedToolCall { id, .. } => Some(id),
+                    _ => None,
+                }));
+            }
+            Message::ToolResult(result) => {
+                if let Some(index) = unresolved
+                    .iter()
+                    .position(|call_id| call_id == &result.call_id)
+                {
+                    unresolved.remove(index);
+                }
+            }
+            Message::User { .. } => {}
+            _ => {}
+        }
+    }
+    Ok(unresolved)
+}
+
 fn validate_path(entries: &[Entry]) -> Result<(), ContextError> {
     let mut expected = None;
     for entry in entries {
@@ -303,6 +331,11 @@ mod tests {
         assert_eq!(plan.compacted, [SessionMessage::user("old")]);
         assert_eq!(plan.retained_tail.len(), 2);
         assert_eq!(plan.first_kept, Some(EntryId::from("e2")));
+        assert_eq!(
+            unresolved_tool_calls(&entries[..2]).unwrap(),
+            [ToolCallId::from("call")]
+        );
+        assert!(unresolved_tool_calls(&entries).unwrap().is_empty());
     }
 
     #[test]

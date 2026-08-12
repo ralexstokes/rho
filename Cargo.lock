@@ -1430,6 +1430,7 @@ dependencies = [
 name = "rho-store"
 version = "0.1.0"
 dependencies = [
+ "rho-ai",
  "rho-codec-jsonl",
  "rho-core",
  "serde_json",

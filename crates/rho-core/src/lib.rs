@@ -10,7 +10,7 @@ mod recovery;
 
 pub use context::{
     AssembledContext, CompactionPlan, ContextError, SessionSettings, assemble_context,
-    plan_compaction,
+    plan_compaction, unresolved_tool_calls,
 };
 pub use machine::{
     Action, ActionOutcome, AgentEvent, Effect, EntryStamp, HookInvocation, Input,

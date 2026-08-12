@@ -11,7 +11,8 @@ use serde_json::Value;
 
 use crate::{
     CreateOptions, ForkPoint, RepoFuture, Session, SessionError, SessionMeta, SessionRepo,
-    append_entry_to_items, branch_from_items, checked_next_seq, derive_leaf, session_meta, stamp,
+    append_entry_to_items, branch_from_items, checked_next_seq, derive_leaf,
+    reject_incomplete_tool_turn, session_meta, stamp,
 };
 
 /// Process-local reference repository with writer-lock semantics.
@@ -115,6 +116,7 @@ impl SessionRepo for MemoryRepo {
             };
             let branch =
                 branch_from_items(&source_file.items, source_file.leaf.clone(), target.clone())?;
+            reject_incomplete_tool_turn(&branch)?;
             let id = stamp::session_id();
             let header = SessionHeader {
                 v: FORMAT_VERSION,
@@ -131,6 +133,7 @@ impl SessionRepo for MemoryRepo {
                 .enumerate()
                 .map(|(index, mut entry)| {
                     entry.seq = u64::try_from(index).unwrap_or(u64::MAX) + 1;
+                    entry.op = None;
                     Item::Entry(entry)
                 })
                 .collect::<Vec<_>>();
@@ -305,6 +308,8 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> SessionError {
 
 #[cfg(test)]
 mod tests {
+    use rho_ai::{AssistantMessage, ContentBlock, ModelId, ProviderId, StopReason, Usage};
+
     use crate::conformance;
 
     use super::*;
@@ -312,5 +317,59 @@ mod tests {
     #[tokio::test]
     async fn passes_shared_conformance_suite() {
         conformance::run(&MemoryRepo::default()).await;
+    }
+
+    #[tokio::test]
+    async fn fork_rejects_an_incomplete_provider_tool_turn() {
+        let repo = MemoryRepo::default();
+        let mut session = repo
+            .create(CreateOptions {
+                cwd: "/workspace".to_owned(),
+            })
+            .await
+            .unwrap();
+        let id = session.header().id.clone();
+        let root = EntryId::from("root");
+        session
+            .append_entry(NewEntry {
+                id: root.clone(),
+                parent: None,
+                lane: LaneName::main(),
+                op: None,
+                at: rho_core::Timestamp::from("t1"),
+                body: rho_core::EntryBody::Message {
+                    message: rho_core::SessionMessage::user("read"),
+                },
+            })
+            .unwrap();
+        session
+            .append_entry(NewEntry {
+                id: EntryId::from("assistant"),
+                parent: Some(root),
+                lane: LaneName::main(),
+                op: None,
+                at: rho_core::Timestamp::from("t2"),
+                body: rho_core::EntryBody::Message {
+                    message: rho_core::SessionMessage::Assistant(AssistantMessage {
+                        blocks: vec![ContentBlock::ToolCall {
+                            id: rho_ai::ToolCallId::from("call"),
+                            name: "read".to_owned(),
+                            args: serde_json::json!({}),
+                        }],
+                        stop: StopReason::ToolUse,
+                        usage: Usage::default(),
+                        provider: ProviderId::from("p"),
+                        model: ModelId::from("m"),
+                    }),
+                },
+            })
+            .unwrap();
+        drop(session);
+
+        assert!(matches!(
+            repo.fork(id, ForkPoint::Leaf).await,
+            Err(SessionError::IncompleteToolTurn { call_ids })
+                if call_ids == ["call".to_owned()]
+        ));
     }
 }

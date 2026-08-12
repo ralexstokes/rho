@@ -2,7 +2,9 @@ use std::{future::Future, pin::Pin};
 
 use futures_core::Stream;
 
-use crate::{CancellationToken, ModelInfo, ProviderError, Request, SessionConfig, StreamEvent};
+use crate::{
+    CancellationToken, ModelInfo, ProviderError, ProviderId, Request, SessionConfig, StreamEvent,
+};
 
 /// Type-erased stream returned by provider adapters.
 pub type ProviderStream<'session> = Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'session>>;
@@ -13,6 +15,9 @@ pub type OpenProvider<'factory> =
 
 /// Shared provider configuration, credentials, and model catalog.
 pub trait ProviderFactory: Send + Sync {
+    /// Stable adapter identity used to resolve durable model selections.
+    fn provider_id(&self) -> ProviderId;
+
     /// Models this factory can open.
     fn models(&self) -> &[ModelInfo];
 

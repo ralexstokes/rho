@@ -72,6 +72,20 @@ pub enum SessionError {
     /// An externally supplied identifier is unsafe for filesystem use.
     #[error("invalid session identifier {0:?}")]
     InvalidSessionId(String),
+    /// A file's name and durable header disagree about session identity.
+    #[error("session file identity mismatch: expected {expected}, found {actual}")]
+    HeaderIdMismatch {
+        /// Identity implied by the filename or request.
+        expected: SessionId,
+        /// Identity stored in the header.
+        actual: SessionId,
+    },
+    /// A fork point leaves provider tool calls without results.
+    #[error("fork point leaves unresolved tool calls: {call_ids:?}")]
+    IncompleteToolTurn {
+        /// Provider-issued calls requiring results.
+        call_ids: Vec<String>,
+    },
     /// Appending would not extend the selected branch.
     #[error("entry parent {actual:?} did not match current leaf {expected:?}")]
     InvalidEntryParent {
@@ -209,6 +223,21 @@ fn session_meta(header: SessionHeader, items: &[Item]) -> SessionMeta {
         header,
         leaf: derive_leaf(items),
         status: rho_core::reduce_lane_status(items, &LaneName::main()),
+    }
+}
+
+fn reject_incomplete_tool_turn(entries: &[Entry]) -> Result<(), SessionError> {
+    let unresolved = rho_core::unresolved_tool_calls(entries)
+        .map_err(|error| SessionError::Io(std::io::Error::other(error)))?;
+    if unresolved.is_empty() {
+        Ok(())
+    } else {
+        Err(SessionError::IncompleteToolTurn {
+            call_ids: unresolved
+                .into_iter()
+                .map(|call_id| call_id.to_string())
+                .collect(),
+        })
     }
 }
 
@@ -363,6 +392,66 @@ pub mod conformance {
             id
         );
         drop(fork);
+
+        let mut completed = repo
+            .create(CreateOptions {
+                cwd: "/workspace".to_owned(),
+            })
+            .await
+            .expect("create completed session");
+        let completed_id = completed.header().id.clone();
+        let completed_op = OpId::from("00000000-0000-7000-8000-000000000010");
+        completed
+            .append_entry(NewEntry {
+                id: EntryId::from("00000000-0000-7000-8000-000000000011"),
+                parent: None,
+                lane: LaneName::main(),
+                op: Some(completed_op.clone()),
+                at: Timestamp::from("2026-08-11T00:01:00Z"),
+                body: EntryBody::Message {
+                    message: SessionMessage::user("completed operation"),
+                },
+            })
+            .expect("append completed prompt");
+        completed
+            .append_record(NewRecord {
+                lane: LaneName::main(),
+                at: Timestamp::from("2026-08-11T00:01:01Z"),
+                body: RecordBody::OpStarted {
+                    op: completed_op.clone(),
+                    intent: OpIntent::Run,
+                    origin: Origin::External,
+                    host: None,
+                },
+            })
+            .expect("start completed operation");
+        completed
+            .append_record(NewRecord {
+                lane: LaneName::main(),
+                at: Timestamp::from("2026-08-11T00:01:02Z"),
+                body: RecordBody::OpFinished {
+                    op: completed_op,
+                    outcome: rho_core::OpOutcome::Completed,
+                },
+            })
+            .expect("finish completed operation");
+        drop(completed);
+        let completed_fork = repo
+            .fork(completed_id, ForkPoint::Leaf)
+            .await
+            .expect("fork completed operation");
+        assert_eq!(
+            completed_fork.lane_status().expect("fork status"),
+            rho_core::LaneStatus::Idle
+        );
+        assert!(
+            completed_fork
+                .export_entries()
+                .expect("fork entries")
+                .iter()
+                .all(|entry| entry.op.is_none())
+        );
+        drop(completed_fork);
 
         let doomed = repo
             .create(CreateOptions {

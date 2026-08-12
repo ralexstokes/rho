@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use crate::{
     CreateOptions, ForkPoint, RepoFuture, Session, SessionError, SessionMeta, SessionRepo,
-    append_entry_to_items, branch_from_items, checked_next_seq, derive_leaf, session_meta, stamp,
+    append_entry_to_items, branch_from_items, checked_next_seq, derive_leaf,
+    reject_incomplete_tool_turn, session_meta, stamp,
 };
 
 /// Durability policy for successful appends.
@@ -109,6 +110,12 @@ impl JsonlRepo {
             Err(error) => return Err(error.into()),
         };
         let decoded = decode_session(&bytes)?;
+        if decoded.header.id != *id {
+            return Err(SessionError::HeaderIdMismatch {
+                expected: id.clone(),
+                actual: decoded.header.id,
+            });
+        }
         Ok((decoded.header, decoded.items))
     }
 }
@@ -186,7 +193,18 @@ impl SessionRepo for JsonlRepo {
                         if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                             continue;
                         }
+                        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                            return Err(SessionError::InvalidSessionId(path.display().to_string()));
+                        };
+                        let id = SessionId::from(stem);
+                        validate_id(&id)?;
                         let decoded = decode_session(&fs::read(path)?)?;
+                        if decoded.header.id != id {
+                            return Err(SessionError::HeaderIdMismatch {
+                                expected: id,
+                                actual: decoded.header.id,
+                            });
+                        }
                         sessions.push(session_meta(decoded.header, &decoded.items));
                     }
                     sessions.sort_by(|left, right| left.header.id.cmp(&right.header.id));
@@ -220,6 +238,7 @@ impl SessionRepo for JsonlRepo {
                 ForkPoint::Entry(entry) => Some(entry),
             };
             let branch = branch_from_items(&source_items, source_leaf, target.clone())?;
+            reject_incomplete_tool_turn(&branch)?;
             let id = stamp::session_id();
             let header = SessionHeader {
                 v: FORMAT_VERSION,
@@ -236,6 +255,7 @@ impl SessionRepo for JsonlRepo {
                 .enumerate()
                 .map(|(index, mut entry)| {
                     entry.seq = u64::try_from(index).unwrap_or(u64::MAX) + 1;
+                    entry.op = None;
                     Item::Entry(entry)
                 })
                 .collect();
@@ -297,10 +317,7 @@ impl Session for JsonlSession {
             }
             _ => None,
         };
-        let boundary = matches!(
-            record.body,
-            RecordBody::OpStarted { .. } | RecordBody::OpFinished { .. }
-        );
+        let boundary = is_sync_boundary(&record.body);
         self.append_item(
             Item::Record(Record {
                 seq,
@@ -388,6 +405,16 @@ fn validate_id(id: &SessionId) -> Result<(), SessionError> {
     Ok(())
 }
 
+fn is_sync_boundary(body: &RecordBody) -> bool {
+    matches!(
+        body,
+        RecordBody::OpStarted { .. }
+            | RecordBody::OpFinished { .. }
+            | RecordBody::AbortRequested { .. }
+            | RecordBody::ToolStarted { .. }
+    )
+}
+
 fn acquire_lock(path: &Path, id: &SessionId) -> Result<File, SessionError> {
     let lock = OpenOptions::new()
         .read(true)
@@ -455,5 +482,47 @@ mod tests {
         if path.exists() {
             fs::remove_dir_all(path).expect("remove test repository");
         }
+    }
+
+    #[test]
+    fn tool_start_is_fsynced_before_the_side_effect() {
+        assert!(is_sync_boundary(&RecordBody::ToolStarted {
+            op: rho_core::OpId::from("op"),
+            call_id: rho_ai::ToolCallId::from("call"),
+            name: "write".to_owned(),
+            effective_args: serde_json::json!({}),
+            replay: rho_core::ReplaySafety::Never,
+        }));
+    }
+
+    #[tokio::test]
+    async fn filename_and_header_identity_must_match_for_list_and_fork() {
+        let (path, repo) = temp_repo();
+        let session = repo
+            .create(CreateOptions {
+                cwd: "/workspace".to_owned(),
+            })
+            .await
+            .unwrap();
+        let original = session.header().id.clone();
+        drop(session);
+        let substituted = SessionId::from(Uuid::now_v7().to_string());
+        fs::rename(
+            repo.session_path(&original).unwrap(),
+            repo.session_path(&substituted).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            repo.list().await,
+            Err(SessionError::HeaderIdMismatch { expected, actual })
+                if expected == substituted && actual == original
+        ));
+        assert!(matches!(
+            repo.fork(substituted.clone(), ForkPoint::Leaf).await,
+            Err(SessionError::HeaderIdMismatch { expected, actual })
+                if expected == substituted && actual == original
+        ));
+        fs::remove_dir_all(path).expect("remove test repository");
     }
 }

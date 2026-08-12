@@ -11,8 +11,8 @@ use futures_core::Stream;
 
 use crate::{
     CancellationToken, ErrorKind, Message, ModelInfo, OpenProvider, Provider, ProviderError,
-    ProviderFactory, ProviderStream, Request, SessionConfig, StreamEvent, ThinkingLevel,
-    ToolDefinition,
+    ProviderFactory, ProviderId, ProviderStream, Request, SessionConfig, StreamEvent,
+    ThinkingLevel, ToolDefinition,
 };
 
 /// Whether a scripted generation continued acknowledged state or rebased.
@@ -36,6 +36,7 @@ pub struct Script {
 /// Shared factory for deterministic scripted sessions.
 #[derive(Clone, Debug)]
 pub struct FauxFactory {
+    provider_id: ProviderId,
     models: Vec<ModelInfo>,
     scripts: Arc<Mutex<VecDeque<Script>>>,
     decisions: Arc<Mutex<Vec<SessionDecision>>>,
@@ -46,10 +47,18 @@ impl FauxFactory {
     #[must_use]
     pub fn new(models: Vec<ModelInfo>, scripts: impl IntoIterator<Item = Script>) -> Self {
         Self {
+            provider_id: ProviderId::from("faux"),
             models,
             scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
             decisions: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Overrides the stable provider identity represented by this factory.
+    #[must_use]
+    pub fn with_provider_id(mut self, provider_id: ProviderId) -> Self {
+        self.provider_id = provider_id;
+        self
     }
 
     /// Returns how many scripted requests remain.
@@ -89,6 +98,10 @@ impl FauxFactory {
 }
 
 impl ProviderFactory for FauxFactory {
+    fn provider_id(&self) -> ProviderId {
+        self.provider_id.clone()
+    }
+
     fn models(&self) -> &[ModelInfo] {
         &self.models
     }

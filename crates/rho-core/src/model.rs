@@ -514,6 +514,8 @@ pub struct OpenTool {
 pub struct SuspendedOp {
     /// Operation identity.
     pub op: OpId,
+    /// Whether the opening record was durable before interruption.
+    pub operation_started: bool,
     /// Original intent.
     pub intent: OpIntent,
     /// Whether cancellation was durable before the crash.
@@ -524,6 +526,12 @@ pub struct SuspendedOp {
     pub open_tools: Vec<OpenTool>,
     /// Whether a provider step lacks an assistant result.
     pub stream_in_flight: bool,
+    /// Latest durable assistant result for the operation, if any.
+    pub last_assistant: Option<AssistantMessage>,
+    /// Whether usage for `last_assistant` is already durable.
+    pub last_assistant_usage_recorded: bool,
+    /// Calls from `last_assistant` that already have durable results.
+    pub resolved_tool_calls: Vec<ToolCallId>,
 }
 
 /// Named impossible journal sequence.

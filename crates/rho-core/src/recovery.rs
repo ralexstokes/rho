@@ -9,6 +9,7 @@ use crate::{
 
 #[derive(Debug)]
 struct OperationState {
+    operation_started: bool,
     intent: OpIntent,
     finished: bool,
     abort_requested: bool,
@@ -16,6 +17,9 @@ struct OperationState {
     stream_in_flight: bool,
     started_tools: BTreeSet<ToolCallId>,
     open_tools: Vec<OpenTool>,
+    last_assistant: Option<rho_ai::AssistantMessage>,
+    last_assistant_usage_recorded: bool,
+    resolved_tool_calls: Vec<ToolCallId>,
 }
 
 /// Reduces an interleaved session stream to one lane's recoverable status.
@@ -46,9 +50,13 @@ pub fn reduce_lane_status(items: &[Item], lane: &LaneName) -> LaneStatus {
             Item::Record(record) if &record.lane == lane => {
                 reduce_record(&record.body, &known_ops, &mut operations, &mut open)
             }
-            Item::Entry(entry) if &entry.lane == lane => {
-                reduce_entry(entry.op.as_ref(), &entry.body, &known_ops, &mut operations)
-            }
+            Item::Entry(entry) if &entry.lane == lane => reduce_entry(
+                entry.op.as_ref(),
+                &entry.body,
+                &known_ops,
+                &mut operations,
+                &mut open,
+            ),
             Item::Entry(_) | Item::Record(_) | Item::Fact(_) => Ok(()),
         };
         if let Err(reason) = result {
@@ -62,11 +70,15 @@ pub fn reduce_lane_status(items: &[Item], lane: &LaneName) -> LaneStatus {
     let state = &operations[&op];
     LaneStatus::Suspended(SuspendedOp {
         op,
+        operation_started: state.operation_started,
         intent: state.intent,
         abort_requested: state.abort_requested,
         last_step: state.last_step,
         open_tools: state.open_tools.clone(),
         stream_in_flight: state.stream_in_flight,
+        last_assistant: state.last_assistant.clone(),
+        last_assistant_usage_recorded: state.last_assistant_usage_recorded,
+        resolved_tool_calls: state.resolved_tool_calls.clone(),
     })
 }
 
@@ -99,6 +111,7 @@ fn reduce_record(
         operations.insert(
             op.clone(),
             OperationState {
+                operation_started: true,
                 intent: *intent,
                 finished: false,
                 abort_requested: false,
@@ -106,6 +119,9 @@ fn reduce_record(
                 stream_in_flight: false,
                 started_tools: BTreeSet::new(),
                 open_tools: Vec::new(),
+                last_assistant: None,
+                last_assistant_usage_recorded: false,
+                resolved_tool_calls: Vec::new(),
             },
         );
         *open = Some(op.clone());
@@ -182,7 +198,12 @@ fn reduce_record(
                 replay: *replay,
             });
         }
-        RecordBody::QueueChanged { .. } | RecordBody::Usage { .. } => {}
+        RecordBody::Usage { .. } => {
+            if state.last_assistant.is_some() {
+                state.last_assistant_usage_recorded = true;
+            }
+        }
+        RecordBody::QueueChanged { .. } => {}
         RecordBody::OpStarted { .. } | RecordBody::LaneMoved { .. } => {}
     }
     Ok(())
@@ -193,11 +214,44 @@ fn reduce_entry(
     body: &crate::EntryBody,
     known_ops: &BTreeSet<OpId>,
     operations: &mut BTreeMap<OpId, OperationState>,
+    open: &mut Option<OpId>,
 ) -> Result<(), CorruptionReason> {
     let Some(op) = op else {
         return Ok(());
     };
-    require_known(op, known_ops)?;
+    if !known_ops.contains(op) {
+        return match body {
+            crate::EntryBody::Message {
+                message: SessionMessage::User { .. },
+            } => {
+                if let Some(first) = open.as_ref() {
+                    return Err(CorruptionReason::MultipleOpenOperations {
+                        first: first.clone(),
+                        second: op.clone(),
+                    });
+                }
+                operations.insert(
+                    op.clone(),
+                    OperationState {
+                        operation_started: false,
+                        intent: OpIntent::Run,
+                        finished: false,
+                        abort_requested: false,
+                        last_step: None,
+                        stream_in_flight: false,
+                        started_tools: BTreeSet::new(),
+                        open_tools: Vec::new(),
+                        last_assistant: None,
+                        last_assistant_usage_recorded: false,
+                        resolved_tool_calls: Vec::new(),
+                    },
+                );
+                *open = Some(op.clone());
+                Ok(())
+            }
+            _ => Err(CorruptionReason::UnknownOperation { op: op.clone() }),
+        };
+    }
 
     // The initial user entry is deliberately written immediately before
     // OpStarted, so an operation may be known but not yet encountered.
@@ -214,11 +268,14 @@ fn reduce_entry(
     }
     if let crate::EntryBody::Message { message } = body {
         match message {
-            SessionMessage::Assistant(_) => {
+            SessionMessage::Assistant(message) => {
                 if !state.stream_in_flight {
                     return Err(CorruptionReason::AssistantWithoutStep { op: op.clone() });
                 }
                 state.stream_in_flight = false;
+                state.last_assistant = Some(message.clone());
+                state.last_assistant_usage_recorded = false;
+                state.resolved_tool_calls.clear();
             }
             SessionMessage::ToolResult { call_id, .. } => {
                 let Some(position) = state
@@ -232,6 +289,7 @@ fn reduce_entry(
                     });
                 };
                 state.open_tools.remove(position);
+                state.resolved_tool_calls.push(call_id.clone());
             }
             SessionMessage::User { .. } | SessionMessage::Custom { .. } => {}
         }
@@ -321,6 +379,17 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn user_entry_before_missing_op_start_is_recoverable() {
+        let items = vec![entry(1, Some("op"), SessionMessage::user("durable prompt"))];
+        let LaneStatus::Suspended(status) = reduce_lane_status(&items, &LaneName::main()) else {
+            panic!("expected recoverable pre-start operation");
+        };
+        assert_eq!(status.op, OpId::from("op"));
+        assert!(!status.operation_started);
+        assert_eq!(status.last_step, None);
     }
 
     #[test]

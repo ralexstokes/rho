@@ -13,10 +13,13 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use rho_ai::{CancellationToken, Provider, StreamEvent};
+use rho_ai::{
+    CancellationToken, ErrorKind, Provider, ProviderError, ProviderFactory, SessionConfig,
+    StreamEvent,
+};
 use rho_core::{
-    Action, ActionOutcome, AgentEvent, Effect, EntryId, EntryStamp, Input, MachineError, OpId,
-    Origin, SessionMachine, SessionMessage, Step, Timestamp,
+    Action, ActionOutcome, AgentEvent, Effect, EntryId, EntryStamp, Input, MachineError, ModelRef,
+    OpId, Origin, SessionMachine, SessionMessage, Step, Timestamp,
 };
 use rho_store::{Session, SessionError};
 use rho_tools::{ToolOutput, ToolSet};
@@ -39,6 +42,51 @@ pub struct NoopEventSink;
 impl EventSink for NoopEventSink {
     fn emit(&mut self, _: AgentEvent) -> EventFuture<'_> {
         Box::pin(async {})
+    }
+}
+
+/// A live provider session bound to the provider/model used to open it.
+///
+/// Construction is intentionally only available through [`Self::open`], so
+/// the automatic driver cannot silently execute a machine action against a
+/// provider session opened for a different model.
+pub struct BoundProvider {
+    model: ModelRef,
+    provider: Box<dyn Provider>,
+}
+
+impl BoundProvider {
+    /// Opens a provider session for one durable provider/model selection.
+    ///
+    /// The factory identity and model catalog must both match the selection.
+    pub async fn open(
+        factory: &dyn ProviderFactory,
+        model: ModelRef,
+    ) -> Result<Self, ProviderError> {
+        let factory_provider = factory.provider_id();
+        if model.provider != factory_provider {
+            return Err(ProviderError {
+                retryable: false,
+                kind: ErrorKind::InvalidRequest,
+                message: format!(
+                    "provider factory {:?} cannot open durable provider {:?}",
+                    factory_provider.as_str(),
+                    model.provider.as_str()
+                ),
+            });
+        }
+        let provider = factory
+            .open(SessionConfig {
+                model: model.model.clone(),
+            })
+            .await?;
+        Ok(Self { model, provider })
+    }
+
+    /// Returns the durable selection this provider session was opened for.
+    #[must_use]
+    pub fn model(&self) -> &ModelRef {
+        &self.model
     }
 }
 
@@ -93,6 +141,23 @@ pub enum DriverError {
     /// Recovery found work that requires explicit resume choreography.
     #[error("suspended operation requires resume choreography")]
     Suspended,
+    /// A new prompt was attempted on non-idle durable state.
+    #[error("cannot start a prompt while the durable lane is {status:?}")]
+    LaneNotIdle {
+        /// Observed durable recovery state.
+        status: Box<rho_core::LaneStatus>,
+    },
+    /// The machine was reconstructed from a different branch than the handle.
+    #[error("session machine does not match the writer handle's current branch")]
+    SessionStateMismatch,
+    /// The open provider does not match the machine's durable selection.
+    #[error("machine requires provider/model {expected:?}, but {actual:?} is open")]
+    ProviderSelectionMismatch {
+        /// Provider/model required by the machine or action.
+        expected: ModelRef,
+        /// Provider/model to which the live provider session is bound.
+        actual: ModelRef,
+    },
 }
 
 /// Runs one prompt to a terminal state using the same machine exposed for
@@ -101,7 +166,7 @@ pub enum DriverError {
 pub async fn run_prompt(
     machine: SessionMachine,
     session: &mut dyn Session,
-    provider: &mut dyn Provider,
+    provider: &mut BoundProvider,
     tools: &ToolSet,
     message: SessionMessage,
     origin: Origin,
@@ -110,6 +175,14 @@ pub async fn run_prompt(
     cancellation: CancellationToken,
     events: &mut dyn EventSink,
 ) -> Result<SessionMachine, DriverError> {
+    validate_binding(&machine, session)?;
+    validate_provider(&machine, provider)?;
+    let status = session.lane_status()?;
+    if status != rho_core::LaneStatus::Idle {
+        return Err(DriverError::LaneNotIdle {
+            status: Box::new(status),
+        });
+    }
     let input = Input::Prompt {
         message,
         op: stamps.op_id(),
@@ -136,12 +209,13 @@ pub async fn run_prompt(
 pub async fn resume(
     machine: SessionMachine,
     session: &mut dyn Session,
-    provider: &mut dyn Provider,
+    provider: &mut BoundProvider,
     tools: &ToolSet,
     stamps: &mut dyn StampSource,
     cancellation: CancellationToken,
     events: &mut dyn EventSink,
 ) -> Result<SessionMachine, DriverError> {
+    validate_binding(&machine, session)?;
     let status = session.lane_status()?;
     let (machine, step) = machine.handle(Input::Resume {
         status,
@@ -160,12 +234,44 @@ pub async fn resume(
     .await
 }
 
+fn validate_binding(machine: &SessionMachine, session: &dyn Session) -> Result<(), DriverError> {
+    let durable = session.branch(None)?;
+    let same_branch = durable.len() == machine.entries().len()
+        && durable.iter().zip(machine.entries()).all(|(left, right)| {
+            left.id == right.id
+                && left.parent == right.parent
+                && left.lane == right.lane
+                && left.op == right.op
+                && left.at == right.at
+                && left.body == right.body
+        });
+    if same_branch {
+        Ok(())
+    } else {
+        Err(DriverError::SessionStateMismatch)
+    }
+}
+
+fn validate_provider(
+    machine: &SessionMachine,
+    provider: &BoundProvider,
+) -> Result<(), DriverError> {
+    if machine.model() == provider.model() {
+        Ok(())
+    } else {
+        Err(DriverError::ProviderSelectionMismatch {
+            expected: machine.model().clone(),
+            actual: provider.model().clone(),
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     mut machine: SessionMachine,
     mut step: Step,
     session: &mut dyn Session,
-    provider: &mut dyn Provider,
+    provider: &mut BoundProvider,
     tools: &ToolSet,
     stamps: &mut dyn StampSource,
     cancellation: CancellationToken,
@@ -218,15 +324,21 @@ async fn apply_effects(
 
 async fn execute_action(
     action: Action,
-    provider: &mut dyn Provider,
+    provider: &mut BoundProvider,
     tools: &ToolSet,
     stamps: &mut dyn StampSource,
     cancellation: CancellationToken,
     events: &mut dyn EventSink,
 ) -> Result<ActionOutcome, DriverError> {
     match action {
-        Action::StreamAssistant { request, .. } => {
-            let mut stream = provider.generate(request, cancellation);
+        Action::StreamAssistant { request, model, .. } => {
+            if model != provider.model {
+                return Err(DriverError::ProviderSelectionMismatch {
+                    expected: model,
+                    actual: provider.model.clone(),
+                });
+            }
+            let mut stream = provider.provider.generate(request, cancellation);
             while let Some(event) = stream.next().await {
                 events
                     .emit(AgentEvent::ProviderStream {
@@ -314,8 +426,8 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use rho_ai::{
-        AssistantMessage, Message, ModelId, ModelInfo, ProviderFactory, ProviderId, Request,
-        SessionConfig, StopReason, ThinkingLevel, Usage,
+        AssistantMessage, Message, ModelId, ModelInfo, ProviderId, Request, StopReason,
+        ThinkingLevel, Usage,
         faux::{FauxFactory, Script},
     };
     use rho_core::{EntryStamp, MachineConfig, ReplaySafety};
@@ -329,7 +441,8 @@ mod tests {
 
     impl StampSource for FixedStamps {
         fn op_id(&mut self) -> OpId {
-            OpId::from("00000000-0000-7000-8000-000000000001")
+            self.next += 1;
+            OpId::from(format!("00000000-0000-7000-8000-{:012}", self.next))
         }
 
         fn entry(&mut self) -> EntryStamp {
@@ -348,9 +461,27 @@ mod tests {
 
     #[tokio::test]
     async fn automatic_driver_persists_the_same_machine_effects() {
-        let expected = Request {
+        let first_assistant = AssistantMessage {
+            blocks: vec![rho_ai::ContentBlock::text("done")],
+            stop: StopReason::Stop,
+            usage: Usage::default(),
+            provider: ProviderId::from("p"),
+            model: ModelId::from("m"),
+        };
+        let first_expected = Request {
             system: "test".to_owned(),
             messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            max_output_tokens: 100,
+            thinking: ThinkingLevel::None,
+        };
+        let second_expected = Request {
+            system: "test".to_owned(),
+            messages: vec![
+                Message::user("hello"),
+                Message::Assistant(first_assistant.clone()),
+                Message::user("again"),
+            ],
             tools: Vec::new(),
             max_output_tokens: 100,
             thinking: ThinkingLevel::None,
@@ -362,23 +493,48 @@ mod tests {
                 context_tokens: None,
                 max_output_tokens: None,
             }],
-            [Script {
-                request: expected,
-                events: vec![StreamEvent::Done(AssistantMessage {
-                    blocks: vec![rho_ai::ContentBlock::text("done")],
-                    stop: StopReason::Stop,
-                    usage: Usage::default(),
-                    provider: ProviderId::from("p"),
-                    model: ModelId::from("m"),
-                })],
-            }],
-        );
-        let mut provider = factory
-            .open(SessionConfig {
+            [
+                Script {
+                    request: first_expected,
+                    events: vec![StreamEvent::Done(first_assistant)],
+                },
+                Script {
+                    request: second_expected,
+                    events: vec![StreamEvent::Done(AssistantMessage {
+                        blocks: vec![rho_ai::ContentBlock::text("done again")],
+                        stop: StopReason::Stop,
+                        usage: Usage::default(),
+                        provider: ProviderId::from("p"),
+                        model: ModelId::from("m"),
+                    })],
+                },
+            ],
+        )
+        .with_provider_id(ProviderId::from("p"));
+        let wrong_factory = BoundProvider::open(
+            &factory,
+            ModelRef {
+                provider: ProviderId::from("not-p"),
                 model: ModelId::from("m"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            wrong_factory,
+            Err(ProviderError {
+                kind: ErrorKind::InvalidRequest,
+                ..
             })
-            .await
-            .unwrap();
+        ));
+        let mut provider = BoundProvider::open(
+            &factory,
+            ModelRef {
+                provider: ProviderId::from("p"),
+                model: ModelId::from("m"),
+            },
+        )
+        .await
+        .unwrap();
         let repo = MemoryRepo::default();
         let mut session = repo
             .create(CreateOptions {
@@ -391,6 +547,10 @@ mod tests {
                 system: "test".to_owned(),
                 max_output_tokens: 100,
                 thinking: ThinkingLevel::None,
+                model: rho_core::ModelRef {
+                    provider: ProviderId::from("p"),
+                    model: ModelId::from("m"),
+                },
                 tools: Vec::new(),
             },
             Vec::new(),
@@ -399,7 +559,7 @@ mod tests {
         let machine = run_prompt(
             machine,
             session.as_mut(),
-            provider.as_mut(),
+            &mut provider,
             &ToolSet::new(),
             SessionMessage::user("hello"),
             Origin::External,
@@ -413,6 +573,103 @@ mod tests {
         assert!(machine.is_idle());
         assert_eq!(session.export_entries().unwrap().len(), 2);
         assert_eq!(session.lane_status().unwrap(), rho_core::LaneStatus::Idle);
+
+        let machine = run_prompt(
+            machine,
+            session.as_mut(),
+            &mut provider,
+            &ToolSet::new(),
+            SessionMessage::user("again"),
+            Origin::External,
+            None,
+            &mut FixedStamps { next: 10 },
+            CancellationToken::new(),
+            &mut NoopEventSink,
+        )
+        .await
+        .unwrap();
+        assert!(machine.is_idle());
+        assert_eq!(session.export_entries().unwrap().len(), 4);
+        assert_eq!(session.lane_status().unwrap(), rho_core::LaneStatus::Idle);
+
+        let wrong_model = SessionMachine::new(
+            MachineConfig {
+                system: "test".to_owned(),
+                max_output_tokens: 100,
+                thinking: ThinkingLevel::None,
+                model: ModelRef {
+                    provider: ProviderId::from("p"),
+                    model: ModelId::from("other"),
+                },
+                tools: Vec::new(),
+            },
+            machine.entries().to_vec(),
+        )
+        .unwrap();
+        let item_count = session.log(0, usize::MAX).unwrap().len();
+        let resumed = resume(
+            wrong_model.clone(),
+            session.as_mut(),
+            &mut provider,
+            &ToolSet::new(),
+            &mut FixedStamps { next: 14 },
+            CancellationToken::new(),
+            &mut NoopEventSink,
+        )
+        .await
+        .unwrap();
+        assert!(resumed.is_idle());
+        assert_eq!(session.log(0, usize::MAX).unwrap().len(), item_count);
+
+        let error = run_prompt(
+            wrong_model,
+            session.as_mut(),
+            &mut provider,
+            &ToolSet::new(),
+            SessionMessage::user("wrong model"),
+            Origin::External,
+            None,
+            &mut FixedStamps { next: 15 },
+            CancellationToken::new(),
+            &mut NoopEventSink,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DriverError::ProviderSelectionMismatch { .. }
+        ));
+        assert_eq!(session.log(0, usize::MAX).unwrap().len(), item_count);
+
+        let unrelated = SessionMachine::new(
+            MachineConfig {
+                system: "test".to_owned(),
+                max_output_tokens: 100,
+                thinking: ThinkingLevel::None,
+                model: rho_core::ModelRef {
+                    provider: ProviderId::from("p"),
+                    model: ModelId::from("m"),
+                },
+                tools: Vec::new(),
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let error = run_prompt(
+            unrelated,
+            session.as_mut(),
+            &mut provider,
+            &ToolSet::new(),
+            SessionMessage::user("wrong session"),
+            Origin::External,
+            None,
+            &mut FixedStamps { next: 20 },
+            CancellationToken::new(),
+            &mut NoopEventSink,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, DriverError::SessionStateMismatch));
     }
 
     #[tokio::test]
@@ -461,13 +718,17 @@ mod tests {
                     model: ModelId::from("m"),
                 })],
             }],
-        );
-        let mut provider = factory
-            .open(SessionConfig {
+        )
+        .with_provider_id(ProviderId::from("p"));
+        let mut provider = BoundProvider::open(
+            &factory,
+            ModelRef {
+                provider: ProviderId::from("p"),
                 model: ModelId::from("m"),
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         let repo = MemoryRepo::default();
         let mut session = repo
             .create(CreateOptions {
@@ -542,16 +803,36 @@ mod tests {
                 system: "test".to_owned(),
                 max_output_tokens: 100,
                 thinking: ThinkingLevel::None,
+                model: rho_core::ModelRef {
+                    provider: ProviderId::from("p"),
+                    model: ModelId::from("m"),
+                },
                 tools: Vec::new(),
             },
             branch,
         )
         .unwrap();
 
+        let error = run_prompt(
+            machine.clone(),
+            session.as_mut(),
+            &mut provider,
+            &ToolSet::new(),
+            SessionMessage::user("must resume first"),
+            Origin::External,
+            None,
+            &mut FixedStamps { next: 8 },
+            CancellationToken::new(),
+            &mut NoopEventSink,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, DriverError::LaneNotIdle { .. }));
+
         let machine = resume(
             machine,
             session.as_mut(),
-            provider.as_mut(),
+            &mut provider,
             &ToolSet::new(),
             &mut FixedStamps { next: 10 },
             CancellationToken::new(),
@@ -585,6 +866,10 @@ mod tests {
             system: String::new(),
             max_output_tokens: 1,
             thinking: ThinkingLevel::None,
+            model: rho_core::ModelRef {
+                provider: ProviderId::from("p"),
+                model: ModelId::from("m"),
+            },
             tools: Vec::new(),
         };
         assert!(config.tools.is_empty());
