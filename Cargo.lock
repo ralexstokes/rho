@@ -1533,10 +1533,12 @@ dependencies = [
 name = "rho-tools"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "rho-ai",
  "rho-core",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
 ]
 
