@@ -252,9 +252,17 @@ debuggable, evolvable):
   agents legitimately need host access.
 - TS/JS authors compile to components (componentize-js/jco); Rust/Go/Python also
   land free. No embedded V8/Node anywhere.
-- Native Rust plugins = just implementing rho-agent hook traits in-process
-  (for embedders); no dylib story until someone needs it.
+- **Components are the only supported extension surface.** rho-agent's hook
+  traits are the internal seam hosts dispatch through, not a public contract;
+  native embedders link code (that is embedding, §2.6, not extension). No
+  dylib story.
 - Skills + prompt templates ship early (pure data, big leverage, no ABI needed).
+- Governing frame and binding early-phase constraints (thin-WIT/thick-JSON,
+  the `agent-core` imports-nothing world, wasm32 CI gate, ABI-expressible
+  boundary types): → spec/04-ext-abi.md. Slogan form: **decisions as
+  plugins, effects native** — the pure-core/mutable-shell line of
+  spec/06 is the extension boundary, so the maximal plugin surface is exactly
+  the pure side, and the minimal harness is the effect executor.
 
 ### 2.6 Embedding contract & shelterwood integration
 
@@ -358,6 +366,21 @@ Decided (details in the linked specs):
   `rho-agent` is the driver shell.)
 - Partial tool-arg parsing is a client concern; harness forwards raw deltas
   only (corollary of langsec decision, spec/01 §1.2).
+- **Extension boundary = the core/shell line**: decisions as plugins, effects
+  native. The harness owns the journal, provider transport/credentials,
+  process-touching execution, id/timestamp minting, cancellation, and
+  supervision glue; everything deterministic is plugin-eligible.
+  → spec/04-ext-abi.md §1
+- **Single extension surface**: WASM components only; native hook traits stay
+  an internal host seam. → spec/04-ext-abi.md §2
+- **Thin WIT, thick JSON**: the ABI carries the same versioned owned-serde
+  vocabulary as actor and wire messages (extends the §2.6 identity); WIT is
+  transport. → spec/04-ext-abi.md §4
+- **Componentization is a packaging option bought now**: pure crates build
+  for wasm32 in CI (structural determinism enforcement — an imports-nothing
+  component cannot observe clock/rand/env); the session machine links
+  natively or instantiates as the `agent-core` world, hosts' choice.
+  → spec/04-ext-abi.md §8, spec/06 §5
 
 Open:
 
@@ -369,13 +392,16 @@ Open:
    block with timeout, crash-resume semantics for a pending ask) is core loop
    design and belongs to phase 2 / spec/02, not to the RPC doc.
    → spec/03-rpc.md (unwritten)
-2. WIT ABI — **deferred until after the phase-3 milestone** (no-gating
-   decision removed the only v1 consumer; project-config trust already lands
-   with it; toolchain maturity is a phase-4 risk). Binding phase-2 design
-   rule that makes deferral safe: **hook payloads/results are plain owned
-   serde data — no handles, borrows, or callbacks — async request/response**;
-   hooks are journaled actions, so ABI extensions inherit deterministic
-   replay. → spec/04-ext-abi.md (unwritten)
+2. WIT ABI — **implementation still deferred until after the phase-3
+   milestone**, but the constraints are now written: spec/04-ext-abi.md
+   (constraints sketch, 2026-08-20) fixes the worlds, the thin-WIT/thick-JSON
+   rule, failure semantics, and the phase-2/3 obligations (wasm32 gate,
+   ABI-expressible types). The original binding phase-2 design rule stands
+   and is subsumed there: **hook payloads/results are plain owned serde data
+   — no handles, borrows, or callbacks — async request/response**; hooks are
+   journaled actions, so ABI extensions inherit deterministic replay. Still
+   open at phase-4 entry: the full WIT text and componentize-js maturity
+   (spec/04 §9).
 3. Session entry + lane journal schema — **drafted** → spec/02-session.md
    (its §10 tracks remaining sub-questions: fsync default, queued-message
    payloads, compaction-as-operation, export format).

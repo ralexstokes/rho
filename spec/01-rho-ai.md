@@ -243,4 +243,7 @@ Rules carried over from the overview:
    own default features disabled. Validation results and diagnostics are
    normalized deterministically, but removing ambient randomness from the
    pure dependency graph requires a deterministic upstream map configuration,
-   a patched dependency, or a replacement validator.
+   a patched dependency, or a replacement validator. The wasm32 gate
+   (spec/06 §5, spec/04 §8) upgrades this from cosmetic to blocking:
+   `getrandom` does not build for `wasm32-unknown-unknown` without an
+   explicit backend, so `rho-ai` cannot join the gate until this resolves.
