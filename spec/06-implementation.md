@@ -30,6 +30,14 @@ made: message-level actions, deterministic golden-session replay, hooks as
 owned serde data, langsec parse-at-the-boundary, and the driven state machine
 the shelterwood embedding requires. This doc makes it the rule everywhere.
 
+The line has a second identity: it is the **extension boundary** (spec/04).
+Slogan form: *decisions as plugins, effects native*. The shell side is the
+set of capabilities no plugin can own without becoming the harness (journal,
+provider transport/credentials, process-touching execution, id/timestamp
+minting, cancellation, supervision glue); the pure side is, by construction,
+the maximal plugin-eligible surface. Building to this doc's discipline is
+what keeps componentization a packaging choice rather than a refactor.
+
 ## 2. The central instance: the session machine
 
 The phase-2 loop is the pattern's anchor, and its shape constrains everything
@@ -89,6 +97,15 @@ Determinism rules for the core, enforced (§5):
 - No async in core crates. `Future` appears only in shell crates and in
   boundary traits (`Provider`, `ProviderFactory`, `Session`).
 - No `unsafe` in core crates (`#![forbid(unsafe_code)]`).
+
+A third property is bought rather than free, and cheaply: because the machine
+is deterministic, message-level, and speaks only owned serde data, it
+compiles either natively (the default; embedders and first-party hosts link
+it) or to an imports-nothing WASM component — spec/04's `agent-core` world.
+Which one a host runs is packaging, not architecture. Message-level actions
+are what make the component boundary cheap: the guest is called once per
+command/action-completion, never per token, and advisory deltas never cross
+it. The constraint that keeps this option open is the wasm32 gate in §5.
 
 ## 3. Crate layout
 
@@ -153,6 +170,10 @@ Dependency rules (the point of the split):
 5. `rho-ai` is a pure crate that *defines* an async trait: the trait's
    signature is the boundary; implementations live in shell crates. Same for
    `rho-store`'s traits. A trait with an async fn is an interface, not IO.
+6. Pure crates must build for `wasm32-unknown-unknown`. A dependency that
+   cannot is disqualified no matter how pure it looks — ambient-capability
+   reach (spec/01 open item 7's `getrandom` chain is the standing example)
+   is exactly what the target flushes out at compile time.
 
 ## 4. Where the pattern lands, phase by phase
 
@@ -209,6 +230,16 @@ makes that host a page of code. Nothing to redo when shelterwood matures.
   contain tokio, mio, reqwest, or fs-touching crates. A ~20-line CI script
   asserting `cargo tree -p <pure-crate>` against an allowlist is enough; run
   it from day one, not after the first violation.
+- **wasm32 build gate** (spec/04 §8): CI builds pure crates for
+  `wasm32-unknown-unknown`. This is *structural* determinism enforcement —
+  an ambient clock, randomness, or env read cannot link — and it is what
+  keeps `agent-core` componentization a packaging choice. The clippy
+  `disallowed_methods` and `cargo tree` checks above remain as
+  belt-and-suspenders (they catch shell-crate leaks and name the violation
+  precisely). Gate membership starts at `rho-core` + `rho-codec-jsonl`;
+  `rho-ai` joins when spec/01 open item 7 (validator → `ahash` →
+  `getrandom`) is resolved, which that gate upgrades from cosmetic to
+  blocking.
 - **Test placement follows the split**: core crates carry the exhaustive
   unit/property/truth-table tests and (post format-stamp) golden replays;
   shell crates carry only conformance + integration tests. A complex test for
@@ -235,3 +266,7 @@ makes that host a page of code. Nothing to redo when shelterwood matures.
   another small crate.
 - Mocks of shell traits inside core tests — core tests need no mocks by
   construction; if one seems needed, the boundary is drawn wrong.
+- A boundary type that cannot cross the ABI — handles, borrows, callbacks,
+  platform types in anything the machine consumes or emits. It silently
+  forecloses the component packaging option (spec/04 §8) even if it passes
+  every purity check.
